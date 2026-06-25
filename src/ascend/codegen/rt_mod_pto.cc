@@ -24,23 +24,17 @@ std::string PTOCodeGen(IRModule mod) {
   return cg.Finish();
 }
 
-std::string ApplyPostproc(std::string code, const Target &target) {
-  if (const auto f =
-          ffi::Function::GetGlobal("tilelang_callback_ascend_postproc")) {
-    code = (*f)(code, target).cast<std::string>();
-  }
-  return code;
-}
-
 } // namespace
 
 ffi::Module BuildTileLangPTO(IRModule mod, Target target) {
-  std::string code = ApplyPostproc(PTOCodeGen(mod), target);
+  (void)target;
+  std::string code = PTOCodeGen(mod);
   return CSourceModuleCreate(code, "py", ffi::Array<ffi::String>());
 }
 
 ffi::Module BuildTileLangPTOWithoutCompile(IRModule mod, Target target) {
-  std::string code = ApplyPostproc(PTOCodeGen(mod), target);
+  (void)target;
+  std::string code = PTOCodeGen(mod);
   return CSourceModuleCreate(code, "py", ffi::Array<ffi::String>());
 }
 
