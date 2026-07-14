@@ -31,5 +31,10 @@ def test_simdvf_vecadd_lower(backend):
     _run_vector_add(backend)
 
 
+@pytest.mark.pto
+def test_simdvf_vecadd_lower_pto():
+    _run_vector_add("pto")
+
+
 if __name__ == "__main__":
     tilelang.testing.main()
