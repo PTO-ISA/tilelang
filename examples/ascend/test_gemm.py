@@ -41,6 +41,7 @@ def test_gemm_auto_bf16(target):
     _test("bfloat16", 1e-2, "bfloat16", target=target, mixed=False)
 
 
+@pytest.mark.pto
 def test_gemm_auto_bf16_pto():
     _test("bfloat16", 1e-2, target="pto", mixed=False)
 
