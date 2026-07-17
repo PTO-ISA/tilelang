@@ -46,6 +46,11 @@ def test_gemm_auto_bf16_pto():
     _test("bfloat16", 1e-2, target="pto", mixed=False)
 
 
+@pytest.mark.pto
+def test_gemm_auto_fp8_pto():
+    _test("float8_e4m3fn", 1e-1, target="pto", mixed=False)
+
+
 @pytest.mark.parametrize("target", TARGETS)
 def test_gemm_auto_bf16_mixed(target):
     _test("bfloat16", 1e-2, target=target, mixed=True)
@@ -98,6 +103,8 @@ if __name__ == "__main__":
     print("PASS: test_gemm_auto_bf16")
     test_gemm_auto_bf16_pto()
     print("PASS: test_gemm_auto_bf16_pto")
+    test_gemm_auto_fp8_pto()
+    print("PASS: test_gemm_auto_fp8_pto")
     test_gemm_auto_bf16_mixed("ascend")
     print("PASS: test_gemm_auto_bf16_mixed")
     test_gemm_auto_fp32("ascend")
