@@ -57,6 +57,7 @@ from .tile_schedule import (  # noqa: F401
 from .frame import Cube, CubeFrame, SimdVF, SimdVFFrame, SimtVF, SimtVFFrame, Vector, VectorFrame  # noqa: F401
 
 from . import simd as simd  # noqa: F401 (exposed as T.simd.*)
+from . import vmi as vmi  # noqa: F401 (exposed as T.vmi.*)
 
 # Ascend owns its debug surface: device_assert lowers through the toolkit's
 # assert() macro, print gates by the NPU execution model (no CUDA-style
@@ -110,6 +111,7 @@ _ASCEND_API_ALL = (
     "rng_rand",
     "rng_rand_float",
     "simd",
+    "vmi",
     "unroll",
 )
 
