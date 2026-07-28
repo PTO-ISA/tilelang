@@ -171,24 +171,16 @@ private:
   void EmitAscendBlockscaledGemmL1(const CallNode *op);
   void EmitAscendCopyMatrixCcToUb(const CallNode *op);
   void EmitAscendCopyMatrixCcToGm(const CallNode *op);
-  void EmitAscendCopyUbufToCbuf(const CallNode *op);
-  void EmitAscendNd2NzPostCopy(const CallNode *op);
-  void EmitAscendNd2NzScatter(const CallNode *op);
-  void EmitGemmRun(const PTOGemmEmitContext &ctx, const std::string &a_mat,
-                   const std::string &b_mat, const std::string &acc,
-                   const std::string &clear_accum,
-                   const std::string &unit_flag_ctrl, int64_t hf32_mode);
-  void
-  EmitBlockscaledGemmRun(const PTOGemmEmitContext &ctx,
-                         const std::string &a_mat, const std::string &b_mat,
-                         const std::string &sfa_mat, const std::string &sfb_mat,
-                         const std::string &acc, const std::string &clear_accum,
-                         const std::string &sf_k_offset,
-                         const std::string &unit_flag_ctrl);
   std::string LocalVarID(const VarNode *var);
   bool IsLocalVarBuffer(const VarNode *var) const;
   void EmitMixedEntrySnapshot(const VarNode *var);
   void RestoreMixedSectionVariables(const SBlockNode *section);
+  std::string PrintVmiAnnotationValue(const std::string &key,
+                                      const ObjectRef &value);
+  void PrintPtoVmiCall_(const CallNode *op, std::ostream &os);
+  bool IsVmiLocalRegisterBuffer(const BufferNode *buffer) const;
+  void CheckVmiLocalRegisterIndex(const BufferNode *buffer,
+                                  const PrimExpr &index) const;
   bool HasAscendGemmL1(const PrimFunc &func) const;
   bool HasAscendBlockscaledGemmL1(const PrimFunc &func) const;
   bool HasAscendMad(const PrimFunc &func) const;
