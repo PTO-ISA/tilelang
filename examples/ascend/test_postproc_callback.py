@@ -1,4 +1,4 @@
-"""Verify Ascend postproc hooks in generated source."""
+"""Verify Ascend and PTO postproc hooks in generated source."""
 
 import pytest
 import tilelang
@@ -10,6 +10,7 @@ from example_ascend_postproc_callback import CUSTOM_MARKER, vector_add
     "target, marker",
     [
         ("ascend", CUSTOM_MARKER),
+        pytest.param("pto", CUSTOM_MARKER_PTO, marks=pytest.mark.pto),
     ],
 )
 def test_postproc_marker_in_source(target, marker):
@@ -21,3 +22,5 @@ def test_postproc_marker_in_source(target, marker):
 if __name__ == "__main__":
     test_postproc_marker_in_source("ascend", CUSTOM_MARKER)
     print("PASS: test_postproc_marker_in_source (ascend)")
+    test_postproc_marker_in_source("pto", CUSTOM_MARKER_PTO)
+    print("PASS: test_postproc_marker_in_source (pto)")
