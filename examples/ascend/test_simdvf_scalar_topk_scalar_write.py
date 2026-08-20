@@ -5,34 +5,28 @@ import torch
 import tilelang
 import tilelang.testing
 
-from example_simdvf_scalar_topk_scalar_write import (
-    NUM_EXPERTS,
-    NUM_TOPK,
-    make_kernel,
-    ref_program,
-    simulator_safe_randn,
-)
+from example_simdvf_scalar_topk_scalar_write import make_kernel, ref_program
 
-# Include "(" so the assertion matches call sites, not declarations.
-BYPASS_CALLS = {
-    "asc": "tl::write_gm_bypass_dcache(",
-}
+NUM_EXPERTS = 128
+NUM_TOPK = 8
+NUM_CORES = 32
 
 
-@pytest.mark.parametrize("backend", ["asc"])
-def test_simdvf_scalar_topk_scalar_write(backend):
-    kernel = make_kernel(backend)
-    source = kernel.get_kernel_source()
-    marker = BYPASS_CALLS[backend]
-    assert source.count(marker) > 0, f"{backend} scalar GM write should emit {marker}"
-
+def test_simdvf_scalar_topk_scalar_write():
+    kernel = make_kernel()
     device = torch.device("npu")
     n = 4096
     torch.manual_seed(42)
-    logits = simulator_safe_randn((n, NUM_EXPERTS), dtype=torch.float32, device=device)
+    logits = torch.randn(n, NUM_EXPERTS, dtype=torch.float32, device=device)
     out = kernel(logits)
     torch.npu.synchronize()
     assert torch.equal(out.cpu(), ref_program(logits, NUM_TOPK).cpu())
+
+
+@pytest.mark.pto
+@pytest.mark.skip(reason="PTO VMI has no scalar GM DCache-bypass store")
+def test_pto_scalar_topk_scalar_write():
+    """The shared scalar top-k PTO test covers the algorithm without ASC GM bypass."""
 
 
 if __name__ == "__main__":

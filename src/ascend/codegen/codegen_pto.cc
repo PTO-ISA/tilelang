@@ -1490,7 +1490,18 @@ CodeGenTileLangPTO::PrintVmiAnnotationValue(const std::string &key,
                                             const ObjectRef &value) {
   if (key == "to_dtype") {
     if (const auto *dtype_name = value.as<StringImmNode>()) {
-      return PtoScalarType(ParsePTODtype(dtype_name->value));
+      const std::string &name = dtype_name->value;
+      // PTODSL int-to-int widening requires a signed/unsigned source
+      // (si16/ui16), not TVM's signless i16.
+      if (name == "si8")
+        return "pto.si8";
+      if (name == "si16")
+        return "pto.si16";
+      if (name == "si32")
+        return "pto.si32";
+      if (name == "si64")
+        return "pto.si64";
+      return PtoScalarType(ParsePTODtype(name));
     }
   }
 

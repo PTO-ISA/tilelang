@@ -244,9 +244,19 @@ jobs:
             uv run --no-project -m --
             pytest --verbose --color=yes --durations=0 --showlocals --cache-clear -n 32
           )
-          "${PYTEST[@]}" --maxfail=3 \
+          "${PYTEST[@]}" --maxfail=3 -m "not pto" \
             ascend
 
+
+      - name: Run PTO unit tests with Python ${{ matrix.python-version }}
+        run: |
+          cd testing
+          PYTEST=(
+            uv run --no-project -m --
+            pytest --verbose --color=yes --durations=0 --showlocals --cache-clear -n 32
+          )
+          "${PYTEST[@]}" --maxfail=3 -m "pto" \
+            ascend
 
       # Disabled on the asc branch while Ascend CI is split out from upstream multi-backend CI:
       # - CUDA examples: ../examples

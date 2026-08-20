@@ -69,11 +69,38 @@ def _normalize_lanes(lanes: int, *, context: str) -> int:
     return lanes
 
 
+# Formal PTODSL VMI vreg/mask lane counts (see ptodsl VMI_LANE_COUNTS).
+_VMI_LANE_COUNTS = (1, 2, 4, 8, 64, 128, 256)
+
+
+def _require_vmi_lane_count(lanes: int, *, context: str) -> int:
+    if lanes not in _VMI_LANE_COUNTS:
+        raise ValueError(f"{context} requires lanes to be one of {_VMI_LANE_COUNTS}; got {lanes}")
+    return lanes
+
+
+# PTODSL signed integer names. TIR still uses signless int*; codegen emits si*.
+_PTO_SIGNED_DTYPE = {
+    "si8": "int8",
+    "si16": "int16",
+    "si32": "int32",
+    "si64": "int64",
+}
+
+
 def _scalar_dtype(dtype_like, *, context: str):
+    if isinstance(dtype_like, str) and dtype_like in _PTO_SIGNED_DTYPE:
+        dtype_like = _PTO_SIGNED_DTYPE[dtype_like]
     dt = _dtype(dtype_like)
     if getattr(dt, "lanes", 1) != 1:
         raise ValueError(f"{context} expects a scalar element dtype, got {dt}")
     return dt
+
+
+def _pto_to_dtype_annotation(dtype_like) -> str:
+    if isinstance(dtype_like, str) and dtype_like in _PTO_SIGNED_DTYPE:
+        return dtype_like
+    return str(_scalar_dtype(dtype_like, context="T.vmi to_dtype"))
 
 
 def _is_sequence(value) -> bool:
@@ -213,7 +240,7 @@ def _scope_guarded(fn):
     return wrapper
 
 
-def _normalize_vmi_vcvt_rounding(mode, *, context: str):
+def _normalize_pto_vcvt_rounding(mode, *, context: str):
     token = mode
     if not isinstance(token, str):
         token = str(token)
@@ -227,7 +254,7 @@ def _normalize_vmi_vcvt_rounding(mode, *, context: str):
     return normalized
 
 
-def _validate_vmi_load_modes(
+def _validate_pto_load_modes(
     context: str,
     *,
     dist_mode,
@@ -375,7 +402,7 @@ def vload(
     ip=None,
 ):
     """Load a VMI vector from either `a_ub[0]`-style buffer loads or ptr+offset form."""
-    _validate_vmi_load_modes(
+    _validate_pto_load_modes(
         "T.vmi.vload(...)",
         dist_mode=dist_mode,
         group=group,
@@ -390,9 +417,14 @@ def vload(
     if to_dtype is not None and dist_mode != "unpack":
         raise TypeError('T.vmi.vload(...) accepts to_dtype only when dist_mode="unpack"')
     source_elem = _require_address_element_dtype(source, context="T.vmi.vload(...)")
+    # Keep si*/ui* spelling for PTODSL annotations (signless TIR int* → pto.i*
+    # is wrong for int-to-int widen). Unpack vload itself is not legalized on
+    # the current VPTO path; this preserves a correct annotation if enabled later.
+    to_dtype_annot = None
     if dist_mode == "unpack":
         if to_dtype is None:
             raise TypeError('T.vmi.vload(...) requires to_dtype when dist_mode="unpack"')
+        to_dtype_annot = _pto_to_dtype_annotation(to_dtype)
         to_dtype = _scalar_dtype(to_dtype, context="T.vmi.vload(..., to_dtype=...)")
         if getattr(to_dtype, "bits", None) != 2 * getattr(source_elem, "bits", None):
             raise TypeError("T.vmi.vload(...) unpack must widen by exactly one step")
@@ -405,7 +437,7 @@ def vload(
     ptr, extra_offset = _resolve_ptr_and_offset(source, offset, access_type="r", extent=size)
     attrs = {
         "size": size,
-        "to_dtype": str(_dtype(to_dtype)) if to_dtype is not None else None,
+        "to_dtype": to_dtype_annot,
         "stride": stride,
         "block_stride": block_stride,
         "repeat_stride": repeat_stride,
@@ -440,7 +472,7 @@ def vstore(
     if mask is None and _looks_like_mask(offset):
         mask = offset
         offset = None
-    _validate_vmi_load_modes(
+    _validate_pto_load_modes(
         "T.vmi.vstore(...)",
         dist_mode=dist_mode,
         group=group,
@@ -667,7 +699,7 @@ def vcvt(source, to_dtype=None, mask=None, *, rounding=None, saturate=None, pmod
         raise TypeError("T.vmi.vcvt(...) requires to_dtype")
     to_dtype = _scalar_dtype(to_dtype, context="T.vmi.vcvt(..., to_dtype=...)")
     if rounding is not None:
-        rounding = _normalize_vmi_vcvt_rounding(rounding, context="T.vmi.vcvt(..., rounding=...)")
+        rounding = _normalize_pto_vcvt_rounding(rounding, context="T.vmi.vcvt(..., rounding=...)")
     return _call_vmi(
         "vcvt",
         vreg(_lanes_of(source), to_dtype),
@@ -701,11 +733,14 @@ def vinterpret_cast(source, to_dtype=None, *, loc=None, ip=None):
         if total % tgt_bits != 0:
             raise TypeError("T.vmi.vinterpret_cast(...) requires source/target bit totals to match")
         out_lanes = total // tgt_bits
+    # PTOAS rejects lane counts outside the formal VMI set (e.g. int8x128→si64
+    # yields int64x16, which is not legal).
+    _require_vmi_lane_count(out_lanes, context="T.vmi.vinterpret_cast(...)")
     return _call_vmi(
         "vinterpret_cast",
-        vreg(out_lanes, to_dtype),
+        vreg(out_lanes, target_dt),
         source,
-        to_dtype=str(target_dt),
+        to_dtype=_pto_to_dtype_annotation(to_dtype),
         loc=loc,
         ip=ip,
     )
