@@ -34,7 +34,7 @@ class LibraryGenerator:
     libpath: str | None = None
     lib_code: str | None = None
     pto_kernel_source: str | None = None
-    pto_kernel_name: str | None = None
+    pto_kernel_name: str | list[str] | None = None
     pass_configs: dict[str, Any] | None = None
     compile_flags: list[str] | None = None
 
@@ -53,7 +53,7 @@ class LibraryGenerator:
     def update_lib_code(self, lib_code: str):
         self.lib_code = lib_code
 
-    def update_pto_kernel(self, pto_kernel_source: str, pto_kernel_name: str):
+    def update_pto_kernel(self, pto_kernel_source: str, pto_kernel_name: str | list[str]):
         self.pto_kernel_source = pto_kernel_source
         self.pto_kernel_name = pto_kernel_name
 
@@ -306,19 +306,27 @@ class LibraryGenerator:
         if self.pto_kernel_source is None:
             raise RuntimeError("PTO compilation requires a PTODSL kernel source.")
         if self.pto_kernel_name is None:
-            raise RuntimeError("PTO compilation requires a kernel name.")
+            raise RuntimeError("PTO compilation requires at least one kernel name.")
         if self.lib_code is None:
             raise RuntimeError("PTO compilation requires a host launch source.")
 
         out_dir = tempfile.mkdtemp(prefix="tilelang_pto_")
-        ptodsl_path = os.path.join(out_dir, "kernel.ptodsl.py")
-        pto_path = os.path.join(out_dir, "kernel.pto")
-        fatobj_path = os.path.join(out_dir, "kernel.fatobj.o")
+        kernel_names = [self.pto_kernel_name] if isinstance(self.pto_kernel_name, str) else self.pto_kernel_name
+        if not kernel_names:
+            raise RuntimeError("PTO compilation requires at least one kernel name.")
         launch_cpp = os.path.join(out_dir, "launch.cpp")
         launch_obj = os.path.join(out_dir, "launch.o")
         libpath = os.path.join(out_dir, "lib_kernel.so")
 
-        self._compile_ptodsl_source_to_pto(self.pto_kernel_source, self.pto_kernel_name, ptodsl_path, pto_path)
+        pto_paths = []
+        fatobj_paths = []
+        for index, kernel_name in enumerate(kernel_names):
+            ptodsl_path = os.path.join(out_dir, f"kernel_{index}.ptodsl.py")
+            pto_path = os.path.join(out_dir, f"kernel_{index}.pto")
+            fatobj_path = os.path.join(out_dir, f"kernel_{index}.fatobj.o")
+            self._compile_ptodsl_source_to_pto(self.pto_kernel_source, kernel_name, ptodsl_path, pto_path)
+            pto_paths.append(pto_path)
+            fatobj_paths.append(fatobj_path)
         with open(launch_cpp, "w", encoding="utf-8") as file:
             file.write(self.lib_code)
 
@@ -329,12 +337,15 @@ class LibraryGenerator:
         if not any(flag == "--pto-backend" or flag.startswith("--pto-backend=") for flag in pto_flags):
             pto_flags.append("--pto-backend=vpto")
 
-        pto_cmd = ["ptoas", f"--pto-arch={pto_arch}", *pto_flags, pto_path, "-o", fatobj_path]
-        if self.verbose:
-            print(f"PTO compile command: {' '.join(pto_cmd)}")
-        result = subprocess.run(pto_cmd, text=True, capture_output=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"PTO lowering failed.\nCommand: {' '.join(pto_cmd)}\nstderr:\n{result.stderr}\nstdout:\n{result.stdout}")
+        for pto_path, fatobj_path in zip(pto_paths, fatobj_paths):
+            pto_cmd = ["ptoas", f"--pto-arch={pto_arch}", *pto_flags, pto_path, "-o", fatobj_path]
+            if self.verbose:
+                print(f"PTO compile command: {' '.join(pto_cmd)}")
+            result = subprocess.run(pto_cmd, text=True, capture_output=True)
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"PTO lowering failed.\nCommand: {' '.join(pto_cmd)}\nstderr:\n{result.stderr}\nstdout:\n{result.stdout}"
+                )
 
         from tilelang.contrib.bisheng import find_bisheng_path
 
@@ -374,7 +385,7 @@ class LibraryGenerator:
             "--cce-fatobj-link",
             "-o",
             libpath,
-            fatobj_path,
+            *fatobj_paths,
             launch_obj,
             "-Wl,--no-as-needed",
         ]
