@@ -1,4 +1,4 @@
-"""VMI type and lowering tests.
+"""PTO VMI type and lowering tests.
 
 The PTO tests cover TileLang IR to PTODSL source lowering only. They do not
 validate PTOAS/Bisheng compilation, on-device correctness, or performance.
@@ -9,12 +9,12 @@ from types import SimpleNamespace
 
 import pytest
 
-import tilelang.language as T
+import tilelang.ascend.language as T
 from tilelang.engine.lower import lower
 from tvm import tirx
 from tvm.tirx import Call
 
-VMI_OPAQUE_OPS = [
+PTO_VMI_OPAQUE_OPS = [
     "vload",
     "vstore",
     "create_mask",
@@ -74,7 +74,7 @@ def _op_name(call_or_op):
     return getattr(op, "name", None)
 
 
-def _collect_vmi_calls(func):
+def _collect_pto_calls(func):
     calls = []
 
     def visit(node):
@@ -87,13 +87,13 @@ def _collect_vmi_calls(func):
     return calls
 
 
-def test_vmi_type_helpers():
+def test_pto_type_helpers():
     assert str(T.vmi.vreg(64, T.float32)) == "float32x64"
     assert str(T.vmi.vreg(8, "float16")) == "float16x8"
     assert str(T.vmi.mask(64)) == "boolx64"
 
 
-def test_vmi_alloc_local_builds_vector_register_buffer():
+def test_pto_alloc_local_builds_vector_register_buffer():
     @T.prim_func
     def func():
         with T.Kernel(1) as _, T.SimdVF():
@@ -118,7 +118,7 @@ def test_vmi_alloc_local_builds_vector_register_buffer():
     assert stores and str(stores[0].value.dtype) == "float32x64"
 
 
-def test_vmi_alloc_local_validates_vreg_type_and_shape(monkeypatch):
+def test_pto_alloc_local_validates_vreg_type_and_shape(monkeypatch):
     monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
     with pytest.raises(TypeError, match="VMI vector type"):
         T.vmi.alloc_local((4,), T.float32)
@@ -130,7 +130,7 @@ def test_vmi_alloc_local_validates_vreg_type_and_shape(monkeypatch):
         T.vmi.alloc_local((), T.vmi.vreg(64, T.float32))
 
 
-def test_vmi_namespace_exports_public_ops():
+def test_pto_namespace_exports_public_ops():
     expected = [
         "alloc_local",
         "alloc_var",
@@ -191,7 +191,7 @@ def test_vmi_namespace_exports_public_ops():
     assert not hasattr(T.vmi, "pair_get")
 
 
-def test_vmi_tir_call_dtypes_preserve_vector_and_mask_lanes():
+def test_pto_tir_call_dtypes_preserve_vector_and_mask_lanes():
     @T.prim_func
     def func(A: T.Buffer((64,), "float32"), B: T.Buffer((64,), "float16")):
         with T.Kernel(1) as _:
@@ -208,7 +208,7 @@ def test_vmi_tir_call_dtypes_preserve_vector_and_mask_lanes():
                 T.evaluate(reduced)
 
     dtypes_by_op = {}
-    for call in _collect_vmi_calls(func):
+    for call in _collect_pto_calls(func):
         dtypes_by_op.setdefault(_op_name(call), set()).add(str(call.dtype))
 
     assert dtypes_by_op["tl.vmi.create_mask"] == {"boolx64"}
@@ -218,11 +218,11 @@ def test_vmi_tir_call_dtypes_preserve_vector_and_mask_lanes():
     assert dtypes_by_op["tl.vmi.vcadd"] == {"float32"}
     assert dtypes_by_op["tl.vmi.vcvt"] == {"float16x64"}
     assert dtypes_by_op["tl.vmi.vstore"] == {""}
-    vcadd_call = next(call for call in _collect_vmi_calls(func) if _op_name(call) == "tl.vmi.vcadd")
+    vcadd_call = next(call for call in _collect_pto_calls(func) if _op_name(call) == "tl.vmi.vcadd")
     assert dict(vcadd_call.annotations)["reassoc"] == 0
 
 
-def test_vmi_integer_vcadd_allows_omitted_reassoc():
+def test_pto_integer_vcadd_allows_omitted_reassoc():
     @T.prim_func
     def func(A: T.Buffer((64,), "int32")):
         with T.Kernel(1) as _, T.SimdVF():
@@ -231,25 +231,25 @@ def test_vmi_integer_vcadd_allows_omitted_reassoc():
             reduced = T.vmi.vcadd(source, mask)
             T.evaluate(reduced)
 
-    vcadd_call = next(call for call in _collect_vmi_calls(func) if _op_name(call) == "tl.vmi.vcadd")
+    vcadd_call = next(call for call in _collect_pto_calls(func) if _op_name(call) == "tl.vmi.vcadd")
     assert "reassoc" not in dict(vcadd_call.annotations)
 
 
-def test_vmi_create_mask_tir_annotations_match_ptodsl_surface():
+def test_pto_create_mask_tir_annotations_match_ptodsl_surface():
     @T.prim_func
     def func(A: T.Buffer((64,), "float32")):
         with T.Kernel(1) as _, T.SimdVF():
             mask = T.vmi.create_mask(3, size=32, group=4)
             T.evaluate(mask)
 
-    create_mask_calls = [call for call in _collect_vmi_calls(func) if _op_name(call) == "tl.vmi.create_mask"]
+    create_mask_calls = [call for call in _collect_pto_calls(func) if _op_name(call) == "tl.vmi.create_mask"]
     assert len(create_mask_calls) == 1
     call = create_mask_calls[0]
     assert str(call.dtype) == "boolx32"
     assert dict(call.annotations) == {"group": 4, "size": 32}
 
 
-def test_vmi_scope_guard_allows_ops_inside_simdvf():
+def test_pto_scope_guard_allows_ops_inside_simdvf():
     @T.prim_func
     def func(A: T.Buffer((64,), "float32"), B: T.Buffer((64,), "float32")):
         with T.Kernel(1) as _:
@@ -260,11 +260,11 @@ def test_vmi_scope_guard_allows_ops_inside_simdvf():
                 src = T.vmi.vload(a_ub[0], size=64)
                 T.vmi.vstore(src, b_ub[0], mask)
 
-    names = {_op_name(call) for call in _collect_vmi_calls(func)}
+    names = {_op_name(call) for call in _collect_pto_calls(func)}
     assert {"tl.vmi.create_mask", "tl.vmi.vload", "tl.vmi.vstore"}.issubset(names)
 
 
-def test_vmi_bufferload_addresses_lower_to_explicit_ptr_offset_args():
+def test_pto_bufferload_addresses_lower_to_explicit_ptr_offset_args():
     @T.prim_func
     def func(A: T.Buffer((128,), "float32"), B: T.Buffer((128,), "float32")):
         with T.Kernel(1) as _:
@@ -275,9 +275,9 @@ def test_vmi_bufferload_addresses_lower_to_explicit_ptr_offset_args():
                 src = T.vmi.vload(a_ub[16], size=64)
                 T.vmi.vstore(src, b_ub[32], mask)
 
-    vmi_calls = _collect_vmi_calls(func)
-    vload_call = next(call for call in vmi_calls if _op_name(call) == "tl.vmi.vload")
-    vstore_call = next(call for call in vmi_calls if _op_name(call) == "tl.vmi.vstore")
+    pto_calls = _collect_pto_calls(func)
+    vload_call = next(call for call in pto_calls if _op_name(call) == "tl.vmi.vload")
+    vstore_call = next(call for call in pto_calls if _op_name(call) == "tl.vmi.vstore")
 
     assert _op_name(vload_call.args[0]) == "tl.access_ptr"
     assert str(vload_call.args[1]) == "16"
@@ -394,7 +394,7 @@ def test_vmi_bufferload_addresses_lower_to_explicit_ptr_offset_args():
         ),
     ],
 )
-def test_vmi_wrappers_reject_invalid_mode_combinations(monkeypatch, call, message):
+def test_pto_wrappers_reject_invalid_mode_combinations(monkeypatch, call, message):
     value = SimpleNamespace(dtype="float16x16")
     mask = SimpleNamespace(dtype="boolx16")
     monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
@@ -403,7 +403,7 @@ def test_vmi_wrappers_reject_invalid_mode_combinations(monkeypatch, call, messag
         call(value, mask)
 
 
-def test_vmi_vinterpret_cast_width_changing_bit_totals(monkeypatch):
+def test_pto_vinterpret_cast_width_changing_bit_totals(monkeypatch):
     """Same-width keeps lanes; width change requires matching bit totals (ASC vintlv)."""
     monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
     calls = []
@@ -420,15 +420,21 @@ def test_vmi_vinterpret_cast_width_changing_bit_totals(monkeypatch):
     T.vmi.vinterpret_cast(SimpleNamespace(dtype="bfloat16x128"), "float32")
     assert calls[-1] == ("vinterpret_cast", "float32x64")
 
-    # float16x16 → float32 is legal (256-bit total → float32x8)
+    # float16x16 → float32 is legal (256-bit total → float32x8; 8 is a VMI lane count)
     T.vmi.vinterpret_cast(SimpleNamespace(dtype="float16x16"), "float32")
     assert calls[-1] == ("vinterpret_cast", "float32x8")
 
     with pytest.raises(TypeError, match="bit totals"):
         T.vmi.vinterpret_cast(SimpleNamespace(dtype="float16x15"), "float32")
 
+    # Bit totals match but result lanes are not a formal PTODSL VMI count (16).
+    with pytest.raises(ValueError, match="lanes"):
+        T.vmi.vinterpret_cast(SimpleNamespace(dtype="int8x128"), "si64")
+    with pytest.raises(ValueError, match="lanes"):
+        T.vmi.vinterpret_cast(SimpleNamespace(dtype="int8x128"), "int64")
 
-def test_vmi_wrappers_reject_invalid_operand_contracts(monkeypatch):
+
+def test_pto_wrappers_reject_invalid_operand_contracts(monkeypatch):
     monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
     f32 = SimpleNamespace(dtype="float32x16")
     f16 = SimpleNamespace(dtype="float16x16")
@@ -448,7 +454,7 @@ def test_vmi_wrappers_reject_invalid_operand_contracts(monkeypatch):
         T.vmi.vdhist(i32, i32, mask16)
 
 
-def test_vmi_gather_rejects_non_ub_buffer():
+def test_pto_gather_rejects_non_ub_buffer():
     with pytest.raises(TypeError, match="requires a UB pointer"):
 
         @T.prim_func
@@ -459,7 +465,7 @@ def test_vmi_gather_rejects_non_ub_buffer():
                 T.evaluate(T.vmi.vgather(A[0], offsets, mask))
 
 
-def test_vmi_vload_supports_buffer_address_and_pointer_offset(monkeypatch):
+def test_pto_vload_supports_buffer_address_and_pointer_offset(monkeypatch):
     class FakeBuffer:
         pass
 
@@ -525,7 +531,7 @@ def test_vmi_vload_supports_buffer_address_and_pointer_offset(monkeypatch):
     assert calls[-1][2] == (ptr, 7)
 
 
-def test_vmi_loads_derive_element_dtype_from_real_pointer_annotations(monkeypatch):
+def test_pto_loads_derive_element_dtype_from_real_pointer_annotations(monkeypatch):
     monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         T.vmi,
@@ -554,7 +560,7 @@ def test_vmi_loads_derive_element_dtype_from_real_pointer_annotations(monkeypatc
         lambda source, offsets, mask: T.vmi.vgatherb(source, offsets, mask),
     ],
 )
-def test_vmi_loads_reject_pointer_without_element_dtype(monkeypatch, call):
+def test_pto_loads_reject_pointer_without_element_dtype(monkeypatch, call):
     monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
     source = T.ptr(storage_scope="shared")
     offsets = SimpleNamespace(dtype="int32x16")
@@ -564,7 +570,7 @@ def test_vmi_loads_reject_pointer_without_element_dtype(monkeypatch, call):
         call(source, offsets, mask)
 
 
-def test_vmi_vstore_supports_buffer_address_and_pointer_offset(monkeypatch):
+def test_pto_vstore_supports_buffer_address_and_pointer_offset(monkeypatch):
     class FakeBuffer:
         pass
 
@@ -628,7 +634,7 @@ def test_vmi_vstore_supports_buffer_address_and_pointer_offset(monkeypatch):
     assert calls[-1][2][1:4] == (ptr, 7, "pred")
 
 
-def test_vmi_pair_unpacks_and_indexes_once(monkeypatch):
+def test_pto_pair_unpacks_and_indexes_once(monkeypatch):
     calls = []
 
     monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
@@ -652,7 +658,7 @@ def test_vmi_pair_unpacks_and_indexes_once(monkeypatch):
     assert len(pair) == 2
 
 
-def test_vmi_vload_dintlv_returns_vmi_pair(monkeypatch):
+def test_pto_vload_dintlv_returns_pair(monkeypatch):
     calls = []
 
     monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
@@ -693,7 +699,7 @@ def test_vmi_vload_dintlv_returns_vmi_pair(monkeypatch):
     assert pair[1][2] == "tl.vmi.pair_get"
 
 
-def test_vmi_pair_return_path_can_be_reused_for_vstore(monkeypatch):
+def test_pto_pair_return_path_can_be_reused_for_vstore(monkeypatch):
     pair = T.vmi.VmiPair(SimpleNamespace(dtype="float32x64"))
     calls = []
 
@@ -720,7 +726,7 @@ def test_vmi_pair_return_path_can_be_reused_for_vstore(monkeypatch):
     assert calls[-1][2][1][2] == "tl.vmi.pair_get"
 
 
-def test_vmi_pto_codegen_emits_static_local_register_lists():
+def test_pto_codegen_emits_static_local_register_lists():
     @T.prim_func
     def func(A: T.Buffer((64,), "float32"), B: T.Buffer((64,), "float32")):
         with T.Kernel(1) as _:
@@ -742,7 +748,7 @@ def test_vmi_pto_codegen_emits_static_local_register_lists():
     assert re.search(r"pto\.vmi\.vadd\([^\n]*\[0\], [^\n]*\[3\]", source)
 
 
-def test_vmi_pto_codegen_emits_range_for_non_explicit_unroll():
+def test_pto_codegen_emits_range_for_non_explicit_unroll():
     @T.prim_func
     def func(A: T.Buffer((256,), "float32"), B: T.Buffer((256,), "float32")):
         with T.Kernel(1) as _:
@@ -757,7 +763,7 @@ def test_vmi_pto_codegen_emits_range_for_non_explicit_unroll():
     lower(func, target="pto")
 
 
-def test_vmi_pto_codegen_rejects_non_explicit_unroll_local_register_index():
+def test_pto_codegen_rejects_non_explicit_unroll_local_register_index():
     @T.prim_func
     def func():
         with T.Kernel(1) as _, T.SimdVF():
@@ -769,7 +775,7 @@ def test_vmi_pto_codegen_rejects_non_explicit_unroll_local_register_index():
         lower(func, target="pto")
 
 
-def test_vmi_pto_codegen_rejects_runtime_local_register_index():
+def test_pto_codegen_rejects_runtime_local_register_index():
     @T.prim_func
     def func():
         with T.Kernel(1) as _, T.SimdVF():
@@ -781,7 +787,7 @@ def test_vmi_pto_codegen_rejects_runtime_local_register_index():
         lower(func, target="pto")
 
 
-def test_vmi_pto_codegen_emits_vmi_calls_and_pair_indexing():
+def test_pto_codegen_emits_vector_calls_and_pair_indexing():
     @T.prim_func
     def func(A: T.Buffer((64,), "float32"), B: T.Buffer((64,), "float32")):
         with T.Kernel(1) as _:
@@ -811,7 +817,7 @@ def test_vmi_pto_codegen_emits_vmi_calls_and_pair_indexing():
     assert "[1]" in source
 
 
-def test_vmi_pto_codegen_keeps_dintlv_vstore_pair_grouped():
+def test_pto_codegen_keeps_dintlv_vstore_pair_grouped():
     @T.prim_func
     def func(A: T.Buffer((64,), "float32"), B: T.Buffer((64,), "float32")):
         with T.Kernel(1) as _:
@@ -831,7 +837,7 @@ def test_vmi_pto_codegen_keeps_dintlv_vstore_pair_grouped():
     assert not re.search(r"pto\.vmi\.vstore\(\(.+\)\[0\], \(.+\)\[1\], ", vstore_line)
 
 
-def test_vmi_pto_codegen_covers_every_public_vmi_op():
+def test_pto_codegen_covers_every_public_vector_op():
     @T.prim_func
     def func(
         A: T.Buffer((64,), "float32"),
@@ -955,7 +961,7 @@ def test_vmi_pto_codegen_covers_every_public_vmi_op():
                 T.evaluate(dintlv_hi)
 
     source = lower(func, target="pto").kernel_source
-    missing = sorted(op_name for op_name in VMI_OPAQUE_OPS if f"pto.vmi.{op_name}(" not in source)
+    missing = sorted(op_name for op_name in PTO_VMI_OPAQUE_OPS if f"pto.vmi.{op_name}(" not in source)
     assert not missing, f"missing PTO source generation coverage for {missing}"
     assert "pto.vmi.vmull(" in source
     assert "pto.vmi.vintlv(" in source
@@ -965,7 +971,7 @@ def test_vmi_pto_codegen_covers_every_public_vmi_op():
     assert "pto.vmi.vinterpret_cast(" not in source or "to_dtype=pto.f32" in source
 
 
-def test_vmi_pto_codegen_wraps_literal_scalar_sources_by_dtype():
+def test_pto_codegen_wraps_literal_scalar_sources_by_dtype():
     @T.prim_func
     def func():
         with T.Kernel(1) as _, T.SimdVF():
@@ -1018,7 +1024,7 @@ def test_vmi_pto_codegen_wraps_literal_scalar_sources_by_dtype():
         ("float32", "int64", "pto.si64"),
     ],
 )
-def test_vmi_pto_codegen_uses_signed_integers_for_vcvt(source_dtype, target_dtype, signed_dtype):
+def test_pto_codegen_uses_signed_integers_for_vcvt(source_dtype, target_dtype, signed_dtype):
     @T.prim_func
     def func(A: T.Buffer((256,), source_dtype)):
         with T.Kernel(1) as _:
@@ -1035,20 +1041,14 @@ def test_vmi_pto_codegen_uses_signed_integers_for_vcvt(source_dtype, target_dtyp
     assert f"to_dtype=pto.i{target_dtype.removeprefix('int')}" not in source
 
 
-def test_vmi_codegen_rejects_non_pto_ascend_backend():
+def test_pto_codegen_rejects_non_pto_ascend_backend():
+    # Use a boolx256 mask so Ascend SimdVF type checks (#353) pass and we still
+    # hit the VMI-on-AscendC rejection (boolx64 masks fail earlier on predicates).
     @T.prim_func
-    def func(A: T.Buffer((64,), "float32"), B: T.Buffer((64,), "float32")):
-        with T.Kernel(1) as _:
-            a_ub = T.alloc_shared((64,), "float32")
-            b_ub = T.alloc_shared((64,), "float32")
-            T.copy(A, a_ub)
-            with T.SimdVF():
-                mask = T.vmi.create_mask(32, size=64, group=2)
-                src = T.vmi.vload(a_ub[0], size=64)
-                lo, hi = T.vmi.vintlv(src, src, mask)
-                out = T.vmi.vadd(lo, hi, mask)
-                T.vmi.vstore(out, b_ub[0], mask)
-            T.copy(b_ub, B)
+    def func():
+        with T.Kernel(1), T.SimdVF():
+            mask = T.vmi.create_mask(256, size=256)
+            T.evaluate(mask)
 
     with pytest.raises(Exception, match=r"Ascend CCE codegen does not support tl\.vmi\.create_mask"):
         lower(func, target="ascend")
@@ -1073,13 +1073,13 @@ def test_simdvf_pto_codegen_still_emits_existing_simd_source():
     assert "pto.vsts(" in source
 
 
-@pytest.mark.parametrize("op_name", VMI_OPAQUE_OPS)
-def test_vmi_builtin_effects_are_opaque(op_name):
+@pytest.mark.parametrize("op_name", PTO_VMI_OPAQUE_OPS)
+def test_pto_builtin_effects_are_opaque(op_name):
     effect = T.vmi.tirx.op.Op.get(f"tl.vmi.{op_name}").get_attr("TCallEffectKind")
     assert effect == T.vmi.tirx.CallEffectKind.Opaque
 
 
-def test_vmi_pair_get_is_pure():
+def test_pto_pair_get_is_pure():
     effect = T.vmi.tirx.op.Op.get("tl.vmi.pair_get").get_attr("TCallEffectKind")
     assert effect == T.vmi.tirx.CallEffectKind.Pure
 
@@ -1092,6 +1092,6 @@ def test_vmi_pair_get_is_pure():
         lambda: T.vmi.vreg(64, T.float32x2),
     ],
 )
-def test_vmi_type_helpers_reject_invalid_input(call):
+def test_pto_type_helpers_reject_invalid_input(call):
     with pytest.raises((TypeError, ValueError)):
         call()

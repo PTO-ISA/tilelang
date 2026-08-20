@@ -26,14 +26,9 @@ def _run_vector_add(backend):
     assert torch.equal(c.cpu(), ref_program(a, b).cpu())
 
 
-@pytest.mark.parametrize("backend", ["asc"])
+@pytest.mark.parametrize("backend", ["asc", pytest.param("pto", marks=pytest.mark.pto)])
 def test_simdvf_vecadd_lower(backend):
     _run_vector_add(backend)
-
-
-@pytest.mark.pto
-def test_simdvf_vecadd_lower_pto():
-    _run_vector_add("pto")
 
 
 if __name__ == "__main__":
