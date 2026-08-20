@@ -1050,7 +1050,10 @@ class TLPTOSourceWrapper:
 
     PTO codegen emits PTODSL source. This wrapper generates the host launch
     stub directly from PTODSL/TIR metadata and keeps the PTODSL source for
-    device compilation in libgen.
+    device compilation in libgen. For multi-kernel modules, launches follow
+    the host IR's call order. All device-kernel arguments must map by name to
+    the primary function's public arguments, so matching names share semantics
+    across kernels.
     """
 
     _TYPE_MAP = {
@@ -1088,31 +1091,40 @@ class TLPTOSourceWrapper:
         self.host_mod = host_mod
         self.pass_configs = pass_configs
         self.pto_kernel_source = source.strip()
-        self.pto_kernel_name = self._primary_kernel_name()
-        device_func = self._primary_device_func()
-        self.grid_dim = self._extract_grid_dim(device_func)
-        self.dynamic_smem = self._extract_dynamic_smem(device_func)
-        self.lib_code = self._generate_host_source(self.prim_func, self.pto_kernel_name, self.grid_dim, self.dynamic_smem)
+        device_functions = self._ordered_device_functions(self._device_functions())
+        self.pto_kernel_name = list(dict.fromkeys(g_var.name_hint for g_var, _ in device_functions))
+        kernel_launches = [
+            (g_var.name_hint, self._extract_grid_dim(func), self._extract_dynamic_smem(func)) for g_var, func in device_functions
+        ]
+        self.lib_code = self._generate_host_source(self.prim_func, kernel_launches)
 
-    def _primary_kernel_name(self) -> str:
+    def _device_functions(self) -> list[tuple[Any, tvm.tirx.PrimFunc]]:
         if self.device_mod is None:
-            raise RuntimeError("PTO wrapper requires device module to determine kernel name.")
+            raise RuntimeError("PTO wrapper requires a device module to determine kernel names.")
         functions = list(self.device_mod.functions.items())
-        if len(functions) != 1:
-            names = [g_var.name_hint for g_var, _ in functions]
-            raise RuntimeError(f"PTO JIT currently supports exactly one kernel, got {len(names)}: {names}")
-        g_var, _ = functions[0]
-        return g_var.name_hint
+        if not functions:
+            raise RuntimeError("PTO wrapper requires at least one device kernel.")
+        return functions
 
-    def _primary_device_func(self):
-        if self.device_mod is None:
-            raise RuntimeError("PTO wrapper requires device module to determine launch metadata.")
-        functions = list(self.device_mod.functions.items())
-        if len(functions) != 1:
-            names = [g_var.name_hint for g_var, _ in functions]
-            raise RuntimeError(f"PTO JIT currently supports exactly one kernel, got {len(names)}: {names}")
-        _, func = functions[0]
-        return func
+    def _ordered_device_functions(self, device_functions: list[tuple[Any, tvm.tirx.PrimFunc]]) -> list[tuple[Any, tvm.tirx.PrimFunc]]:
+        """Order device functions according to their calls in the host IR."""
+        if self.host_mod is None:
+            raise RuntimeError("PTO wrapper requires a host module to determine kernel launch order.")
+        if len(self.host_mod.functions) != 1:
+            raise RuntimeError("PTO wrapper requires exactly one host function to determine kernel launch order.")
+
+        host_code = str(next(iter(self.host_mod.functions.values())))
+        ordered_functions: list[tuple[int, Any, tvm.tirx.PrimFunc]] = []
+        for g_var, func in device_functions:
+            kernel_name = g_var.name_hint
+            call_patterns = (rf'T\.call_packed\("{re.escape(kernel_name)}"', rf'value="{re.escape(kernel_name)}"')
+            call_indices = [match.start() for pattern in call_patterns for match in re.finditer(pattern, host_code)]
+            if not call_indices:
+                raise RuntimeError(f"PTO device kernel `{kernel_name}` is not referenced by the host launch function.")
+            ordered_functions.extend((call_index, g_var, func) for call_index in call_indices)
+
+        ordered_functions.sort(key=lambda item: item[0])
+        return [(g_var, func) for _, g_var, func in ordered_functions]
 
     @property
     def prim_func(self):
@@ -1275,39 +1287,32 @@ class TLPTOSourceWrapper:
 
         return host_args, arg_by_name
 
-    def _generate_host_source(self, func, kernel_name: str, grid_dim: str, dynamic_smem: str) -> str:
+    def _generate_host_source(self, func, kernel_launches: list[tuple[str, str, str]]) -> str:
         host_args, host_arg_by_name = self._host_argument_infos(func)
-        device_arg_names = self._parse_ptodsl_kernel_args(kernel_name)
-        if len(device_arg_names) > len(host_args):
-            raise RuntimeError(f"PTO kernel `{kernel_name}` argument count mismatch: device={len(device_arg_names)}, host={len(host_args)}")
-
-        prototype_args = []
-        call_args = []
-        for arg_name in device_arg_names:
-            arg_info = host_arg_by_name.get(arg_name)
-            if arg_info is None:
-                host_names = [arg["name"] for arg in host_args]
-                raise RuntimeError(f"PTO kernel `{kernel_name}` argument `{arg_name}` does not match host arguments {host_names}")
-            prototype_args.append(arg_info["prototype_type"])
-            call_args.append(arg_info["call_arg"])
-
         launch_params = [f"{arg['host_type']} {arg['name']}" for arg in host_args]
-
-        prototype = (
-            "#ifndef AICORE\n"
-            "#define AICORE [aicore]\n"
-            "#endif\n"
-            f'extern "C" __global__ AICORE void {kernel_name}({", ".join(prototype_args)});'
-        )
         launch_params.append("void *stream")
-        call_arg_list = ", ".join(call_args)
-        launch_stub = (
-            f'extern "C" TL_EXPORT int call({", ".join(launch_params)}) {{\n'
-            f"  {kernel_name}<<<{grid_dim}, {dynamic_smem}, stream>>>({call_arg_list});\n"
-            "  return 0;\n"
-            "}\n"
-        )
-        return "\n\n".join([PREDEF_INIT_FUNC.format(""), prototype, launch_stub])
+        prototypes = []
+        launches = []
+        for kernel_name, grid_dim, dynamic_smem in kernel_launches:
+            device_arg_names = self._parse_ptodsl_kernel_args(kernel_name)
+            if len(device_arg_names) > len(host_args):
+                raise RuntimeError(
+                    f"PTO kernel `{kernel_name}` argument count mismatch: device={len(device_arg_names)}, host={len(host_args)}"
+                )
+            prototype_args, call_args = [], []
+            for arg_name in device_arg_names:
+                arg_info = host_arg_by_name.get(arg_name)
+                if arg_info is None:
+                    host_names = [arg["name"] for arg in host_args]
+                    raise RuntimeError(f"PTO kernel `{kernel_name}` argument `{arg_name}` does not match host arguments {host_names}")
+                prototype_args.append(arg_info["prototype_type"])
+                call_args.append(arg_info["call_arg"])
+            prototypes.append(f'extern "C" __global__ AICORE void {kernel_name}({", ".join(prototype_args)});')
+            launches.append(f"  {kernel_name}<<<{grid_dim}, {dynamic_smem}, stream>>>({', '.join(call_args)});")
+
+        header = "#ifndef AICORE\n#define AICORE [aicore]\n#endif"
+        launch_stub = f'extern "C" TL_EXPORT int call({", ".join(launch_params)}) {{\n' + "\n".join(launches) + "\n  return 0;\n}\n"
+        return "\n\n".join([PREDEF_INIT_FUNC.format(""), header, *prototypes, launch_stub])
 
 
 class TLMetalSourceWrapper:
@@ -1347,7 +1352,7 @@ class TLWrapper(BaseWrapper):
     target: Target | None = None
     lib: object | None = None
     pto_kernel_source: str | None = None
-    pto_kernel_name: str | None = None
+    pto_kernel_name: str | list[str] | None = None
 
     def __init__(self, target: Target):
         super().__init__()
