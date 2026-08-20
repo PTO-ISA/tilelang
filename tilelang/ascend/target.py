@@ -65,6 +65,13 @@ def normalize_ascend_target(target: TargetLike) -> Target | None:
         return None
 
 
+def normalize_asc_target(target: TargetLike) -> Target | None:
+    """Accept ``asc`` as the concise name for the AscendC backend."""
+    if isinstance(target, str) and target.strip() == "asc":
+        return normalize_ascend_target("ascend")
+    return None
+
+
 def normalize_pto_target(target: TargetLike) -> Target | None:
     if not isinstance(target, str) or target.strip() != "pto":
         return None

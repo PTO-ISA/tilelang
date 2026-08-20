@@ -1,10 +1,11 @@
-"""NPU e2e coverage for VMI tail masks and dtype conversion."""
+"""NPU e2e coverage for PTO VMI tail masks and dtype conversion."""
 
 from __future__ import annotations
 
 import pytest
 import torch
 import tilelang
+import tilelang.testing
 import tilelang.language as T
 
 
@@ -14,7 +15,7 @@ N = LANES + TAIL
 DEVICE = "npu"
 
 
-def vmi_tail_convert():
+def pto_tail_convert():
     @T.prim_func
     def main(A: T.Buffer((N,), "float32"), C: T.Buffer((N,), "float16")):
         with T.Kernel(1) as _:
@@ -46,12 +47,12 @@ def cpu_input():
 
 
 @pytest.mark.pto
-def test_vmi_tail_mask_and_conversion_e2e():
+def test_pto_tail_mask_and_conversion_e2e():
     a_cpu = cpu_input()
     expected = a_cpu.to(torch.float16)
     a = a_cpu.to(DEVICE)
 
-    kernel = tilelang.compile(vmi_tail_convert(), target="pto", out_idx=-1)
+    kernel = tilelang.compile(pto_tail_convert(), target="pto", out_idx=-1)
     c = kernel(a)
     torch.npu.synchronize()
 
@@ -59,5 +60,4 @@ def test_vmi_tail_mask_and_conversion_e2e():
 
 
 if __name__ == "__main__":
-    test_vmi_tail_mask_and_conversion_e2e()
-    print("PASS: test_vmi_tail_mask_and_conversion_e2e")
+    tilelang.testing.main()

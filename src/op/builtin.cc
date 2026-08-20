@@ -160,7 +160,7 @@ TIR_DEFINE_TL_BUILTIN(sync_warp).set_num_inputs(-1).set_attr<TCallEffectKind>(
 // VMI builtins are registered separately from the Python wrappers so later
 // passes/codegen can match on stable tl.vmi.* op identities. The positional
 // operand ABI plus annotation lowering rules are documented next to the
-// declarations in builtin.h and correspond to tilelang/language/vmi.py.
+// declarations in builtin.h and correspond to tilelang/ascend/language/vmi.py.
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vload).set_num_inputs(-1);
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vstore).set_num_inputs(-1);
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(create_mask).set_num_inputs(-1);
