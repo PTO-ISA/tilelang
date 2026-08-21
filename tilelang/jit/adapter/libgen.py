@@ -1,5 +1,6 @@
 from __future__ import annotations
 import ctypes
+import json
 import logging
 import os
 import shlex
@@ -7,10 +8,12 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import uuid
 from typing import Any
 from pathlib import Path
 
 from tvm.target import Target
+from tvm.contrib import utils
 
 from tilelang import tvm as tvm
 from tilelang.transform import PassConfigKey
@@ -21,7 +24,7 @@ from tilelang.contrib.nvcc import (
     get_target_arch_and_code,
 )
 from tilelang.contrib.rocm import find_hipcc, find_rocm_path, get_rocm_arch
-from tilelang.env import TILELANG_TEMPLATE_PATH
+from tilelang.env import TILELANG_TEMPLATE_PATH, env
 from tilelang.contrib.hip_resource_info import filter_and_record
 
 from .utils import is_ascend_target, is_cpu_target, is_cuda_target, is_hip_target, is_pto_target
@@ -34,13 +37,17 @@ class LibraryGenerator:
     libpath: str | None = None
     lib_code: str | None = None
     pto_kernel_source: str | None = None
-    pto_kernel_name: str | list[str] | None = None
+    pto_kernel_names: list[str] | None = None
     pass_configs: dict[str, Any] | None = None
     compile_flags: list[str] | None = None
 
     def __init__(self, target: Target, verbose: bool = False):
         self.target = target
         self.verbose = verbose
+        self.pto_kernel_source = None
+        self.pto_kernel_names = None
+        self._pto_temp_dir = None
+        self._keep_pto_temp_files = False
 
     def assign_pass_configs(self, pass_configs: dict[str, Any] | None = None):
         self.pass_configs = pass_configs
@@ -53,9 +60,17 @@ class LibraryGenerator:
     def update_lib_code(self, lib_code: str):
         self.lib_code = lib_code
 
-    def update_pto_kernel(self, pto_kernel_source: str, pto_kernel_name: str | list[str]):
+    def update_pto_kernels(self, pto_kernel_source: str, pto_kernel_names: list[str] | None):
+        if not pto_kernel_source.strip():
+            raise RuntimeError("PTO compilation requires a non-empty PTODSL kernel source.")
+        if not pto_kernel_names:
+            raise RuntimeError("PTO compilation requires at least one kernel name.")
+        if any(not isinstance(name, str) or not name for name in pto_kernel_names):
+            raise RuntimeError(f"Invalid PTO kernel names: {pto_kernel_names}")
+        if len(pto_kernel_names) != len(set(pto_kernel_names)):
+            raise RuntimeError(f"PTO kernel names must be unique: {pto_kernel_names}")
         self.pto_kernel_source = pto_kernel_source
-        self.pto_kernel_name = pto_kernel_name
+        self.pto_kernel_names = list(pto_kernel_names)
 
     # Assume currently we only support CUDA compilation
     def load_lib(self, lib_path: str | None = None):
@@ -245,7 +260,7 @@ class LibraryGenerator:
     @staticmethod
     def _compile_ptodsl_source_to_pto(
         ptodsl_source: str,
-        kernel_name: str,
+        kernel_names: list[str],
         src_path: str | Path,
         out_path: str | Path,
     ) -> None:
@@ -256,12 +271,13 @@ class LibraryGenerator:
         script = textwrap.dedent(
             """
             import importlib.util
+            import json
             import pathlib
             import sys
             import traceback
 
             src_path = pathlib.Path(sys.argv[1])
-            kernel_name = sys.argv[2]
+            kernel_names = json.loads(sys.argv[2])
             out_path = pathlib.Path(sys.argv[3])
             module_name = "_tilelang_ptodsl_compile"
 
@@ -275,9 +291,26 @@ class LibraryGenerator:
                 sys.exit(2)
 
             try:
-                kernel = getattr(module, kernel_name)
-                compiled = kernel.compile()
-                out_path.write_text(compiled.mlir_text(), encoding="utf-8")
+                kernels = []
+                for kernel_name in kernel_names:
+                    kernel = getattr(module, kernel_name)
+                    if not callable(getattr(kernel, "build", None)) or not callable(getattr(kernel, "compile", None)):
+                        raise TypeError(f"PTODSL entry `{kernel_name}` is not a compilable PTO kernel handle")
+                    kernels.append(kernel)
+
+                if len(kernels) == 1:
+                    pto_text = kernels[0].compile().mlir_text()
+                else:
+                    from ptodsl import pto
+
+                    merge_jit_modules = getattr(pto, "merge_jit_modules", None)
+                    if not callable(merge_jit_modules):
+                        raise RuntimeError(
+                            "PTO multi-kernel JIT requires ptodsl.pto.merge_jit_modules "
+                            "from ptoas-vmi 0.1.4 or newer"
+                        )
+                    pto_text = str(merge_jit_modules(*kernels))
+                out_path.write_text(pto_text, encoding="utf-8")
             except Exception:
                 traceback.print_exc()
                 sys.exit(3)
@@ -286,7 +319,7 @@ class LibraryGenerator:
 
         python_bin = sys.executable
         result = subprocess.run(
-            [python_bin, "-c", script, str(src_path), kernel_name, str(out_path)],
+            [python_bin, "-c", script, str(src_path), json.dumps(kernel_names), str(out_path)],
             text=True,
             capture_output=True,
         )
@@ -297,36 +330,41 @@ class LibraryGenerator:
         if result.returncode != 0:
             raise RuntimeError(
                 "PTODSL compile-only lowering failed.\n"
-                f"Command: {python_bin} -c <ptodsl-compile-script> {src_path} {kernel_name} {out_path}\n"
+                f"Kernels: {kernel_names}\n"
+                f"Command: {python_bin} -c <ptodsl-compile-script> {src_path} <kernel-names-json> {out_path}\n"
                 f"stdout:\n{result.stdout}\n"
                 f"stderr:\n{result.stderr}"
             )
 
     def compile_pto_lib(self):
+        try:
+            self._compile_pto_lib()
+        except Exception:
+            retained_dir = None
+            if self._keep_pto_temp_files and self._pto_temp_dir is not None:
+                retained_dir = self._pto_temp_dir.temp_dir
+            self._cleanup_pto_temp_files()
+            if retained_dir is not None:
+                logger.warning("PTO temporary directory retained after failure: %s", retained_dir)
+            raise
+
+    def _compile_pto_lib(self):
         if self.pto_kernel_source is None:
             raise RuntimeError("PTO compilation requires a PTODSL kernel source.")
-        if self.pto_kernel_name is None:
+        if not self.pto_kernel_names:
             raise RuntimeError("PTO compilation requires at least one kernel name.")
         if self.lib_code is None:
             raise RuntimeError("PTO compilation requires a host launch source.")
 
-        out_dir = tempfile.mkdtemp(prefix="tilelang_pto_")
-        kernel_names = [self.pto_kernel_name] if isinstance(self.pto_kernel_name, str) else self.pto_kernel_name
-        if not kernel_names:
-            raise RuntimeError("PTO compilation requires at least one kernel name.")
+        out_dir = self._create_pto_temp_dir()
+        ptodsl_path = os.path.join(out_dir, "kernel.ptodsl.py")
+        pto_path = os.path.join(out_dir, "kernel.pto")
+        fatobj_path = os.path.join(out_dir, "kernel.fatobj.o")
         launch_cpp = os.path.join(out_dir, "launch.cpp")
         launch_obj = os.path.join(out_dir, "launch.o")
         libpath = os.path.join(out_dir, "lib_kernel.so")
 
-        pto_paths = []
-        fatobj_paths = []
-        for index, kernel_name in enumerate(kernel_names):
-            ptodsl_path = os.path.join(out_dir, f"kernel_{index}.ptodsl.py")
-            pto_path = os.path.join(out_dir, f"kernel_{index}.pto")
-            fatobj_path = os.path.join(out_dir, f"kernel_{index}.fatobj.o")
-            self._compile_ptodsl_source_to_pto(self.pto_kernel_source, kernel_name, ptodsl_path, pto_path)
-            pto_paths.append(pto_path)
-            fatobj_paths.append(fatobj_path)
+        self._compile_ptodsl_source_to_pto(self.pto_kernel_source, self.pto_kernel_names, ptodsl_path, pto_path)
         with open(launch_cpp, "w", encoding="utf-8") as file:
             file.write(self.lib_code)
 
@@ -337,15 +375,15 @@ class LibraryGenerator:
         if not any(flag == "--pto-backend" or flag.startswith("--pto-backend=") for flag in pto_flags):
             pto_flags.append("--pto-backend=vpto")
 
-        for pto_path, fatobj_path in zip(pto_paths, fatobj_paths):
-            pto_cmd = ["ptoas", f"--pto-arch={pto_arch}", *pto_flags, pto_path, "-o", fatobj_path]
-            if self.verbose:
-                print(f"PTO compile command: {' '.join(pto_cmd)}")
-            result = subprocess.run(pto_cmd, text=True, capture_output=True)
-            if result.returncode != 0:
-                raise RuntimeError(
-                    f"PTO lowering failed.\nCommand: {' '.join(pto_cmd)}\nstderr:\n{result.stderr}\nstdout:\n{result.stdout}"
-                )
+        pto_cmd = ["ptoas", f"--pto-arch={pto_arch}", *pto_flags, pto_path, "-o", fatobj_path]
+        if self.verbose:
+            print(f"PTO compile command: {' '.join(pto_cmd)}")
+        result = subprocess.run(pto_cmd, text=True, capture_output=True)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"PTO lowering failed for kernels {self.pto_kernel_names}.\n"
+                f"Command: {' '.join(pto_cmd)}\nstderr:\n{result.stderr}\nstdout:\n{result.stdout}"
+            )
 
         from tilelang.contrib.bisheng import find_bisheng_path
 
@@ -385,7 +423,7 @@ class LibraryGenerator:
             "--cce-fatobj-link",
             "-o",
             libpath,
-            *fatobj_paths,
+            fatobj_path,
             launch_obj,
             "-Wl,--no-as-needed",
         ]
@@ -399,6 +437,36 @@ class LibraryGenerator:
 
         self.srcpath = launch_cpp
         self.libpath = libpath
+
+    def _create_pto_temp_dir(self) -> str:
+        if self._pto_temp_dir is not None:
+            return self._pto_temp_dir.temp_dir
+        os.makedirs(env.TILELANG_TMP_DIR, exist_ok=True)
+        work_path = os.path.join(env.TILELANG_TMP_DIR, f"pto_{os.getpid()}_{uuid.uuid4().hex}")
+        self._keep_pto_temp_files = not env.should_cleanup_temp_files()
+        self._pto_temp_dir = utils.tempdir(
+            custom_path=work_path,
+            keep_for_debug=self._keep_pto_temp_files,
+        )
+        return self._pto_temp_dir.temp_dir
+
+    def _cleanup_pto_temp_files(self):
+        """Release PTO build files during failed compilation cleanup."""
+        temp_dir = self._pto_temp_dir
+        if temp_dir is None or temp_dir.temp_dir is None:
+            return
+        if self._keep_pto_temp_files:
+            logger.debug("Keeping PTO temporary directory for debugging: %s", temp_dir.temp_dir)
+            return
+
+        work_dir = os.path.abspath(temp_dir.temp_dir)
+        temp_dir.remove()
+        self._pto_temp_dir = None
+        self._keep_pto_temp_files = False
+        for attr in ("srcpath", "libpath"):
+            path = getattr(self, attr, None)
+            if path and os.path.abspath(path).startswith(work_dir + os.sep):
+                setattr(self, attr, None)
 
     def remove_lib(self):
         if self.libpath:
