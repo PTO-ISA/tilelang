@@ -34,7 +34,7 @@ def test_pto_wrapper_supports_multiple_device_kernels_in_host_call_order():
         artifact.host_mod,
     )
 
-    assert wrapper.pto_kernel_name == ["main_kernel", "main_kernel_1"]
+    assert wrapper.pto_kernel_names == ["main_kernel", "main_kernel_1"]
     assert wrapper.pto_kernel_source.count("@pto.jit") == 2
     first_launch = wrapper.lib_code.index("main_kernel<<<")
     second_launch = wrapper.lib_code.index("main_kernel_1<<<")

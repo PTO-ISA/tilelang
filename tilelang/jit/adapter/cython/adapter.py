@@ -155,7 +155,7 @@ class CythonKernelAdapter(BaseKernelAdapter):
 
         self.lib_generator.update_lib_code(self.host_kernel_source)
         if self.wrapper.pto_kernel_source is not None:
-            self.lib_generator.update_pto_kernel(self.wrapper.pto_kernel_source, self.wrapper.pto_kernel_name)
+            self.lib_generator.update_pto_kernels(self.wrapper.pto_kernel_source, self.wrapper.pto_kernel_names)
         self.lib_generator.compile_lib()
         self.lib = self.lib_generator.load_lib()
 
