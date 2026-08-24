@@ -1156,6 +1156,8 @@ class TLPTOSourceWrapper:
         "float8_e4m3fn": "float8_e4m3_t",
         "float8_e5m2": "float8_e5m2_t",
         "float8_e8m0fnu": "float8_e8m0_t",
+        "float4_e2m1fn": "float4_e2m1x2_t",
+        "float4_e2m1fnx2": "float4_e2m1x2_t",
         "float64": "double",
         "int64": "int64_t",
         "int32": "int",
