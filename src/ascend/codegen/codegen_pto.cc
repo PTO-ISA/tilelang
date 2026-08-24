@@ -21,6 +21,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -65,6 +66,12 @@ std::string PtoTypeName(DataType t) {
   if (tl::IsAscendVectorizableFP8(t))
     return PtoFP8TypeName(t);
 
+  // PTO stores E2M1 as one byte containing a pair of logical FP4 values.
+  // TileLang expresses FP4 logically; PTO stores each pair as one f4e2m1x2
+  // element.
+  if (t.is_float4_e2m1fn()) {
+    return "pto.f4e2m1x2";
+  }
   ICHECK(t.is_scalar()) << "PTO scalar type expected, got " << t;
   if (t.is_float()) {
     if (t.bits() == 32)
@@ -135,6 +142,8 @@ DataType ParsePTODtype(const std::string &dtype_name) {
     return DataType::Float8E4M3FN();
   if (dtype_name == "float8_e5m2" || dtype_name == "float8_e5m2_t")
     return DataType::Float8E5M2();
+  if (dtype_name == "float4_e2m1fn" || dtype_name == "float4_e2m1fnx2")
+    return DataType::Float4E2M1FN(2);
   if (dtype_name == "int64")
     return DataType::Int(64);
   if (dtype_name == "int32")
@@ -1514,6 +1523,20 @@ CodeGenTileLangPTO::PrintVmiAnnotationValue(const std::string &key,
   return os.str();
 }
 
+// Returns true if a tl.vmi.vcvt narrows logical BF16 values to FP4.  PTO only
+// exposes FP4 as f4e2m1x2, so this call packs its BF16 input in codegen.
+static bool
+IsVmiVcvtToFp4(const std::vector<std::pair<std::string, ObjectRef>> &kwargs) {
+  for (const auto &[key, value] : kwargs) {
+    if (key == "to_dtype") {
+      if (const auto *str = value.as<StringImmNode>()) {
+        return str->value == "float4_e2m1fn";
+      }
+    }
+  }
+  return false;
+}
+
 void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
                                           std::ostream &os) {
   auto opt_call_op = op->op.as<Op>();
@@ -1534,6 +1557,18 @@ void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
   std::sort(kwargs.begin(), kwargs.end(), [](const auto &lhs, const auto &rhs) {
     return lhs.first < rhs.first;
   });
+
+  if (op_name == "tl.vmi.vcvt" && IsVmiVcvtToFp4(kwargs)) {
+    ICHECK_EQ(op->args.size(), 1U)
+        << "Packed FP4 vcvt expects exactly one BF16 source vector";
+    const DataType source_dtype = op->args[0].dtype();
+    ICHECK(source_dtype.is_vector() && source_dtype.element_of().is_bfloat16())
+        << "Packed FP4 vcvt only supports bfloat16 source vectors, got "
+        << source_dtype;
+    ICHECK_EQ(source_dtype.lanes() % 2, 0)
+        << "Packed FP4 vcvt requires an even BF16 lane count, got "
+        << source_dtype.lanes();
+  }
 
   os << "pto." << op_name.substr(3) << "(";
   bool needs_comma = false;
@@ -1624,6 +1659,14 @@ void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
         os << PtoScalarType(arg.dtype()) << "(";
         print_scalar_literal_value(arg);
         os << ")";
+      } else if (op_name == "tl.vmi.vcvt" && i == 0 && IsVmiVcvtToFp4(kwargs) &&
+                 arg.dtype().is_vector() &&
+                 arg.dtype().element_of().is_bfloat16()) {
+        // PTOAS vcvt only accepts bf16x2 -> f4x2; pair the bf16 source
+        // (vinterpret_cast is a physical no-op) inline. Note: pto.vmi.bf16x2
+        // is the BF16x2Type dtype, distinct from the MLIR vector pto.bf16x2.
+        os << "pto.vmi.vinterpret_cast(" << PrintExpr_(arg)
+           << ", to_dtype=pto.vmi.bf16x2)";
       } else {
         os << PrintExpr_(arg);
       }
@@ -1638,6 +1681,13 @@ void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
     os << key << "=";
     if (op_name == "tl.vmi.vcvt" && key == "to_dtype" && op->dtype.is_int()) {
       os << PtoSignedIntegerTypeName(op->dtype.element_of());
+    } else if (op_name == "tl.vmi.vload" && key == "size" &&
+               op->dtype.element_of().is_float4_e2m1fn()) {
+      // TileLang VMI exposes FP4 lane counts logically.  PTO represents each
+      // f4e2m1x2 byte as one physical VMI element, so its vload size must be
+      // expressed in packed-pair units.  The frontend has already converted
+      // the corresponding address offset to the same physical unit.
+      os << "(" << PrintVmiAnnotationValue(key, value) << " // 2)";
     } else {
       os << PrintVmiAnnotationValue(key, value);
     }

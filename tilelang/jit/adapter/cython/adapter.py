@@ -166,7 +166,7 @@ class CythonKernelAdapter(BaseKernelAdapter):
             error_msg += f"\n{self.lib_code}"
             raise RuntimeError(f"Initialization failed: {error_msg}")
 
-        self.cython_wrapper = CythonKernelWrapper(self.result_idx, self.params, self.lib, *_device_providers())
+        self.cython_wrapper = CythonKernelWrapper(self.result_idx, self.params, self.lib, *_device_providers(), target=self.target)
         self.cython_wrapper.set_dynamic_symbolic_map(self.dynamic_symbolic_map)
         self.cython_wrapper.set_dynamic_symbolic_sources(self.dynamic_symbolic_sources)
         self.cython_wrapper.set_buffer_dtype_map(self.buffer_dtype_map)
@@ -230,7 +230,7 @@ class CythonKernelAdapter(BaseKernelAdapter):
             error_msg = adapter.lib.get_last_error().decode("utf-8")
             raise RuntimeError(f"Initialization failed: {error_msg}")
 
-        adapter.cython_wrapper = CythonKernelWrapper(adapter.result_idx, adapter.params, adapter.lib, *_device_providers())
+        adapter.cython_wrapper = CythonKernelWrapper(adapter.result_idx, adapter.params, adapter.lib, *_device_providers(), target=adapter.target)
         adapter.cython_wrapper.set_dynamic_symbolic_map(adapter.dynamic_symbolic_map)
         adapter.cython_wrapper.set_dynamic_symbolic_sources(adapter.dynamic_symbolic_sources)
         adapter.cython_wrapper.set_buffer_dtype_map(adapter.buffer_dtype_map)
@@ -348,7 +348,7 @@ class CythonKernelAdapter(BaseKernelAdapter):
             if param in buffer_map:
                 buffer = buffer_map[param]
                 static_shape, static_strides = [], []
-                packing_factor = 1
+                packing_factor = KernelParam.from_buffer(buffer).storage_packing_factor(target=self.target)
                 innermost_dim = len(buffer.shape) - 1
                 for j, s in enumerate(buffer.shape):
                     if isinstance(s, tirx.IntImm):
