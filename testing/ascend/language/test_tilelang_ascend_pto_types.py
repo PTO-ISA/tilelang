@@ -285,6 +285,31 @@ def test_pto_bufferload_addresses_lower_to_explicit_ptr_offset_args():
     assert str(vstore_call.args[2]) == "32"
 
 
+def test_pto_fp4_multidim_bufferload_uses_packed_linear_offset():
+    @T.prim_func
+    def func(
+        A: T.Buffer((256,), "bfloat16"),
+        B: T.Buffer((2, 256), "float4_e2m1fn"),
+    ):
+        with T.Kernel(1) as _:
+            a_ub = T.alloc_shared((256,), "bfloat16")
+            b_ub = T.alloc_shared((2, 256), "float4_e2m1fn")
+            with T.SimdVF():
+                mask = T.vmi.create_mask(128, size=128)
+                fp4 = T.vmi.vcvt(T.vmi.vload(a_ub[0], size=256), "float4_e2m1fn")
+                T.vmi.vstore(fp4, b_ub[1, 0], mask)
+                loaded = T.vmi.vload(b_ub[1, 0], size=256)
+                T.evaluate(loaded)
+
+    pto_calls = _collect_pto_calls(func)
+    vload = next(call for call in pto_calls if _op_name(call) == "tl.vmi.vload" and str(call.dtype) == "float4_e2m1fnx256")
+    vstore = next(call for call in pto_calls if _op_name(call) == "tl.vmi.vstore")
+    assert _op_name(vload.args[0]) == "tl.access_ptr"
+    assert str(vload.args[1]) == "128"
+    assert _op_name(vstore.args[1]) == "tl.access_ptr"
+    assert str(vstore.args[2]) == "128"
+
+
 @pytest.mark.parametrize(
     "call, message",
     [
@@ -699,6 +724,113 @@ def test_pto_vload_dintlv_returns_pair(monkeypatch):
     assert pair[1][2] == "tl.vmi.pair_get"
 
 
+def test_vmi_fp4_rejects_unsupported_paths(monkeypatch):
+    monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
+    fp4 = SimpleNamespace(dtype="float4_e2m1fnx256")
+
+    with pytest.raises(ValueError, match="even FP4 lane count"):
+        T.vmi.vload(fp4, size=255)
+    with pytest.raises(TypeError, match="does not unpack or convert packed FP4"):
+        T.vmi.vload(fp4, size=256, dist_mode="unpack", to_dtype="uint8")
+    with pytest.raises(TypeError, match='does not support packed FP4 with dist_mode="dintlv"'):
+        T.vmi.vload(fp4, size=256, dist_mode="dintlv")
+    with pytest.raises(TypeError, match="does not support packed FP4 vectors"):
+        T.vmi.vadd(fp4, fp4, SimpleNamespace(dtype="boolx256"))
+    with pytest.raises(TypeError, match="does not support packed FP4 vectors"):
+        T.vmi.vsel(SimpleNamespace(dtype="boolx256"), fp4, fp4)
+
+
+def test_vmi_fp4_vcvt_validates_pto_specific_options(monkeypatch):
+    calls = []
+    monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        T.vmi,
+        "_call_vmi",
+        lambda op, result_dtype, *args, **kwargs: calls.append((op, result_dtype, args, kwargs)) or "ok",
+    )
+    bf16 = SimpleNamespace(dtype="bfloat16x256")
+
+    assert T.vmi.vcvt(bf16, "float4_e2m1fn", rounding="C") == "ok"
+    assert calls[-1][3]["rounding"] == "C"
+    with pytest.raises(ValueError, match="expected one of A, C, F, R, Z"):
+        T.vmi.vcvt(bf16, "float4_e2m1fn", rounding="H")
+    with pytest.raises(ValueError, match="does not support saturate"):
+        T.vmi.vcvt(bf16, "float4_e2m1fn", saturate="SAT")
+
+
+def test_vmi_gather_rejects_packed_fp4_source(monkeypatch):
+    monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
+    fp4_ptr = SimpleNamespace(dtype="ptr", type_annotation=SimpleNamespace(element_type=SimpleNamespace(dtype="float4_e2m1fn")))
+    offsets = SimpleNamespace(dtype="int32x64")
+    mask = SimpleNamespace(dtype="boolx64")
+
+    with pytest.raises(TypeError, match="does not support packed FP4 source buffers"):
+        T.vmi.vgather(fp4_ptr, offsets, mask)
+    with pytest.raises(TypeError, match="does not support packed FP4 source buffers"):
+        T.vmi.vgatherb(fp4_ptr, offsets, mask)
+
+
+def test_vmi_fp4_vstore_requires_physical_mask_lanes(monkeypatch):
+    monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
+    monkeypatch.setattr(T.vmi, "_call_vmi", lambda *args, **kwargs: "ok")
+    fp4 = SimpleNamespace(dtype="float4_e2m1fnx256")
+    ptr = SimpleNamespace(dtype="ptr")
+
+    with pytest.raises(TypeError, match=r"physical FP4x2 mask with half as many lanes.*expected 128, got 256"):
+        T.vmi.vstore(fp4, ptr, mask=SimpleNamespace(dtype="boolx256"))
+    assert T.vmi.vstore(fp4, ptr, mask=SimpleNamespace(dtype="boolx128")) == "ok"
+
+
+def test_vmi_vstore_dintlv_rejects_mismatched_pair_types(monkeypatch):
+    monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
+    with pytest.raises(TypeError, match="requires identical VMI vector types"):
+        T.vmi.vstore(
+            (SimpleNamespace(dtype="float16x64"), SimpleNamespace(dtype="float16x32")),
+            SimpleNamespace(dtype="ptr"),
+            dist_mode="dintlv",
+        )
+
+
+def test_vmi_fp4_vload_keeps_logical_size_and_packs_offset(monkeypatch):
+    calls = []
+    monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        T.vmi,
+        "_call_vmi",
+        lambda op, result_dtype, *args, **kwargs: calls.append((op, result_dtype, args, kwargs)) or "ok",
+    )
+    fp4_ptr = SimpleNamespace(dtype="ptr", type_annotation=SimpleNamespace(element_type=SimpleNamespace(dtype="float4_e2m1fn")))
+
+    assert T.vmi.vload(fp4_ptr, offset=256, size=256) == "ok"
+    assert calls[-1] == (
+        "vload",
+        "float4_e2m1fnx256",
+        (fp4_ptr, 128),
+        {
+            "size": 256,
+            "to_dtype": None,
+            "stride": None,
+            "block_stride": None,
+            "repeat_stride": None,
+            "dist_mode": None,
+            "group": None,
+            "loc": None,
+            "ip": None,
+        },
+    )
+
+
+def test_vmi_fp4_rejects_non_contiguous_modes(monkeypatch):
+    monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
+    fp4_ptr = SimpleNamespace(dtype="ptr", type_annotation=SimpleNamespace(element_type=SimpleNamespace(dtype="float4_e2m1fn")))
+    with pytest.raises(TypeError, match="only supports contiguous packed FP4 loads"):
+        T.vmi.vload(fp4_ptr, size=256, group=2, stride=128)
+    with pytest.raises(TypeError, match="only supports contiguous packed FP4 loads"):
+        T.vmi.vload(fp4_ptr, size=256, dist_mode="brc")
+    with pytest.raises(TypeError, match="only supports contiguous packed FP4 stores"):
+        T.vmi.vstore(SimpleNamespace(dtype="float4_e2m1fnx256"), fp4_ptr, group=2, stride=128)
+
+
 def test_pto_pair_return_path_can_be_reused_for_vstore(monkeypatch):
     pair = T.vmi.VmiPair(SimpleNamespace(dtype="float32x64"))
     calls = []
@@ -1039,6 +1171,50 @@ def test_pto_codegen_uses_signed_integers_for_vcvt(source_dtype, target_dtype, s
     assert "pto.vbitcast(" not in source
     assert f"to_dtype={signed_dtype}" in source
     assert f"to_dtype=pto.i{target_dtype.removeprefix('int')}" not in source
+
+
+def test_vmi_pto_codegen_uses_physical_fp4_storage_units():
+    @T.prim_func
+    def func(
+        A: T.Buffer((256,), "bfloat16"),
+        B: T.Buffer((512,), "float4_e2m1fn"),
+    ):
+        with T.Kernel(1) as _:
+            a_ub = T.alloc_shared((256,), "bfloat16")
+            b_ub = T.alloc_shared((512,), "float4_e2m1fn")
+            with T.SimdVF():
+                mask = T.vmi.create_mask(128, size=128)
+                bf16 = T.vmi.vload(a_ub[0], size=256)
+                fp4 = T.vmi.vcvt(bf16, "float4_e2m1fn")
+                T.vmi.vstore(fp4, b_ub[256], mask)
+                loaded = T.vmi.vload(b_ub[256], size=256)
+                T.evaluate(loaded)
+
+    source = lower(func, target="pto").kernel_source
+    vstore_line = next(line for line in source.splitlines() if "pto.vmi.vstore(fp4," in line)
+    vload_line = next(line for line in source.splitlines() if "pto.vmi.vload(" in line and "f4e2m1x2" in line)
+    assert "mask = pto.vmi.create_mask(128, size=128)" in source
+    assert ", 128, " in vstore_line
+    assert ", 128, " in vload_line
+    assert "size=(256 // 2)" in vload_line
+
+
+def test_vmi_pto_codegen_preserves_physical_fp4_mask_group():
+    @T.prim_func
+    def func(
+        A: T.Buffer((256,), "bfloat16"),
+        B: T.Buffer((256,), "float4_e2m1fn"),
+    ):
+        with T.Kernel(1) as _:
+            a_ub = T.alloc_shared((256,), "bfloat16")
+            b_ub = T.alloc_shared((256,), "float4_e2m1fn")
+            with T.SimdVF():
+                physical_mask = T.vmi.create_mask(4, size=128, group=4)
+                fp4 = T.vmi.vcvt(T.vmi.vload(a_ub[0], size=256), "float4_e2m1fn")
+                T.vmi.vstore(fp4, b_ub[0], physical_mask)
+
+    source = lower(func, target="pto").kernel_source
+    assert "physical_mask = pto.vmi.create_mask(4, group=4, size=128)" in source
 
 
 def test_pto_codegen_rejects_non_pto_ascend_backend():

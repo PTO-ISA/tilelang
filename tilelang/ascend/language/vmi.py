@@ -138,11 +138,19 @@ def _require_mask(mask, *, context: str):
     return mask
 
 
-def _require_same_vreg_type(*values, context: str):
+def _require_same_vreg_type(*values, context: str, allow_packed_fp4: bool = False):
     dtypes = [_dtype_of(value) for value in values]
     if any(dtype != dtypes[0] for dtype in dtypes[1:]):
         raise TypeError(f"{context} requires identical VMI vector types")
+    if not allow_packed_fp4:
+        _reject_packed_fp4(*values, context=context)
     return dtypes[0]
+
+
+def _reject_packed_fp4(*values, context: str):
+    """Reject FP4 values from VMI operations without packed-FP4 semantics."""
+    if any(str(_element_dtype_of(value)) == "float4_e2m1fn" for value in values):
+        raise TypeError(f"{context} does not support packed FP4 vectors")
 
 
 def _require_integer_vector(value, *, context: str):
@@ -240,16 +248,16 @@ def _scope_guarded(fn):
     return wrapper
 
 
-def _normalize_pto_vcvt_rounding(mode, *, context: str):
+def _normalize_pto_vcvt_rounding(mode, *, context: str, allowed=None):
     token = mode
     if not isinstance(token, str):
         token = str(token)
         if "." in token:
             token = token.rsplit(".", 1)[-1]
     normalized = token.strip().upper()
-    allowed = {"R", "A", "H", "Z"}
-    if normalized not in allowed:
-        expected = ", ".join(sorted(allowed))
+    allowed_modes = set(allowed or {"R", "A", "H", "Z"})
+    if normalized not in allowed_modes:
+        expected = ", ".join(sorted(allowed_modes))
         raise ValueError(f"{context} does not support rounding {mode!r}; expected one of {expected}")
     return normalized
 
@@ -310,8 +318,24 @@ def _resolve_ptr_and_offset(source, offset=None, *, access_type: str, extent=Non
         raise TypeError("T.vmi buffer addresses do not accept an offset; express the offset in the buffer index")
     if isinstance(source, BufferLoad):
         if len(source.indices) != 1:
-            ptr = access_ptr(source, access_type, extent=extent, offset=0)
-            return ptr, _zero_offset()
+            # Keep the linear element offset outside access_ptr.  In particular,
+            # FP4 callers convert this logical offset to f4e2m1x2 units before
+            # PTO emission; leaving it embedded in access_ptr would make PTO
+            # interpret it as an already-packed offset.
+            strides = source.buffer.strides
+            if len(strides) != len(source.indices):
+                strides = []
+                for index in range(len(source.indices)):
+                    stride = 1
+                    for extent_dim in source.buffer.shape[index + 1 :]:
+                        stride = stride * extent_dim
+                    strides.append(stride)
+            linear_offset = None
+            for index, stride in zip(source.indices, strides):
+                term = index * stride
+                linear_offset = term if linear_offset is None else linear_offset + term
+            ptr = access_ptr(source.buffer, access_type, extent=extent, offset=0)
+            return ptr, linear_offset if linear_offset is not None else _zero_offset()
         ptr = access_ptr(source.buffer, access_type, extent=extent, offset=0)
         return ptr, source.indices[0]
     if isinstance(source, (Buffer, BufferRegion)):
@@ -386,6 +410,18 @@ def _pair_get(pair, index):
     return tirx.call_intrin(str(inner.dtype), _Op("tl.vmi.pair_get"), inner, index)
 
 
+def _pack_fp4_element_offset(value, *, context: str):
+    """Convert a logical FP4 element offset to packed-pair units."""
+    constant = _constant_int(value)
+    if constant is not None:
+        if constant % 2:
+            raise ValueError(f"{context} requires an even FP4 element offset, got {constant}")
+        return constant // 2
+    # Dynamic offsets are expressed in logical FP4 element units and lowered
+    # to packed-pair units.
+    return value // 2
+
+
 @_scope_guarded
 def vload(
     source,
@@ -417,10 +453,20 @@ def vload(
     if to_dtype is not None and dist_mode != "unpack":
         raise TypeError('T.vmi.vload(...) accepts to_dtype only when dist_mode="unpack"')
     source_elem = _require_address_element_dtype(source, context="T.vmi.vload(...)")
-    # Keep si*/ui* spelling for PTODSL annotations (signless TIR int* → pto.i*
+    # Keep si*/ui* spelling for PTODSL annotations (signless TIR int* -> pto.i*
     # is wrong for int-to-int widen). Unpack vload itself is not legalized on
     # the current VPTO path; this preserves a correct annotation if enabled later.
     to_dtype_annot = None
+    is_packed_fp4 = str(source_elem) == "float4_e2m1fn"
+    if is_packed_fp4:
+        if size % 2:
+            raise ValueError("T.vmi.vload(...) requires an even FP4 lane count for packed FP4 storage")
+        if to_dtype is not None or dist_mode == "unpack":
+            raise TypeError("T.vmi.vload(...) does not unpack or convert packed FP4 source vectors")
+        if dist_mode == "dintlv":
+            raise TypeError('T.vmi.vload(...) does not support packed FP4 with dist_mode="dintlv"')
+        if group is not None or block_stride is not None or repeat_stride is not None or dist_mode == "brc":
+            raise TypeError("T.vmi.vload(...) only supports contiguous packed FP4 loads")
     if dist_mode == "unpack":
         if to_dtype is None:
             raise TypeError('T.vmi.vload(...) requires to_dtype when dist_mode="unpack"')
@@ -435,6 +481,8 @@ def vload(
         elem_dtype=to_dtype if to_dtype is not None else source_elem,
     )
     ptr, extra_offset = _resolve_ptr_and_offset(source, offset, access_type="r", extent=size)
+    if is_packed_fp4:
+        extra_offset = _pack_fp4_element_offset(extra_offset, context="T.vmi.vload(...)")
     attrs = {
         "size": size,
         "to_dtype": to_dtype_annot,
@@ -484,24 +532,51 @@ def vstore(
     )
     if group is not None and mask is not None:
         raise TypeError("T.vmi.vstore(...) group mode does not take a mask operand")
+    value_dtype = None
     if dist_mode == "dintlv":
         if isinstance(values, VmiPair):
+            value_dtype = _element_dtype_of(values)
             values = tuple(values)
         elif not _is_sequence(values) or len(values) != 2:
             raise TypeError('T.vmi.vstore(...) with dist_mode="dintlv" requires an (even, odd) pair')
+        else:
+            _require_same_vreg_type(values[0], values[1], context="T.vmi.vstore(...)", allow_packed_fp4=True)
     elif isinstance(values, VmiPair) or _is_sequence(values):
         raise TypeError('T.vmi.vstore(...) expects a single VMI vector unless dist_mode="dintlv"')
 
     store_extent = _lanes_of(values[0]) if _is_sequence(values) else _lanes_of(values)
     ptr, extra_offset = _resolve_ptr_and_offset(destination, offset, access_type="w", extent=store_extent)
     value_args = list(values) if _is_sequence(values) else [values]
+    if value_dtype is None:
+        value_dtype = _element_dtype_of(values[0]) if _is_sequence(values) else _element_dtype_of(values)
+    if str(value_dtype) == "float4_e2m1fn":
+        if store_extent % 2:
+            raise ValueError("T.vmi.vstore(...) requires an even FP4 lane count for packed FP4 storage")
+        if dist_mode == "dintlv":
+            raise TypeError('T.vmi.vstore(...) does not support packed FP4 with dist_mode="dintlv"')
+        if group is not None or block_stride is not None or repeat_stride is not None:
+            raise TypeError("T.vmi.vstore(...) only supports contiguous packed FP4 stores")
+        extra_offset = _pack_fp4_element_offset(extra_offset, context="T.vmi.vstore(...)")
+        if mask is not None:
+            mask = _require_mask(mask, context="T.vmi.vstore(...) of FP4")
+            if not str(_dtype_of(mask)).startswith("bool"):
+                raise TypeError("T.vmi.vstore(...) of FP4 expects a VMI mask operand")
+            physical_lanes = store_extent // 2
+            if _lanes_of(mask) != physical_lanes:
+                raise TypeError(
+                    "T.vmi.vstore(...) of FP4 requires a physical FP4x2 mask with "
+                    f"half as many lanes as its {store_extent}-lane logical FP4 value "
+                    f"(expected {physical_lanes}, got {_lanes_of(mask)})"
+                )
+    elif mask is not None:
+        mask = _require_mask(mask, context="T.vmi.vstore(...)")
     return _call_vmi(
         "vstore",
         "void",
         *value_args,
         ptr,
         extra_offset,
-        _require_mask(mask, context="T.vmi.vstore(...)") if mask is not None else None,
+        mask,
         stride=stride,
         block_stride=block_stride,
         repeat_stride=repeat_stride,
@@ -517,6 +592,7 @@ def vstore(
 def vci(base, *, size, order=None, loc=None, ip=None):
     if size is None:
         raise TypeError("T.vmi.vci(...) requires size")
+    _reject_packed_fp4(base, context="T.vmi.vci(...)")
     result_dtype = vreg(size, _element_dtype_of(base))
     return _call_vmi("vci", result_dtype, base, size=size, order=order, loc=loc, ip=ip)
 
@@ -536,6 +612,7 @@ def _binary_same_dtype(name):
 def _unary_same_dtype(name):
     @_scope_guarded
     def wrapper(source, mask=None, *, pmode=None, loc=None, ip=None):
+        _reject_packed_fp4(source, context=f"T.vmi.{name}(...)")
         args = [source]
         if mask is not None:
             args.append(mask)
@@ -547,6 +624,7 @@ def _unary_same_dtype(name):
 def _vec_scalar_same_dtype(name):
     @_scope_guarded
     def wrapper(source, scalar, mask, *, pmode=None, loc=None, ip=None):
+        _reject_packed_fp4(source, context=f"T.vmi.{name}(...)")
         return _call_vmi(
             name,
             _dtype_of(source),
@@ -601,6 +679,7 @@ def vcmp(lhs, rhs, seed, cmp, *, pmode=None, loc=None, ip=None):
 @_scope_guarded
 def vcmps(source, scalar, seed, cmp, *, pmode=None, loc=None, ip=None):
     context = "T.vmi.vcmps(...)"
+    _reject_packed_fp4(source, context=context)
     seed = _require_compatible_mask(seed, _lanes_of(source), context=context)
     cmp = _normalize_compare_predicate(cmp, context=context)
     return _call_vmi("vcmps", _dtype_of(seed), source, scalar, seed, cmp, pmode=pmode, loc=loc, ip=ip)
@@ -616,6 +695,7 @@ def vsel(mask, true_value, false_value, *, pmode=None, loc=None, ip=None):
 
 @_scope_guarded
 def vselr(source, index, *, loc=None, ip=None):
+    _reject_packed_fp4(source, context="T.vmi.vselr(...)")
     _require_integer_vector(index, context="T.vmi.vselr(...)")
     if _lanes_of(source) != _lanes_of(index):
         raise TypeError("T.vmi.vselr(...) requires source and index lane counts to match")
@@ -626,6 +706,7 @@ def vselr(source, index, *, loc=None, ip=None):
 def vbrc(value, *, size, group=None, loc=None, ip=None):
     if size is None:
         raise TypeError("T.vmi.vbrc(...) requires size")
+    _reject_packed_fp4(value, context="T.vmi.vbrc(...)")
     if group is not None:
         if isinstance(group, bool) or not isinstance(group, int):
             raise TypeError("T.vmi.vbrc(...) requires group to be a positive Python integer")
@@ -649,6 +730,7 @@ def vbrc(value, *, size, group=None, loc=None, ip=None):
 @_scope_guarded
 def vcadd(source, mask, *, group=None, pmode=None, reassoc=None, loc=None, ip=None):
     context = "T.vmi.vcadd(...)"
+    _reject_packed_fp4(source, context=context)
     elem_dtype = _element_dtype_of(source)
     if reassoc is None and str(elem_dtype).startswith(("float", "bfloat")):
         raise TypeError(
@@ -675,6 +757,7 @@ def vcadd(source, mask, *, group=None, pmode=None, reassoc=None, loc=None, ip=No
 
 @_scope_guarded
 def vcmax(source, mask, *, group=None, pmode=None, loc=None, ip=None):
+    _reject_packed_fp4(source, context="T.vmi.vcmax(...)")
     lanes = 1 if group is None else _normalize_lanes(group, context="T.vmi.vcmax(..., group=...)")
     if group is not None and _lanes_of(source) % group != 0:
         raise ValueError("T.vmi.vcmax(...) requires source lanes to be divisible by group")
@@ -684,6 +767,7 @@ def vcmax(source, mask, *, group=None, pmode=None, loc=None, ip=None):
 
 @_scope_guarded
 def vcmin(source, mask, *, group=None, pmode=None, loc=None, ip=None):
+    _reject_packed_fp4(source, context="T.vmi.vcmin(...)")
     lanes = 1 if group is None else _normalize_lanes(group, context="T.vmi.vcmin(..., group=...)")
     if group is not None and _lanes_of(source) % group != 0:
         raise ValueError("T.vmi.vcmin(...) requires source lanes to be divisible by group")
@@ -698,7 +782,23 @@ def vcvt(source, to_dtype=None, mask=None, *, rounding=None, saturate=None, pmod
     if to_dtype is None:
         raise TypeError("T.vmi.vcvt(...) requires to_dtype")
     to_dtype = _scalar_dtype(to_dtype, context="T.vmi.vcvt(..., to_dtype=...)")
-    if rounding is not None:
+    src_dt = _element_dtype_of(source)
+    if str(to_dtype) == "float4_e2m1fn":
+        if str(src_dt) != "bfloat16":
+            raise TypeError("T.vmi.vcvt(...) supports packed FP4 only for bfloat16 to float4_e2m1fn")
+        if _lanes_of(source) % 2:
+            raise ValueError("T.vmi.vcvt(...) requires an even BF16 lane count for packed FP4")
+        if rounding is not None:
+            rounding = _normalize_pto_vcvt_rounding(
+                rounding,
+                context="T.vmi.vcvt(..., rounding=...)",
+                allowed={"R", "A", "F", "Z", "C"},
+            )
+        if saturate is not None:
+            raise ValueError("T.vmi.vcvt(...) does not support saturate for bfloat16 to packed FP4 conversion")
+    elif str(src_dt) == "float4_e2m1fn":
+        raise TypeError("T.vmi.vcvt(...) does not support packed FP4 source vectors")
+    elif rounding is not None:
         rounding = _normalize_pto_vcvt_rounding(rounding, context="T.vmi.vcvt(..., rounding=...)")
     return _call_vmi(
         "vcvt",
@@ -748,6 +848,7 @@ def vinterpret_cast(source, to_dtype=None, *, loc=None, ip=None):
 
 @_scope_guarded
 def vexpdif(x, max_value, mask, *, pmode=None, loc=None, ip=None):
+    _reject_packed_fp4(x, max_value, context="T.vmi.vexpdif(...)")
     return _call_vmi(
         "vexpdif", _dtype_of(max_value), x, max_value, _require_mask(mask, context="T.vmi.vexpdif(...)"), pmode=pmode, loc=loc, ip=ip
     )
@@ -755,16 +856,19 @@ def vexpdif(x, max_value, mask, *, pmode=None, loc=None, ip=None):
 
 @_scope_guarded
 def vaxpy(x, acc, alpha, mask, *, pmode=None, loc=None, ip=None):
+    _reject_packed_fp4(x, acc, context="T.vmi.vaxpy(...)")
     return _call_vmi("vaxpy", _dtype_of(acc), x, acc, alpha, _require_mask(mask, context="T.vmi.vaxpy(...)"), pmode=pmode, loc=loc, ip=ip)
 
 
 @_scope_guarded
 def vlrelu(x, slope, mask, *, pmode=None, loc=None, ip=None):
+    _reject_packed_fp4(x, context="T.vmi.vlrelu(...)")
     return _call_vmi("vlrelu", _dtype_of(x), x, slope, _require_mask(mask, context="T.vmi.vlrelu(...)"), pmode=pmode, loc=loc, ip=ip)
 
 
 @_scope_guarded
 def vprelu(x, alpha, mask, *, pmode=None, loc=None, ip=None):
+    _reject_packed_fp4(x, context="T.vmi.vprelu(...)")
     return _call_vmi("vprelu", _dtype_of(x), x, alpha, _require_mask(mask, context="T.vmi.vprelu(...)"), pmode=pmode, loc=loc, ip=ip)
 
 
@@ -782,6 +886,7 @@ def vmull(a, b, mask, *, pmode=None, loc=None, ip=None):
 
 @_scope_guarded
 def vmula(acc, lhs, rhs, mask, *, pmode=None, loc=None, ip=None):
+    _reject_packed_fp4(acc, lhs, rhs, context="T.vmi.vmula(...)")
     return _call_vmi("vmula", _dtype_of(acc), acc, lhs, rhs, _require_mask(mask, context="T.vmi.vmula(...)"), pmode=pmode, loc=loc, ip=ip)
 
 
@@ -809,6 +914,8 @@ def vchist(acc, source, mask, *, loc=None, ip=None):
 def vgather(source, offsets, mask, *, pmode=None, loc=None, ip=None):
     _require_ub_address(source, context="T.vmi.vgather(...)")
     source_elem = _require_address_element_dtype(source, context="T.vmi.vgather(...)")
+    if str(source_elem) == "float4_e2m1fn":
+        raise TypeError("T.vmi.vgather(...) does not support packed FP4 source buffers")
     _require_integer_vector(offsets, context="T.vmi.vgather(...)")
     mask = _require_compatible_mask(mask, _lanes_of(offsets), context="T.vmi.vgather(...)")
     ptr, offset = _resolve_ptr_and_offset(source, access_type="r", extent=_lanes_of(offsets))
@@ -829,6 +936,8 @@ def vgather(source, offsets, mask, *, pmode=None, loc=None, ip=None):
 def vgatherb(source, offsets, mask, *, pmode=None, loc=None, ip=None):
     _require_ub_address(source, context="T.vmi.vgatherb(...)")
     source_elem = _require_address_element_dtype(source, context="T.vmi.vgatherb(...)")
+    if str(source_elem) == "float4_e2m1fn":
+        raise TypeError("T.vmi.vgatherb(...) does not support packed FP4 source buffers")
     _require_integer_vector(offsets, context="T.vmi.vgatherb(...)")
     mask = _require_compatible_mask(mask, _lanes_of(offsets), context="T.vmi.vgatherb(...)")
     ptr, offset = _resolve_ptr_and_offset(source, access_type="r", extent=_lanes_of(mask))
@@ -848,6 +957,7 @@ def vgatherb(source, offsets, mask, *, pmode=None, loc=None, ip=None):
 @_scope_guarded
 def vscatter(value, destination, offsets, mask, *, pmode=None, loc=None, ip=None):
     _require_ub_address(destination, context="T.vmi.vscatter(...)")
+    _reject_packed_fp4(value, context="T.vmi.vscatter(...)")
     destination_dtype = _address_element_dtype(destination)
     if destination_dtype is not None and destination_dtype != _element_dtype_of(value):
         raise TypeError("T.vmi.vscatter(...) requires value and destination element types to match")
