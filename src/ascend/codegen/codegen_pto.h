@@ -179,6 +179,10 @@ private:
                                       const ObjectRef &value);
   void PrintPtoVmiCall_(const CallNode *op, std::ostream &os);
   bool IsVmiLocalRegisterBuffer(const BufferNode *buffer) const;
+  // Vector local.var buffers allocated before ``for_stmt`` and stored in its
+  // body. These must be emitted as PTODSL loop-carried state for ``T.serial``.
+  std::vector<const VarNode *>
+  CollectLoopCarriedLocalVars(const Stmt &body) const;
   void CheckVmiLocalRegisterIndex(const BufferNode *buffer,
                                   const PrimExpr &index) const;
   bool HasAscendGemmL1(const PrimFunc &func) const;
