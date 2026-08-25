@@ -1185,6 +1185,26 @@ bool CodeGenTileLangPTO::IsLocalVarBuffer(const VarNode *var) const {
   return local_var_buffers_.count(var) != 0;
 }
 
+std::vector<const VarNode *>
+CodeGenTileLangPTO::CollectLoopCarriedLocalVars(const Stmt &body) const {
+  std::vector<const VarNode *> carry_vars;
+  std::unordered_set<const VarNode *> seen;
+  PostOrderVisit(body, [&](const ObjectRef &node) {
+    const auto *store = node.as<BufferStoreNode>();
+    if (store == nullptr) {
+      return;
+    }
+    const VarNode *var = store->buffer->data.get();
+    if (!IsLocalVarBuffer(var) || store->buffer->dtype.lanes() <= 1) {
+      return;
+    }
+    if (seen.insert(var).second) {
+      carry_vars.push_back(var);
+    }
+  });
+  return carry_vars;
+}
+
 bool CodeGenTileLangPTO::IsVmiLocalRegisterBuffer(
     const BufferNode *buffer) const {
   return !inside_simtvf_body_ && ScopeOfBuffer(buffer) == "local" &&
@@ -2452,9 +2472,17 @@ void CodeGenTileLangPTO::VisitStmt_(const ForNode *op) {
 
   PrintIndent();
   std::string vid = AllocVarID(op->loop_var.get());
+  const std::vector<const VarNode *> carry_vars =
+      use_static_range ? std::vector<const VarNode *>{}
+                       : CollectLoopCarriedLocalVars(op->body);
   if (use_static_range) {
     stream << "for " << vid << " in pto.static_range(" << PrintExpr_(start)
            << ", " << PrintExpr_(stop) << ", " << PrintExpr_(step) << "):\n";
+  } else if (!carry_vars.empty()) {
+    // Python range + PTODSL ast_rewrite infers scf.for iter_args from
+    // ``acc = f(acc, ...)`` stores of an outer vector local.var.
+    stream << "for " << vid << " in range(" << PrintExpr_(start) << ", "
+           << PrintExpr_(stop) << ", " << PrintExpr_(step) << "):\n";
   } else {
     stream << "with pto.for_(" << PrintExpr_(start) << ", " << PrintExpr_(stop)
            << ", step=" << PrintExpr_(step) << ") as " << vid << ":\n";

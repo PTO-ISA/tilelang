@@ -8,6 +8,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "cuda/codegen/codegen_py.h"
 
@@ -126,6 +127,10 @@ private:
   std::string LocalVarID(const VarNode *var);
   bool IsLocalVarBuffer(const VarNode *var) const;
   bool IsVmiLocalRegisterBuffer(const BufferNode *buffer) const;
+  // Vector local.var buffers allocated before ``for_stmt`` and stored in its
+  // body. These must be emitted as PTODSL loop-carried state for ``T.serial``.
+  std::vector<const VarNode *>
+  CollectLoopCarriedLocalVars(const Stmt &body) const;
   void CheckVmiLocalRegisterIndex(const BufferNode *buffer,
                                   const PrimExpr &index) const;
   bool HasAscendGemmL1(const PrimFunc &func) const;
