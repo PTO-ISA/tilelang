@@ -3145,6 +3145,21 @@ void CodeGenTileLangPTO::VisitExpr_(const SelectNode *op,
   os << ")";
 }
 
+void CodeGenTileLangPTO::VisitExpr_(const LetNode *op,
+                                    std::ostream &os) { // NOLINT(*)
+  // Bind once as a statement, then return the bound name. Preserve Let
+  // once-eval (no Substitute). VisitStmt_(For) prints bounds before the
+  // header so these assignments land on their own lines. After #382
+  // (shape >= 0) some Persistent extents keep Lets that used to fold.
+  std::string value = PrintExpr_(op->value);
+  ICHECK(!var_idmap_.count(op->var.get()));
+  PrintIndent();
+  stream << AllocVarID(op->var.get()) << " = " << value << "\n";
+  os << PrintExpr_(op->body);
+  bool removed = var_idmap_.erase(op->var.get());
+  ICHECK(removed);
+}
+
 void CodeGenTileLangPTO::PrintBinaryExpr_(const std::string &opstr,
                                           DataType dtype, PrimExpr lhs,
                                           PrimExpr rhs,
@@ -3313,22 +3328,26 @@ void CodeGenTileLangPTO::VisitStmt_(const ForNode *op) {
                                 TryGetConstInt(extent, &extent_value) &&
                                 TryGetConstInt(step, &step_value);
 
+  // Print bounds before the header so nested Let assignments land above it.
+  std::string start_str = PrintExpr_(start);
+  std::string stop_str = PrintExpr_(stop);
+  std::string step_str = PrintExpr_(step);
   PrintIndent();
   std::string vid = AllocVarID(op->loop_var.get());
   const std::vector<const VarNode *> carry_vars =
       use_static_range ? std::vector<const VarNode *>{}
                        : CollectLoopCarriedLocalVars(op->body);
   if (use_static_range) {
-    stream << "for " << vid << " in pto.static_range(" << PrintExpr_(start)
-           << ", " << PrintExpr_(stop) << ", " << PrintExpr_(step) << "):\n";
+    stream << "for " << vid << " in pto.static_range(" << start_str << ", "
+           << stop_str << ", " << step_str << "):\n";
   } else if (!carry_vars.empty()) {
     // Python range + PTODSL ast_rewrite infers scf.for iter_args from
     // ``acc = f(acc, ...)`` stores of an outer vector local.var.
-    stream << "for " << vid << " in range(" << PrintExpr_(start) << ", "
-           << PrintExpr_(stop) << ", " << PrintExpr_(step) << "):\n";
+    stream << "for " << vid << " in range(" << start_str << ", " << stop_str
+           << ", " << step_str << "):\n";
   } else {
-    stream << "with pto.for_(" << PrintExpr_(start) << ", " << PrintExpr_(stop)
-           << ", step=" << PrintExpr_(step) << ") as " << vid << ":\n";
+    stream << "with pto.for_(" << start_str << ", " << stop_str
+           << ", step=" << step_str << ") as " << vid << ":\n";
   }
   int scope = BeginScope();
   PrintStmt_(op->body);
