@@ -5,6 +5,8 @@
 #ifndef TVM_TL_PTO_CODEGEN_CODEGEN_PTO_H_
 #define TVM_TL_PTO_CODEGEN_CODEGEN_PTO_H_
 
+#include <functional>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -70,6 +72,20 @@ private:
     std::string b_l0_name;
   };
 
+  struct PTOBlockscaledGemmEmitContext {
+    bool initialized{false};
+    int64_t tile_m{0};
+    int64_t tile_n{0};
+    int64_t tile_k{0};
+    int64_t base_k{0};
+    int64_t sf_nz_stride{0};
+    DataType input_dtype;
+    DataType accum_dtype;
+    std::string helper_name;
+    std::string a_l0_name;
+    std::string b_l0_name;
+  };
+
   std::string PtoScalarType(DataType t) const;
   std::string PtoPtrType(DataType t, const std::string &space) const;
   std::string GetAccessPtrExpr_(const CallNode *op);
@@ -93,6 +109,8 @@ private:
   void EmitScalarizedLoad(const BufferLoadNode *op, std::ostream &os);
   void EmitScalarizedStore(const BufferStoreNode *op);
   std::string ScopeOfBuffer(const BufferNode *buffer) const;
+  std::optional<std::string>
+  PtoSpaceForStorageScope(const std::string &scope) const;
   void PrintBinaryExpr_(const std::string &opstr, DataType dtype, PrimExpr lhs,
                         PrimExpr rhs,
                         std::ostream &os) override; // NOLINT(*)
@@ -113,14 +131,34 @@ private:
   std::string GetPtoLocalByteAddrExpr(const PrimExpr &index,
                                       DataType elem_dtype,
                                       const std::string &context);
+  std::string GetPtoE8M0ScalePtrExpr(const PrimExpr &expr);
   std::string GetPtoAccPtrExpr(const PrimExpr &expr, DataType dtype);
+  std::string GetPtoL0APtrExpr(const PrimExpr &expr, DataType dtype);
+  std::string GetPtoL0BPtrExpr(const PrimExpr &expr, DataType dtype);
+  std::string GetPtoMatPtrExpr(const PrimExpr &expr, DataType dtype);
+  std::string GetPtoUbPtrExpr(const PrimExpr &expr, DataType dtype);
   void EnsurePTOGemmHelper(const CallNode *op);
+  void EnsurePTOBlockscaledGemmHelper(const CallNode *op);
+  void EmitUnitFlagDispatch(
+      const PrimExpr &unit_flag_expr,
+      const std::function<std::string(int64_t)> &map_unit_flag,
+      const std::function<void(const std::string &)> &emit_operation);
   void EmitAscendCopyGmToCbuf(const CallNode *op);
+  void EmitAscendLoadCbufToL0(const CallNode *op, bool is_l0a);
   void EmitAscendGemmL1(const CallNode *op);
+  void EmitAscendMad(const CallNode *op);
+  void EmitAscendBlockscaledGemmL1(const CallNode *op);
+  void EmitAscendMadMx(const CallNode *op);
+  void EmitAscendCopyMatrixCcToUb(const CallNode *op);
   void EmitAscendCopyMatrixCcToGm(const CallNode *op);
   void EmitPTOGemmRun(const std::string &a_mat, const std::string &b_mat,
                       const std::string &acc, const std::string &clear_accum,
                       const std::string &unit_flag_ctrl, int64_t hf32_mode);
+  void EmitPTOBlockscaledGemmRun(
+      const std::string &a_mat, const std::string &b_mat,
+      const std::string &sfa_e8m0_mat, const std::string &sfb_e8m0_mat,
+      const std::string &acc, const std::string &sf_k_offset,
+      const std::string &clear_accum, const std::string &unit_flag_ctrl);
   std::string PrintVmiAnnotationValue(const std::string &key,
                                       const ObjectRef &value);
   void PrintPtoVmiCall_(const CallNode *op, std::ostream &os);
@@ -133,15 +171,18 @@ private:
   CollectLoopCarriedLocalVars(const Stmt &body) const;
   void CheckVmiLocalRegisterIndex(const BufferNode *buffer,
                                   const PrimExpr &index) const;
+  bool HasAscendGemm(const PrimFunc &func) const;
   bool HasAscendGemmL1(const PrimFunc &func) const;
 
   bool current_function_has_gemm_{false};
+  bool current_function_has_mixed_sections_{false};
   bool has_gemm_l1_{false};
   std::unordered_map<const VarNode *, FragmentInfo> fragment_info_;
   std::unordered_set<const VarNode *> local_var_buffers_;
   std::unordered_map<Call, int64_t, ObjectPtrHash, ObjectPtrEqual>
-      hf32_mode_by_gemm_;
+      hf32_mode_by_cube_call_;
   PTOGemmEmitContext gemm_emit_ctx_;
+  PTOBlockscaledGemmEmitContext blockscaled_gemm_emit_ctx_;
   std::pair<std::string, std::string>
   ParseHardEventPair(const std::string &hard_event) const;
 };

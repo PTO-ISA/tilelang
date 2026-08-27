@@ -30,6 +30,7 @@ class PTOGemmL1Template:
         sub_k_c0_blocks: int,
         a_l0_stage_elems: int,
         b_l0_stage_elems: int,
+        input_pack_factor: int = 1,
     ):
         key = (
             tile_m,
@@ -41,6 +42,7 @@ class PTOGemmL1Template:
             sub_k_c0_blocks,
             a_l0_stage_elems,
             b_l0_stage_elems,
+            input_pack_factor,
         )
         if key not in cls._instances:
             cls._instances[key] = super().__new__(cls)
@@ -57,6 +59,7 @@ class PTOGemmL1Template:
         sub_k_c0_blocks: int,
         a_l0_stage_elems: int,
         b_l0_stage_elems: int,
+        input_pack_factor: int = 1,
     ):
         if getattr(self, "_initialized", False):
             return
@@ -70,6 +73,7 @@ class PTOGemmL1Template:
             sub_k_c0_blocks,
             a_l0_stage_elems,
             b_l0_stage_elems,
+            input_pack_factor,
         )
         self.tile_m = tile_m
         self.tile_n = tile_n
@@ -80,6 +84,8 @@ class PTOGemmL1Template:
         self.sub_k_c0_blocks = sub_k_c0_blocks
         self.a_l0_stage_elems = a_l0_stage_elems
         self.b_l0_stage_elems = b_l0_stage_elems
+        self.input_pack_factor = input_pack_factor
+        self.sub_k_storage_cols = sub_k_c0_blocks * input_pack_factor
         self._initialized = True
 
     @staticmethod
@@ -101,6 +107,7 @@ class PTOGemmL1Template:
         sub_k_c0_blocks: int,
         a_l0_stage_elems: int,
         b_l0_stage_elems: int,
+        input_pack_factor: int,
     ):
         for name, value in (
             ("tile_m", tile_m),
@@ -112,6 +119,7 @@ class PTOGemmL1Template:
             ("sub_k_c0_blocks", sub_k_c0_blocks),
             ("a_l0_stage_elems", a_l0_stage_elems),
             ("b_l0_stage_elems", b_l0_stage_elems),
+            ("input_pack_factor", input_pack_factor),
         ):
             cls._require_positive_int(name, value)
 
@@ -127,13 +135,23 @@ class PTOGemmL1Template:
             raise ValueError(f"base_k must be divisible by input_c0, got {base_k} and {input_c0}")
         if sub_k_c0_blocks != base_k // input_c0:
             raise ValueError(f"sub_k_c0_blocks must equal base_k // input_c0, got {sub_k_c0_blocks} != {base_k} // {input_c0}")
-        if a_l0_stage_elems != tile_m * base_k:
-            raise ValueError(f"a_l0_stage_elems must equal tile_m * base_k, got {a_l0_stage_elems} != {tile_m} * {base_k}")
-        if b_l0_stage_elems != tile_n * base_k:
-            raise ValueError(f"b_l0_stage_elems must equal tile_n * base_k, got {b_l0_stage_elems} != {tile_n} * {base_k}")
+        if (tile_m * base_k) % input_pack_factor != 0:
+            raise ValueError(f"tile_m * base_k must be divisible by input_pack_factor, got {tile_m} * {base_k} and {input_pack_factor}")
+        if (tile_n * base_k) % input_pack_factor != 0:
+            raise ValueError(f"tile_n * base_k must be divisible by input_pack_factor, got {tile_n} * {base_k} and {input_pack_factor}")
+        expected_a_stage_elems = tile_m * base_k // input_pack_factor
+        expected_b_stage_elems = tile_n * base_k // input_pack_factor
+        if a_l0_stage_elems != expected_a_stage_elems:
+            raise ValueError(
+                f"a_l0_stage_elems must equal tile_m * base_k / input_pack_factor, got {a_l0_stage_elems} != {expected_a_stage_elems}"
+            )
+        if b_l0_stage_elems != expected_b_stage_elems:
+            raise ValueError(
+                f"b_l0_stage_elems must equal tile_n * base_k / input_pack_factor, got {b_l0_stage_elems} != {expected_b_stage_elems}"
+            )
 
     def _emit_l1_to_l0b_static(self, b_mat, b_l0_0, stage: int, sk: int):
-        sub_k_c0 = sk * self.sub_k_c0_blocks
+        sub_k_storage_col = sk * self.sub_k_storage_cols
         # dav-3510 TRANS_B=true path: GEMM interprets B as transposed, so L1
         # must hold W[N, K]. NN inputs W[K, N] are converted to this layout by
         # DN2NZ during GM->L1.
@@ -150,7 +168,7 @@ class PTOGemmL1Template:
                 self._b_l0_stage(b_l0_0, stage),
                 self.base_k,
                 self.tile_n,
-                start_col=sub_k_c0,
+                start_col=sub_k_storage_col,
             )
 
     def _a_l0_stage(self, a_l0_0, stage: int):
@@ -165,7 +183,7 @@ class PTOGemmL1Template:
 
     def _emit_l1_to_l0_static(self, a_mat, b_mat, a_l0_0, b_l0_0, sk: int):
         stage = sk & 1
-        sub_k_c0 = sk * self.sub_k_c0_blocks
+        sub_k_storage_col = sk * self.sub_k_storage_cols
         pto.wait_flag("M", "MTE1", event_id=stage)
         if sk == 0:
             pto.mte_l1_l0a(a_mat, self._a_l0_stage(a_l0_0, stage), self.tile_m, self.base_k)
@@ -175,7 +193,7 @@ class PTOGemmL1Template:
                 self._a_l0_stage(a_l0_0, stage),
                 self.tile_m,
                 self.base_k,
-                start_col=sub_k_c0,
+                start_col=sub_k_storage_col,
             )
         self._emit_l1_to_l0b_static(b_mat, b_l0_0, stage, sk)
         pto.set_flag("MTE1", "M", event_id=stage)
@@ -387,7 +405,7 @@ class PTOGemmL1Template:
         with pto.for_(2, self.sub_k_tiles, step=1) as sk:
             l0_stage = sk % 2
             l0_stage_i64 = _coerce_i64(l0_stage, context="L0 stage index")
-            sub_k_c0 = sk * self.sub_k_c0_blocks
+            sub_k_storage_col = sk * self.sub_k_storage_cols
             a_l0 = pto.addptr(
                 a_l0_0,
                 scalar.muli(l0_stage_i64, pto.const(self.a_l0_stage_elems, dtype=pto.int64)),
@@ -397,13 +415,19 @@ class PTOGemmL1Template:
                 scalar.muli(l0_stage_i64, pto.const(self.b_l0_stage_elems, dtype=pto.int64)),
             )
             pto.wait_flag("M", "MTE1", event_id=l0_stage)
-            pto.mte_l1_l0a(a_mat, a_l0, self.tile_m, self.base_k, start_col=sub_k_c0)
+            pto.mte_l1_l0a(
+                a_mat,
+                a_l0,
+                self.tile_m,
+                self.base_k,
+                start_col=sub_k_storage_col,
+            )
             pto.mte_l1_l0b(
                 b_mat,
                 b_l0,
                 self.base_k,
                 self.tile_n,
-                start_col=sub_k_c0,
+                start_col=sub_k_storage_col,
             )
             pto.set_flag("MTE1", "M", event_id=l0_stage)
 
@@ -465,4 +489,221 @@ class PTOGemmL1Template:
             unit_flag_ctrl,
             tf32_mode,
         )
+        self._emit_pipeline_drain_for_tile(unit_flag_ctrl)
+
+
+class PTOBlockscaledGemmL1Template(PTOGemmL1Template):
+    """PTODSL helper for an E4M3 or E2M1 blockscaled L1 cube GEMM tile.
+
+    Matrix data uses the regular L1-to-L0 loads inherited from
+    :class:`PTOGemmL1Template`. Pair-packed ``uint16`` scale storage is viewed
+    as E8M0 only at the MX load boundary, where the caller supplies an
+    ``pto.ptr(pto.f8e8m0, "mat")`` pointer to the same L1 allocation. FP4
+    uses ``input_pack_factor=2`` so data-load start columns and L0 stage
+    offsets remain in packed-storage units.
+    """
+
+    _instances: dict[tuple[int, ...], PTOBlockscaledGemmL1Template] = {}
+
+    def __new__(
+        cls,
+        tile_m: int,
+        tile_n: int,
+        tile_k: int,
+        base_k: int,
+        sub_k_tiles: int,
+        input_c0: int,
+        sub_k_c0_blocks: int,
+        a_l0_stage_elems: int,
+        b_l0_stage_elems: int,
+        sf_nz_stride: int,
+        input_pack_factor: int = 1,
+    ):
+        key = (
+            tile_m,
+            tile_n,
+            tile_k,
+            base_k,
+            sub_k_tiles,
+            input_c0,
+            sub_k_c0_blocks,
+            a_l0_stage_elems,
+            b_l0_stage_elems,
+            sf_nz_stride,
+            input_pack_factor,
+        )
+        if key not in cls._instances:
+            cls._instances[key] = object.__new__(cls)
+        return cls._instances[key]
+
+    def __init__(
+        self,
+        tile_m: int,
+        tile_n: int,
+        tile_k: int,
+        base_k: int,
+        sub_k_tiles: int,
+        input_c0: int,
+        sub_k_c0_blocks: int,
+        a_l0_stage_elems: int,
+        b_l0_stage_elems: int,
+        sf_nz_stride: int,
+        input_pack_factor: int = 1,
+    ):
+        if getattr(self, "_blockscaled_initialized", False):
+            return
+        super().__init__(
+            tile_m,
+            tile_n,
+            tile_k,
+            base_k,
+            sub_k_tiles,
+            input_c0,
+            sub_k_c0_blocks,
+            a_l0_stage_elems,
+            b_l0_stage_elems,
+            input_pack_factor,
+        )
+        self._require_positive_int("sf_nz_stride", sf_nz_stride)
+        if base_k % 64 != 0:
+            raise ValueError(f"base_k must be divisible by 64, got {base_k}")
+        self.sf_nz_stride = sf_nz_stride
+        self.sf_pairs_per_inner = base_k // 64
+        self._blockscaled_initialized = True
+
+    def _emit_l1_to_l0_static(
+        self,
+        a_mat,
+        b_mat,
+        sfa_e8m0_mat,
+        sfb_e8m0_mat,
+        a_l0_0,
+        b_l0_0,
+        sf_k_offset,
+        sk: int,
+    ):
+        stage = sk & 1
+        sub_k_storage_col = sk * self.sub_k_storage_cols
+        sf_y = sf_k_offset + sk * self.sf_pairs_per_inner
+        a_l0 = self._a_l0_stage(a_l0_0, stage)
+        b_l0 = self._b_l0_stage(b_l0_0, stage)
+
+        pto.wait_flag("M", "MTE1", event_id=stage)
+        if sk == 0:
+            pto.mte_l1_l0a(a_mat, a_l0, self.tile_m, self.base_k)
+            pto.mte_l1_l0b(b_mat, b_l0, self.base_k, self.tile_n)
+        else:
+            pto.mte_l1_l0a(
+                a_mat,
+                a_l0,
+                self.tile_m,
+                self.base_k,
+                start_col=sub_k_storage_col,
+            )
+            pto.mte_l1_l0b(
+                b_mat,
+                b_l0,
+                self.base_k,
+                self.tile_n,
+                start_col=sub_k_storage_col,
+            )
+        pto.mte_l1_l0a_mx(
+            sfa_e8m0_mat,
+            a_l0,
+            x_start=0,
+            y_start=sf_y,
+            x_step=self.tile_m // 16,
+            y_step=self.sf_pairs_per_inner,
+            src_stride=self.sf_nz_stride,
+            dst_stride=self.sf_pairs_per_inner,
+        )
+        pto.mte_l1_l0b_mx(
+            sfb_e8m0_mat,
+            b_l0,
+            x_start=0,
+            y_start=sf_y,
+            x_step=self.tile_n // 16,
+            y_step=self.sf_pairs_per_inner,
+            src_stride=self.sf_nz_stride,
+            dst_stride=self.sf_pairs_per_inner,
+        )
+        pto.set_flag("MTE1", "M", event_id=stage)
+
+    def _emit_mad_op(
+        self,
+        a_l0_0,
+        b_l0_0,
+        acc,
+        sk: int,
+        use_mad: bool,
+        unit_flag,
+        *_unused_hf32_mode,
+    ):
+        stage = sk & 1
+        a_l0 = self._a_l0_stage(a_l0_0, stage)
+        b_l0 = self._b_l0_stage(b_l0_0, stage)
+        if use_mad:
+            pto.mad_mx(
+                a_l0,
+                b_l0,
+                acc,
+                self.tile_m,
+                self.tile_n,
+                self.base_k,
+                unit_flag=unit_flag,
+                disable_gemv=True,
+                sat="sat",
+            )
+            return
+        pto.mad_mx_acc(
+            a_l0,
+            b_l0,
+            acc,
+            self.tile_m,
+            self.tile_n,
+            self.base_k,
+            unit_flag=unit_flag,
+            disable_gemv=True,
+            sat="sat",
+        )
+
+    def run_l1_tile(
+        self,
+        a_mat,
+        b_mat,
+        sfa_e8m0_mat,
+        sfb_e8m0_mat,
+        a_l0_0,
+        b_l0_0,
+        acc,
+        *,
+        sf_k_offset,
+        clear_accum,
+        unit_flag_ctrl=0,
+    ):
+        """Emit one blockscaled L1 tile with E8M0 scale staging."""
+
+        self._emit_pipeline_init_for_tile(clear_accum, unit_flag_ctrl)
+
+        # Keep each MX stage ordered until a prefetching schedule is validated.
+        for sk in range(self.sub_k_tiles):
+            self._emit_l1_to_l0_static(
+                a_mat,
+                b_mat,
+                sfa_e8m0_mat,
+                sfb_e8m0_mat,
+                a_l0_0,
+                b_l0_0,
+                sf_k_offset,
+                sk,
+            )
+            self._emit_mad_static(
+                a_l0_0,
+                b_l0_0,
+                acc,
+                sk,
+                clear_accum if sk == 0 else False,
+                unit_flag_ctrl,
+                None,
+            )
         self._emit_pipeline_drain_for_tile(unit_flag_ctrl)

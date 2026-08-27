@@ -142,7 +142,8 @@ DataType ParsePTODtype(const std::string &dtype_name) {
     return DataType::Float8E4M3FN();
   if (dtype_name == "float8_e5m2" || dtype_name == "float8_e5m2_t")
     return DataType::Float8E5M2();
-  if (dtype_name == "float4_e2m1fn" || dtype_name == "float4_e2m1fnx2")
+  if (dtype_name == "float4_e2m1fn" || dtype_name == "float4_e2m1_t" ||
+      dtype_name == "float4_e2m1fnx2" || dtype_name == "float4_e2m1x2_t")
     return DataType::Float4E2M1FN(2);
   if (dtype_name == "int64")
     return DataType::Int(64);
@@ -215,6 +216,26 @@ void CheckContiguousRampStride(const PrimExpr &index, const char *access_kind) {
         << " emits a contiguous vector access, so Ramp stride must be 1, got "
         << ramp->stride;
   }
+}
+
+PrimExpr NormalizePackedFP4Index(const PrimExpr &index, DataType elem_dtype,
+                                 const char *pointer_kind) {
+  if (!elem_dtype.is_float4_e2m1fn() || index.dtype().lanes() == 1) {
+    return index;
+  }
+
+  const auto *ramp = index.as<RampNode>();
+  ICHECK(ramp) << "PTO packed FP4 " << pointer_kind
+               << " expects a contiguous Ramp index, got " << index;
+  PrimExpr stride = arith::Analyzer().Simplify(ramp->stride);
+  int64_t stride_value = 0;
+  ICHECK(TryGetConstInt(stride, &stride_value) && stride_value == 1)
+      << "PTO packed FP4 " << pointer_kind
+      << " requires a unit-stride Ramp index, got " << ramp->stride;
+
+  const int lanes = index.dtype().lanes();
+  return arith::Analyzer().Simplify(
+      floordiv(ramp->base, make_const(ramp->base.dtype(), lanes)));
 }
 
 void CheckConstZero(const PrimExpr &expr, const char *name) {
@@ -305,7 +326,7 @@ void CheckPTOLocalVarBuffer(const BufferNode *buffer) {
 
 void CheckPTOKernel(const PrimFunc &func) {
   bool has_cube_block = false;
-  bool has_gemm_l1 = false;
+  bool has_supported_cube_op = false;
   bool has_unsupported_cube_op = false;
 
   PostOrderVisit(func->body, [&](const ffi::ObjectRef &node) {
@@ -316,44 +337,71 @@ void CheckPTOKernel(const PrimFunc &func) {
     }
 
     if (const auto *call = node.as<CallNode>()) {
-      if (call->op.same_as(tl::ascend_gemm_l1())) {
-        has_gemm_l1 = true;
-      } else if (call->op.same_as(tl::ascend_blockscaled_gemm_l1()) ||
-                 call->op.same_as(tl::ascend_mad()) ||
-                 call->op.same_as(tl::ascend_nd2nz_scatter()) ||
+      if (call->op.same_as(tl::ascend_gemm_l1()) ||
+          call->op.same_as(tl::ascend_blockscaled_gemm_l1()) ||
+          call->op.same_as(tl::ascend_mad()) ||
+          call->op.same_as(tl::ascend_mad_mx())) {
+        has_supported_cube_op = true;
+      } else if (call->op.same_as(tl::ascend_nd2nz_scatter()) ||
                  call->op.same_as(tl::ascend_nd2nz_post_copy())) {
         has_unsupported_cube_op = true;
       }
     }
   });
 
-  ICHECK(!has_cube_block || has_gemm_l1)
-      << "PTO codegen only supports cube kernels through tl.ascend_gemm_l1";
+  ICHECK(!has_cube_block || has_supported_cube_op)
+      << "PTO codegen found a cube block without a supported cube operation";
   ICHECK(!has_unsupported_cube_op)
       << "PTO codegen does not support this Ascend cube op yet.";
 }
 
 std::string AccStoreUnitFlagArg(int64_t unit_flag_ctrl) {
   if (unit_flag_ctrl == 0)
-    return "None";
+    return "";
   if (unit_flag_ctrl == 2)
     return "pto.AccStoreUnitFlagCtrl.CHECK_ONLY";
   if (unit_flag_ctrl == 3)
     return "pto.AccStoreUnitFlagCtrl.CHECK_AND_CLEAR";
-  LOG(FATAL) << "PTO GEMM unsupported L0C store unit_flag_ctrl="
-             << unit_flag_ctrl;
-  return "None";
+  LOG(FATAL) << "PTO L0C store unsupported unit_flag_ctrl=" << unit_flag_ctrl;
+  return "";
+}
+
+std::string MadUnitFlagArg(int64_t unit_flag_ctrl) {
+  if (unit_flag_ctrl == 0)
+    return "";
+  if (unit_flag_ctrl == 2)
+    return "pto.MadUnitFlagMode.CHECK_ONLY";
+  if (unit_flag_ctrl == 3)
+    return "pto.MadUnitFlagMode.CHECK_AND_SET";
+  LOG(FATAL) << "PTO MAD unsupported unit_flag_ctrl=" << unit_flag_ctrl;
+  return "";
 }
 
 bool IsSupportedPTOGemmInputDtype(DataType dtype) {
-  return IsFloat32(dtype) || dtype.is_bfloat16() || dtype.is_float8_e4m3fn();
+  return IsFloat32(dtype) || dtype.is_float16() || dtype.is_bfloat16() ||
+         dtype.is_float8_e4m3fn() || dtype.is_float4_e2m1fn();
 }
+
+bool IsSamePTOStorageDtype(DataType lhs, DataType rhs) {
+  return lhs == rhs || (lhs.is_float4_e2m1fn() && rhs.is_float4_e2m1fn());
+}
+
+int64_t PTOGemmInputPackFactor(DataType dtype) {
+  return dtype.is_float4_e2m1fn() ? 2 : 1;
+}
+
+// L1/L0A/L0B matrices use a fixed 16-row fractal. The K fractal depends on
+// the element width and is obtained from PTOGemmInputC0.
+constexpr int64_t kAscendMFractal = 16;
 
 int64_t PTOGemmInputC0(DataType dtype) {
   ICHECK(IsSupportedPTOGemmInputDtype(dtype))
-      << "PTO GEMM L1 helper currently only supports float32, bfloat16, and "
-         "float8_e4m3fn inputs, got "
+      << "PTO GEMM L1 helper currently only supports float32, float16, "
+         "bfloat16, float8_e4m3fn, or float4_e2m1fn inputs, got "
       << dtype;
+  if (dtype.is_float4_e2m1fn()) {
+    return 64;
+  }
   int64_t elem_bytes = dtype.bytes();
   ICHECK_GT(elem_bytes, 0) << "Invalid PTO GEMM input dtype size: " << dtype;
   ICHECK_EQ(32 % elem_bytes, 0)
@@ -386,6 +434,27 @@ DataType GetAnnotatedPointerDtype(const PrimExpr &expr,
   }
 
   return fallback_dtype;
+}
+
+DataType GetAscendMadInputDtype(const CallNode *call) {
+  ICHECK_EQ(call->args.size(), 10U)
+      << "tl.ascend_mad expects exactly 10 arguments";
+  return GetAnnotatedPointerDtype(
+      call->args[1],
+      GetAnnotatedPointerDtype(call->args[2], DataType::BFloat(16)));
+}
+
+void EmitPTOHf32ModeArgument(std::ostream &os, int64_t hf32_mode) {
+  if (hf32_mode == 0) {
+    return;
+  }
+  ICHECK(hf32_mode == 1 || hf32_mode == 2)
+      << "PTO HF32 mode must be 0, 1, or 2, got " << hf32_mode;
+  // PTO names the hardware bit-47 mode ROUND_AWAY; CANN names the same
+  // setting HF32TransMode::NEAREST_ZERO.
+  os << ", tf32_mode="
+     << (hf32_mode == 1 ? "pto.Tf32Mode.ROUND_AWAY"
+                        : "pto.Tf32Mode.ROUND_EVEN");
 }
 
 bool GetAddressOfIndex(const PrimExpr &expr, PrimExpr *index,
@@ -431,7 +500,7 @@ public:
     analyzer.VisitStmt(func->body, kDisabled);
 
     ModeMap result;
-    for (const auto &[call, modes] : analyzer.gemm_modes_) {
+    for (const auto &[call, modes] : analyzer.cube_call_modes_) {
       ICHECK_NE(modes, 0);
       ICHECK_EQ(modes & (modes - 1), 0)
           << "PTO HF32 mode is control-flow dependent for GEMM " << call
@@ -540,7 +609,11 @@ private:
       const auto *dtype_name = call->args[9].as<StringImmNode>();
       ICHECK(dtype_name) << "PTO GEMM requires a constant input dtype string";
       if (IsFloat32(ParsePTODtype(dtype_name->value))) {
-        gemm_modes_[GetRef<Call>(call)] |= state;
+        cube_call_modes_[GetRef<Call>(call)] |= state;
+      }
+    } else if (call->op.same_as(tl::ascend_mad())) {
+      if (IsFloat32(GetAscendMadInputDtype(call))) {
+        cube_call_modes_[GetRef<Call>(call)] |= state;
       }
     }
     return state;
@@ -558,7 +631,8 @@ private:
     return is_one(op->predicate) ? block_out : state | block_out;
   }
 
-  std::unordered_map<Call, uint8_t, ObjectPtrHash, ObjectPtrEqual> gemm_modes_;
+  std::unordered_map<Call, uint8_t, ObjectPtrHash, ObjectPtrEqual>
+      cube_call_modes_;
   arith::Analyzer analyzer_;
 };
 
@@ -646,10 +720,78 @@ void CodeGenTileLangPTO::AddFunction(const GlobalVar &gvar,
   local_var_buffers_.clear();
   inside_simtvf_body_ = false;
   persistent_buffer_vars_ = SimtPersistentBufferCollector().Collect(func->body);
+  current_function_has_mixed_sections_ = false;
+  int64_t cube_section_count = 0;
+  int64_t vector_section_count = 0;
+  int64_t vector_count = 2;
+  std::optional<int64_t> cthread_extent;
+  std::optional<int64_t> inconsistent_cthread_extent;
+  bool has_nonconstant_cthread_extent = false;
+  tirx::PostOrderVisit(func->body, [&](const ObjectRef &node) {
+    if (const auto *attr = node.as<AttrStmtNode>()) {
+      const auto *iter_var = attr->node.as<IterVarNode>();
+      if (attr->attr_key == tirx::attr::thread_extent && iter_var != nullptr &&
+          iter_var->thread_tag == "cthread") {
+        const auto *extent = attr->value.as<IntImmNode>();
+        if (extent == nullptr) {
+          has_nonconstant_cthread_extent = true;
+        } else if (cthread_extent.has_value()) {
+          if (cthread_extent.value() != extent->value) {
+            inconsistent_cthread_extent = extent->value;
+          }
+        } else {
+          cthread_extent = extent->value;
+        }
+      }
+    }
+    if (const auto *block = node.as<SBlockNode>()) {
+      if (block->name_hint == "CUBE") {
+        ++cube_section_count;
+      } else if (block->name_hint == "VECTOR") {
+        ++vector_section_count;
+        if (auto count_annotation = block->annotations.Get("vector_count")) {
+          const auto *count = count_annotation.value().as<IntImmNode>();
+          ICHECK(count != nullptr) << "PTO VECTOR section vector_count must be "
+                                      "an integer, got "
+                                   << count_annotation.value();
+          vector_count = count->value;
+        }
+      }
+    }
+  });
+  ICHECK_LE(cube_section_count, 1)
+      << "PTO codegen currently supports at most one CUBE section per function";
+  ICHECK_LE(vector_section_count, 1) << "PTO codegen currently supports at "
+                                        "most one VECTOR section per function";
+  ICHECK_EQ(cube_section_count != 0, vector_section_count != 0)
+      << "T.Cube() and T.Vector() must be used together for Mix mode";
+  if (vector_section_count != 0 &&
+      (cthread_extent.has_value() || has_nonconstant_cthread_extent)) {
+    ICHECK(!has_nonconstant_cthread_extent)
+        << "PTO cthread extent must be a constant integer";
+    ICHECK(!inconsistent_cthread_extent.has_value())
+        << "PTO function contains inconsistent cthread extents ("
+        << cthread_extent.value() << " and "
+        << inconsistent_cthread_extent.value() << ")";
+    ICHECK_EQ(cthread_extent.value(), 2)
+        << "PTO backend cannot express __mix__(1, " << cthread_extent.value()
+        << "); PTOAS currently supports only AIV count 2";
+    ICHECK_EQ(cthread_extent.value(), vector_count)
+        << "PTO VECTOR section cthread extent must match vector_count; got "
+        << cthread_extent.value() << " and " << vector_count;
+  }
+  if (vector_section_count != 0) {
+    ICHECK_EQ(vector_count, 2)
+        << "PTO mixed kernel currently supports only T.Vector(vector=2); "
+           "T.Vector(vector=1) requires PTOAS AIV-count support";
+  }
+  current_function_has_mixed_sections_ =
+      cube_section_count != 0 && vector_section_count != 0;
   gemm_emit_ctx_ = PTOGemmEmitContext();
-  hf32_mode_by_gemm_ = PTOHf32ModeAnalyzer::Analyze(func);
-  current_function_has_gemm_ = HasAscendGemmL1(func);
-  has_gemm_l1_ = has_gemm_l1_ || current_function_has_gemm_;
+  hf32_mode_by_cube_call_ = PTOHf32ModeAnalyzer::Analyze(func);
+  blockscaled_gemm_emit_ctx_ = PTOBlockscaledGemmEmitContext();
+  current_function_has_gemm_ = HasAscendGemm(func);
+  has_gemm_l1_ = has_gemm_l1_ || HasAscendGemmL1(func);
 
   PrintFuncDecorator_(stream);
   PrintFunctionSignature_(current_function_name_, func, stream);
@@ -657,15 +799,23 @@ void CodeGenTileLangPTO::AddFunction(const GlobalVar &gvar,
   int func_scope = BeginScope();
   if (current_function_has_gemm_) {
     const CallNode *first_gemm = nullptr;
+    const CallNode *first_blockscaled_gemm = nullptr;
     tirx::PostOrderVisit(func->body, [&](const ObjectRef &node) {
       if (const auto *call = node.as<CallNode>()) {
         if (first_gemm == nullptr && call->op.same_as(tl::ascend_gemm_l1())) {
           first_gemm = call;
+        } else if (first_blockscaled_gemm == nullptr &&
+                   call->op.same_as(tl::ascend_blockscaled_gemm_l1())) {
+          first_blockscaled_gemm = call;
         }
       }
     });
-    ICHECK(first_gemm != nullptr);
-    EnsurePTOGemmHelper(first_gemm);
+    if (first_gemm != nullptr) {
+      EnsurePTOGemmHelper(first_gemm);
+    }
+    if (first_blockscaled_gemm != nullptr) {
+      EnsurePTOBlockscaledGemmHelper(first_blockscaled_gemm);
+    }
   }
   PrintStmt_(func->body);
   EndScope(func_scope);
@@ -679,7 +829,8 @@ std::string CodeGenTileLangPTO::Finish() {
   code << "from ptodsl._surface_values import wrap_surface_value as "
           "_tl_wrap_surface_value\n";
   if (has_gemm_l1_) {
-    code << "from tilelang.contrib.ptodsl.gemm import PTOGemmL1Template\n";
+    code << "from tilelang.contrib.ptodsl.gemm import PTOGemmL1Template, "
+            "PTOBlockscaledGemmL1Template\n";
   }
   code << "\n";
   code << decl_stream.str();
@@ -688,9 +839,17 @@ std::string CodeGenTileLangPTO::Finish() {
 }
 
 void CodeGenTileLangPTO::PrintFuncDecorator_(std::ostream &os) { // NOLINT(*)
-  os << "@pto.jit(name=\"" << current_function_name_ << "\", kernel_kind=\""
-     << (current_function_has_gemm_ ? "cube" : "vector")
-     << "\", target=\"a5\", mode=\"explicit\"";
+  // Leave kernel_kind inferred so PTOAS can split explicit CUBE/VECTOR
+  // sections into their corresponding backend children.
+  auto kernel_kind = "vector";
+  if (current_function_has_gemm_) {
+    kernel_kind = "cube";
+  }
+  os << "@pto.jit(name=\"" << current_function_name_ << "\"";
+  if (!current_function_has_mixed_sections_) {
+    os << ", kernel_kind=\"" << kernel_kind << "\"";
+  }
+  os << ", target=\"a5\", mode=\"explicit\"";
   if (current_function_has_gemm_) {
     os << ", insert_sync=False";
   }
@@ -712,12 +871,10 @@ void CodeGenTileLangPTO::PrintFunctionSignature_(
       os << ": " << PtoPtrType(buffer->dtype, "gm");
     } else if (auto *ptr = v->type_annotation.as<PointerTypeNode>()) {
       if (auto *prim = ptr->element_type.as<PrimTypeNode>()) {
-        std::string scope =
-            ptr->storage_scope.empty() ? "gm" : ptr->storage_scope;
-        if (scope == "global") {
-          scope = "gm";
-        }
-        os << ": " << PtoPtrType(prim->dtype, scope);
+        auto pto_space = PtoSpaceForStorageScope(ptr->storage_scope);
+        ICHECK(pto_space.has_value())
+            << "Unsupported PTO pointer storage scope: " << ptr->storage_scope;
+        os << ": " << PtoPtrType(prim->dtype, *pto_space);
       } else {
         os << ": " << PtoScalarType(v->dtype);
       }
@@ -756,16 +913,49 @@ CodeGenTileLangPTO::ParseHardEventPair(const std::string &hard_event) const {
   return {hard_event.substr(0, pos), hard_event.substr(pos + 1)};
 }
 
+bool CodeGenTileLangPTO::HasAscendGemm(const PrimFunc &func) const {
+  bool found = false;
+  tirx::PostOrderVisit(func->body, [&](const ObjectRef &node) {
+    if (found)
+      return;
+    if (const auto *call = node.as<CallNode>()) {
+      found = call->op.same_as(tl::ascend_gemm_l1()) ||
+              call->op.same_as(tl::ascend_blockscaled_gemm_l1()) ||
+              call->op.same_as(tl::ascend_mad()) ||
+              call->op.same_as(tl::ascend_mad_mx());
+    }
+  });
+  return found;
+}
+
 bool CodeGenTileLangPTO::HasAscendGemmL1(const PrimFunc &func) const {
   bool found = false;
   tirx::PostOrderVisit(func->body, [&](const ObjectRef &node) {
     if (found)
       return;
     if (const auto *call = node.as<CallNode>()) {
-      found = call->op.same_as(tl::ascend_gemm_l1());
+      found = call->op.same_as(tl::ascend_gemm_l1()) ||
+              call->op.same_as(tl::ascend_blockscaled_gemm_l1());
     }
   });
   return found;
+}
+
+std::optional<std::string>
+CodeGenTileLangPTO::PtoSpaceForStorageScope(const std::string &scope) const {
+  if (scope == "global" || scope.empty())
+    return std::string("gm");
+  if (scope == "shared" || scope == "shared.dyn")
+    return std::string("ub");
+  if (scope == "shared.l1" || scope == "shared.l1.dyn")
+    return std::string("mat");
+  if (scope == "shared.l0a" || scope == "shared.l0a.dyn")
+    return std::string("left");
+  if (scope == "shared.l0b" || scope == "shared.l0b.dyn")
+    return std::string("right");
+  if (scope == "shared.l0c" || scope == "shared.l0c.dyn")
+    return std::string("acc");
+  return std::nullopt;
 }
 
 std::string CodeGenTileLangPTO::ScopeOfBuffer(const BufferNode *buffer) const {
@@ -869,28 +1059,31 @@ std::string CodeGenTileLangPTO::GetPtoPointerExpr(const VarNode *buffer_var,
     scope = alloc_storage_scope_.at(buffer_var);
   }
 
+  auto pto_space = PtoSpaceForStorageScope(scope);
   std::string base = GetVarID(buffer_var);
-  if (scope == "shared" || scope == "shared.dyn") {
+  if (pto_space.has_value() && *pto_space != "gm") {
     if (HandleTypeMatch_(buffer_var, DataType::Int(8)) ||
         !HandleTypeMatch_(buffer_var, elem_dtype)) {
-      base = "pto.castptr(" + base + ", " + PtoPtrType(elem_dtype, "ub") + ")";
+      base = "pto.castptr(" + base + ", " + PtoPtrType(elem_dtype, *pto_space) +
+             ")";
     }
   }
 
-  if (is_zero(index)) {
+  PrimExpr normalized_index =
+      NormalizePackedFP4Index(index, elem_dtype, "pointer offset");
+  if (is_zero(normalized_index)) {
     return base;
   }
 
   std::string index_str;
   int64_t const_index = 0;
-  if (TryGetConstInt(index, &const_index)) {
+  if (TryGetConstInt(normalized_index, &const_index)) {
     index_str = std::to_string(const_index);
   } else {
-    index_str = RemoveOutermostParentheses(PrintExpr_(index));
+    index_str = RemoveOutermostParentheses(PrintExpr_(normalized_index));
   }
 
-  if (scope == "global" || scope.empty() || scope == "shared" ||
-      scope == "shared.dyn") {
+  if (pto_space.has_value()) {
     return "pto.addptr(" + base + ", " + index_str + ")";
   }
 
@@ -919,18 +1112,16 @@ std::string CodeGenTileLangPTO::PtoScalarLoad(const BufferNode *buffer,
            ")";
   }
 
-  if (scope == "shared" || scope == "shared.dyn" || scope == "global" ||
-      scope.empty()) {
+  auto pto_space = PtoSpaceForStorageScope(scope);
+  if (pto_space.has_value()) {
     const VarNode *buffer_var = buffer->data.get();
     std::string base = GetVarID(buffer_var);
-    std::string pto_space =
-        (scope == "shared" || scope == "shared.dyn") ? "ub" : "gm";
-    if (scope == "shared" || scope == "shared.dyn") {
+    if (*pto_space != "gm") {
       const bool need_cast = HandleTypeMatch_(buffer_var, DataType::Int(8)) ||
                              !HandleTypeMatch_(buffer_var, buffer->dtype);
       if (need_cast) {
         base = "pto.castptr(" + base + ", " +
-               PtoPtrType(buffer->dtype, pto_space) + ")";
+               PtoPtrType(buffer->dtype, *pto_space) + ")";
       }
     }
     return "scalar.load(" + base + ", " + index_str + ")";
@@ -969,18 +1160,16 @@ void CodeGenTileLangPTO::EmitPtoScalarStore(const BufferNode *buffer,
     return;
   }
 
-  if (scope == "shared" || scope == "shared.dyn" || scope == "global" ||
-      scope.empty()) {
+  auto pto_space = PtoSpaceForStorageScope(scope);
+  if (pto_space.has_value()) {
     const VarNode *buffer_var = buffer->data.get();
     std::string base = GetVarID(buffer_var);
-    std::string pto_space =
-        (scope == "shared" || scope == "shared.dyn") ? "ub" : "gm";
-    if (scope == "shared" || scope == "shared.dyn") {
+    if (*pto_space != "gm") {
       const bool need_cast = HandleTypeMatch_(buffer_var, DataType::Int(8)) ||
                              !HandleTypeMatch_(buffer_var, buffer->dtype);
       if (need_cast) {
         base = "pto.castptr(" + base + ", " +
-               PtoPtrType(buffer->dtype, pto_space) + ")";
+               PtoPtrType(buffer->dtype, *pto_space) + ")";
       }
     }
     stream << "scalar.store(" << value << ", " << base << ", " << index_str
@@ -995,7 +1184,8 @@ void CodeGenTileLangPTO::EmitPtoBufferAllocation(const Buffer &buffer) {
   std::string scope = GetPtrStorageScope(buffer->data);
   alloc_storage_scope_[buffer->data.get()] = scope;
 
-  if (scope == "shared" || scope == "shared.dyn") {
+  auto pto_space = PtoSpaceForStorageScope(scope);
+  if (pto_space.has_value() && *pto_space != "gm") {
     PrintIndent();
     std::string vid = AllocVarID(buffer->data.get());
     auto alloc = AllocBuffer(buffer);
@@ -1003,7 +1193,7 @@ void CodeGenTileLangPTO::EmitPtoBufferAllocation(const Buffer &buffer) {
     ICHECK(opt_size.has_value())
         << "PTO shared allocation currently requires constant allocation size";
     stream << vid << " = pto.castptr(pto.const(0, dtype=pto.i64), "
-           << PtoPtrType(buffer->dtype, "ub") << ")\n";
+           << PtoPtrType(buffer->dtype, *pto_space) << ")\n";
     RegisterHandleType_(buffer->data.get(), buffer->dtype);
     return;
   } else if (scope == "local.fragment" || scope == "local") {
@@ -1096,7 +1286,9 @@ std::string CodeGenTileLangPTO::GetAscendCopyGmUbExpr_(const CallNode *op) {
 std::string CodeGenTileLangPTO::GetAscendCopyUbGmExpr_(const CallNode *op) {
   ICHECK_EQ(op->args.size(), 8U);
   std::string dst = RemoveOutermostParentheses(PrintExpr_(op->args[0]));
-  std::string src = RemoveOutermostParentheses(PrintExpr_(op->args[1]));
+  DataType src_dtype =
+      GetAnnotatedPointerDtype(op->args[1], DataType::Float(32));
+  std::string src = GetPtoLocalPtrExpr(op->args[1], "ub", src_dtype);
   std::string burst_num = RemoveOutermostParentheses(PrintExpr_(op->args[3]));
   std::string burst_len = RemoveOutermostParentheses(PrintExpr_(op->args[4]));
   int64_t l2_cache_ctrl = 0;
@@ -1114,14 +1306,17 @@ std::string CodeGenTileLangPTO::GetAscendCopyUbGmExpr_(const CallNode *op) {
 
 std::string CodeGenTileLangPTO::GetPtoLocalByteAddrExpr(
     const PrimExpr &index, DataType elem_dtype, const std::string &context) {
+  PrimExpr normalized_index =
+      NormalizePackedFP4Index(index, elem_dtype, context.c_str());
   int64_t const_index = 0;
   int64_t elem_bytes = elem_dtype.bytes();
-  if (TryGetConstInt(index, &const_index)) {
+  if (TryGetConstInt(normalized_index, &const_index)) {
     return "pto.const(" + std::to_string(const_index * elem_bytes) +
            ", dtype=pto.int64)";
   }
 
-  std::string index_expr = RemoveOutermostParentheses(PrintExpr_(index));
+  std::string index_expr =
+      RemoveOutermostParentheses(PrintExpr_(normalized_index));
   std::string coerced =
       "_tl_coerce_i64(" + index_expr + ", context=\"" + context + "\")";
   if (elem_bytes == 1) {
@@ -1160,11 +1355,17 @@ std::string CodeGenTileLangPTO::GetPtoLocalPtrExpr(const PrimExpr &expr,
   if (alloc_storage_scope_.count(buffer_var)) {
     scope = alloc_storage_scope_.at(buffer_var);
   }
-  ICHECK(scope == "shared" || scope == "shared.dyn" || scope == "shared.l1" ||
-         scope == "shared.l1.dyn" || scope == "shared.l0c" ||
-         scope == "local.fragment" || scope.empty())
+  std::optional<std::string> actual_space;
+  if (!scope.empty()) {
+    actual_space = PtoSpaceForStorageScope(scope);
+  }
+  ICHECK(actual_space.has_value() || scope == "local.fragment" || scope.empty())
       << "PTO local pointer expected shared/local.fragment storage, got "
       << scope;
+  if (actual_space.has_value()) {
+    ICHECK_EQ(*actual_space, space)
+        << "PTO local pointer storage scope does not match requested space";
+  }
 
   std::string byte_addr =
       GetPtoLocalByteAddrExpr(index, elem_dtype, "PTO local pointer offset");
@@ -1172,9 +1373,53 @@ std::string CodeGenTileLangPTO::GetPtoLocalPtrExpr(const PrimExpr &expr,
          ")";
 }
 
+std::string CodeGenTileLangPTO::GetPtoE8M0ScalePtrExpr(const PrimExpr &expr) {
+  PrimExpr index;
+  const VarNode *buffer_var = nullptr;
+  ICHECK(GetAddressOfIndex(expr, &index, &buffer_var))
+      << "PTO E8M0 scale pointer expects address_of/tvm_access_ptr, got "
+      << expr;
+
+  DataType storage_dtype = GetAnnotatedPointerDtype(expr, DataType::UInt(16));
+  ICHECK(storage_dtype.is_uint() && storage_dtype.bits() == 16)
+      << "PTO blockscaled GEMM requires pair-packed uint16 scale storage, got "
+      << storage_dtype;
+
+  std::string scope;
+  if (alloc_storage_scope_.count(buffer_var)) {
+    scope = alloc_storage_scope_.at(buffer_var);
+  }
+  ICHECK(scope == "shared.l1" || scope == "shared.l1.dyn")
+      << "PTO E8M0 scale pointer must refer to an L1 allocation, got " << scope;
+
+  std::string byte_addr = GetPtoLocalByteAddrExpr(
+      index, storage_dtype, "PTO E8M0 scale pointer offset");
+  return "pto.castptr(" + byte_addr + ", pto.ptr(pto.f8e8m0, \"mat\"))";
+}
+
 std::string CodeGenTileLangPTO::GetPtoAccPtrExpr(const PrimExpr &expr,
                                                  DataType dtype) {
   return GetPtoLocalPtrExpr(expr, "acc", dtype);
+}
+
+std::string CodeGenTileLangPTO::GetPtoL0APtrExpr(const PrimExpr &expr,
+                                                 DataType dtype) {
+  return GetPtoLocalPtrExpr(expr, "left", dtype);
+}
+
+std::string CodeGenTileLangPTO::GetPtoL0BPtrExpr(const PrimExpr &expr,
+                                                 DataType dtype) {
+  return GetPtoLocalPtrExpr(expr, "right", dtype);
+}
+
+std::string CodeGenTileLangPTO::GetPtoMatPtrExpr(const PrimExpr &expr,
+                                                 DataType dtype) {
+  return GetPtoLocalPtrExpr(expr, "mat", dtype);
+}
+
+std::string CodeGenTileLangPTO::GetPtoUbPtrExpr(const PrimExpr &expr,
+                                                DataType dtype) {
+  return GetPtoLocalPtrExpr(expr, "ub", dtype);
 }
 
 std::string CodeGenTileLangPTO::LocalVarID(const VarNode *var) {
@@ -1243,16 +1488,20 @@ void CodeGenTileLangPTO::EnsurePTOGemmHelper(const CallNode *op) {
                         "string at tl.ascend_gemm_l1 arg 9";
   DataType input_dtype = ParsePTODtype(dtype_name->value);
   ICHECK(IsSupportedPTOGemmInputDtype(input_dtype))
-      << "PTO GEMM L1 helper currently only supports float32, bfloat16, and "
-         "float8_e4m3fn inputs, got "
+      << "PTO GEMM L1 helper currently only supports float32, float16, "
+         "bfloat16, float8_e4m3fn, or float4_e2m1fn inputs, got "
       << input_dtype;
+  ICHECK(!input_dtype.is_float4_e2m1fn())
+      << "PTO GEMM L1 does not support packed float4 inputs; use the "
+         "blockscaled GEMM path so codegen can preserve the FP4 storage "
+         "layout";
 
   DataType a_dtype = GetAnnotatedPointerDtype(op->args[1], input_dtype);
   DataType b_dtype = GetAnnotatedPointerDtype(op->args[2], input_dtype);
-  ICHECK(a_dtype == input_dtype)
+  ICHECK(IsSamePTOStorageDtype(a_dtype, input_dtype))
       << "PTO GEMM L1 A pointer dtype must match input dtype " << input_dtype
       << ", got " << a_dtype;
-  ICHECK(b_dtype == input_dtype)
+  ICHECK(IsSamePTOStorageDtype(b_dtype, input_dtype))
       << "PTO GEMM L1 B pointer dtype must match input dtype " << input_dtype
       << ", got " << b_dtype;
 
@@ -1311,16 +1560,152 @@ void CodeGenTileLangPTO::EnsurePTOGemmHelper(const CallNode *op) {
          << a_l0_stage_elems << ", " << b_l0_stage_elems << ")\n";
 }
 
+void CodeGenTileLangPTO::EnsurePTOBlockscaledGemmHelper(const CallNode *op) {
+  ICHECK_EQ(op->args.size(), 18U)
+      << "tl.ascend_blockscaled_gemm_l1 expects exactly 18 arguments";
+  int64_t tile_m = ConstArgDim(op, 5, "tl.ascend_blockscaled_gemm_l1 M");
+  int64_t tile_k = ConstArgDim(op, 6, "tl.ascend_blockscaled_gemm_l1 K");
+  int64_t tile_n = ConstArgDim(op, 7, "tl.ascend_blockscaled_gemm_l1 N");
+  int64_t base_k =
+      ConstArgDim(op, 8, "tl.ascend_blockscaled_gemm_l1 tile_k_sub");
+  int64_t trans_b = ConstArgDim(op, 9, "tl.ascend_blockscaled_gemm_l1 trans_b");
+  int64_t sf_nz_stride =
+      ConstArgDim(op, 16, "tl.ascend_blockscaled_gemm_l1 sf_nz_stride");
+  ICHECK_EQ(trans_b, 1)
+      << "PTO blockscaled GEMM L1 helper currently requires trans_b=1";
+  ICHECK_EQ(tile_k % base_k, 0);
+  ICHECK_EQ(base_k % 64, 0)
+      << "PTO blockscaled GEMM tile_k_sub must be divisible by 64, got "
+      << base_k;
+  ICHECK_GT(sf_nz_stride, 0)
+      << "PTO blockscaled GEMM sf_nz_stride must be positive, got "
+      << sf_nz_stride;
+  CheckConstZero(op->args[14], "blockscaled GEMM buf_offset");
+
+  const auto *input_dtype_name = op->args[11].as<StringImmNode>();
+  ICHECK(input_dtype_name)
+      << "PTO blockscaled GEMM L1 helper requires a constant input dtype "
+         "string at tl.ascend_blockscaled_gemm_l1 arg 11";
+  DataType input_dtype = ParsePTODtype(input_dtype_name->value);
+  ICHECK(input_dtype.is_float8_e4m3fn() || input_dtype.is_float4_e2m1fn())
+      << "PTO blockscaled GEMM L1 helper currently supports only "
+         "float8_e4m3fn or float4_e2m1fn inputs, got "
+      << input_dtype;
+
+  const auto *scale_dtype_name = op->args[12].as<StringImmNode>();
+  ICHECK(scale_dtype_name)
+      << "PTO blockscaled GEMM L1 helper requires a constant scale dtype "
+         "string at tl.ascend_blockscaled_gemm_l1 arg 12";
+  ICHECK(scale_dtype_name->value == "uint16_t")
+      << "PTO blockscaled GEMM L1 helper currently requires pair-packed "
+         "uint16_t scales, got "
+      << scale_dtype_name->value;
+
+  const auto *accum_dtype_name = op->args[13].as<StringImmNode>();
+  ICHECK(accum_dtype_name)
+      << "PTO blockscaled GEMM L1 helper requires a constant accum dtype "
+         "string at tl.ascend_blockscaled_gemm_l1 arg 13";
+  DataType accum_dtype = ParsePTODtype(accum_dtype_name->value);
+  ICHECK(accum_dtype.is_float() && accum_dtype.bits() == 32)
+      << "PTO blockscaled GEMM L1 helper currently supports float32 "
+         "accum/output, got "
+      << accum_dtype;
+
+  DataType a_dtype = GetAnnotatedPointerDtype(op->args[1], input_dtype);
+  DataType b_dtype = GetAnnotatedPointerDtype(op->args[2], input_dtype);
+  ICHECK(IsSamePTOStorageDtype(a_dtype, input_dtype))
+      << "PTO blockscaled GEMM A pointer dtype must match input dtype "
+      << input_dtype << ", got " << a_dtype;
+  ICHECK(IsSamePTOStorageDtype(b_dtype, input_dtype))
+      << "PTO blockscaled GEMM B pointer dtype must match input dtype "
+      << input_dtype << ", got " << b_dtype;
+
+  DataType sfa_dtype =
+      GetAnnotatedPointerDtype(op->args[3], DataType::UInt(16));
+  DataType sfb_dtype =
+      GetAnnotatedPointerDtype(op->args[4], DataType::UInt(16));
+  ICHECK(sfa_dtype.is_uint() && sfa_dtype.bits() == 16)
+      << "PTO blockscaled GEMM SFA pointer must be uint16, got " << sfa_dtype;
+  ICHECK(sfb_dtype.is_uint() && sfb_dtype.bits() == 16)
+      << "PTO blockscaled GEMM SFB pointer must be uint16, got " << sfb_dtype;
+
+  DataType acc_dtype =
+      GetAnnotatedPointerDtype(op->args[0], DataType::Float(32));
+  ICHECK(acc_dtype == accum_dtype)
+      << "PTO blockscaled GEMM accumulator pointer dtype must match "
+      << accum_dtype << ", got " << acc_dtype;
+
+  if (blockscaled_gemm_emit_ctx_.initialized) {
+    ICHECK_EQ(blockscaled_gemm_emit_ctx_.tile_m, tile_m);
+    ICHECK_EQ(blockscaled_gemm_emit_ctx_.tile_n, tile_n);
+    ICHECK_EQ(blockscaled_gemm_emit_ctx_.tile_k, tile_k);
+    ICHECK_EQ(blockscaled_gemm_emit_ctx_.base_k, base_k);
+    ICHECK_EQ(blockscaled_gemm_emit_ctx_.sf_nz_stride, sf_nz_stride);
+    ICHECK(blockscaled_gemm_emit_ctx_.input_dtype == input_dtype)
+        << "PTO blockscaled GEMM helper saw inconsistent input dtype";
+    ICHECK(blockscaled_gemm_emit_ctx_.accum_dtype == accum_dtype)
+        << "PTO blockscaled GEMM helper saw inconsistent accum/output dtype";
+    return;
+  }
+
+  blockscaled_gemm_emit_ctx_.initialized = true;
+  blockscaled_gemm_emit_ctx_.tile_m = tile_m;
+  blockscaled_gemm_emit_ctx_.tile_n = tile_n;
+  blockscaled_gemm_emit_ctx_.tile_k = tile_k;
+  blockscaled_gemm_emit_ctx_.base_k = base_k;
+  blockscaled_gemm_emit_ctx_.sf_nz_stride = sf_nz_stride;
+  blockscaled_gemm_emit_ctx_.input_dtype = input_dtype;
+  blockscaled_gemm_emit_ctx_.accum_dtype = accum_dtype;
+  blockscaled_gemm_emit_ctx_.helper_name = "_tl_blockscaled_gemm_l1";
+  blockscaled_gemm_emit_ctx_.a_l0_name = "blockscaled_a_l0_0";
+  blockscaled_gemm_emit_ctx_.b_l0_name = "blockscaled_b_l0_0";
+
+  int64_t input_c0 = PTOGemmInputC0(input_dtype);
+  ICHECK_EQ(base_k % input_c0, 0)
+      << "PTO blockscaled GEMM tile_k_sub must be divisible by input C0="
+      << input_c0 << " for dtype " << input_dtype;
+  int64_t sub_k_tiles = tile_k / base_k;
+  int64_t sub_k_c0_blocks = base_k / input_c0;
+  int64_t input_pack_factor = PTOGemmInputPackFactor(input_dtype);
+  int64_t a_l0_stage_elems = tile_m * base_k / input_pack_factor;
+  int64_t b_l0_stage_elems = tile_n * base_k / input_pack_factor;
+
+  PrintIndent();
+  stream << "blockscaled_zero_addr = pto.const(0, dtype=pto.int64)\n";
+  PrintIndent();
+  stream << blockscaled_gemm_emit_ctx_.a_l0_name << " = pto.castptr("
+         << "blockscaled_zero_addr, " << PtoPtrType(input_dtype, "left")
+         << ")\n";
+  PrintIndent();
+  stream << blockscaled_gemm_emit_ctx_.b_l0_name << " = pto.castptr("
+         << "blockscaled_zero_addr, " << PtoPtrType(input_dtype, "right")
+         << ")\n";
+  PrintIndent();
+  stream << blockscaled_gemm_emit_ctx_.helper_name
+         << " = PTOBlockscaledGemmL1Template(" << tile_m << ", " << tile_n
+         << ", " << tile_k << ", " << base_k << ", " << sub_k_tiles << ", "
+         << input_c0 << ", " << sub_k_c0_blocks << ", " << a_l0_stage_elems
+         << ", " << b_l0_stage_elems << ", " << sf_nz_stride;
+  if (input_pack_factor != 1) {
+    stream << ", input_pack_factor=" << input_pack_factor;
+  }
+  stream << ")\n";
+}
+
 void CodeGenTileLangPTO::EmitAscendCopyGmToCbuf(const CallNode *op) {
   ICHECK_EQ(op->args.size(), 12U)
       << "tl.ascend_copy_gm_to_cbuf expects exactly 12 arguments";
   CheckConstZero(op->args[2], "sid");
   CheckConstZero(op->args[7], "loop4_src_stride");
 
-  // arg[11] physical_dtype is consumed by the AscendC codegen for packed-SF
-  // pointer casts. Reject that variant because PTO cannot emit it yet.
-  ICHECK(Downcast<StringImm>(op->args[11])->value.empty())
-      << "PTO GM-to-L1 copy does not support packed scale-factor layouts";
+  const std::string physical_dtype = Downcast<StringImm>(op->args[11])->value;
+  DataType dst_dtype =
+      GetAnnotatedPointerDtype(op->args[0], DataType::BFloat(16));
+  const bool is_fp4 = dst_dtype.is_float4_e2m1fn();
+  ICHECK(physical_dtype.empty() || (is_fp4 && physical_dtype == "int8_t"))
+      << "PTO GM-to-L1 copy only supports the int8 physical dtype for FP4 "
+         "storage, got "
+      << physical_dtype;
 
   int64_t transpose = 0;
   ICHECK(TryGetConstInt(op->args[9], &transpose))
@@ -1329,6 +1714,10 @@ void CodeGenTileLangPTO::EmitAscendCopyGmToCbuf(const CallNode *op) {
   std::string dst =
       GetPtoLocalPtrExpr(op->args[0], "mat", DataType::BFloat(16));
   std::string src = RemoveOutermostParentheses(PrintExpr_(op->args[1]));
+  DataType src_dtype = GetAnnotatedPointerDtype(op->args[1], dst_dtype);
+  if (is_fp4 && !src_dtype.is_float4_e2m1fn()) {
+    src = "pto.castptr(" + src + ", " + PtoPtrType(dst_dtype, "gm") + ")";
+  }
   std::string l2_cache_ctrl =
       RemoveOutermostParentheses(PrintExpr_(op->args[4]));
   std::string n_value = RemoveOutermostParentheses(PrintExpr_(op->args[5]));
@@ -1347,6 +1736,82 @@ void CodeGenTileLangPTO::EmitAscendCopyGmToCbuf(const CallNode *op) {
          << (smallc0_en == "0" ? "False" : smallc0_en) << "))\n";
 }
 
+void CodeGenTileLangPTO::EmitAscendLoadCbufToL0(const CallNode *op,
+                                                bool is_l0a) {
+  ICHECK(op->args.size() == 9U || op->args.size() == 16U)
+      << "PTO L1-to-L0 load expects 9 or 16 arguments";
+
+  const char *intrinsic_name =
+      is_l0a ? "tl.ascend_load_cbuf_to_ca" : "tl.ascend_load_cbuf_to_cb";
+  std::string m_start = RemoveOutermostParentheses(PrintExpr_(op->args[2]));
+  std::string k_start = RemoveOutermostParentheses(PrintExpr_(op->args[3]));
+  std::string m_step = RemoveOutermostParentheses(PrintExpr_(op->args[4]));
+  std::string k_step = RemoveOutermostParentheses(PrintExpr_(op->args[5]));
+  std::string src_stride = RemoveOutermostParentheses(PrintExpr_(op->args[6]));
+  std::string dst_stride = RemoveOutermostParentheses(PrintExpr_(op->args[7]));
+  int64_t transpose = 0;
+  ICHECK(TryGetConstInt(op->args[8], &transpose))
+      << intrinsic_name << " requires a constant transpose flag";
+
+  if (op->args.size() == 9U) {
+    DataType dtype =
+        GetAnnotatedPointerDtype(op->args[0], DataType::BFloat(16));
+    std::string dst = is_l0a ? GetPtoL0APtrExpr(op->args[0], dtype)
+                             : GetPtoL0BPtrExpr(op->args[0], dtype);
+    std::string src = GetPtoMatPtrExpr(op->args[1], dtype);
+
+    PrintIndent();
+    stream << (is_l0a ? "pto.mte_l1_l0a(" : "pto.mte_l1_l0b(") << src << ", "
+           << dst << ", m_start=" << m_start << ", k_start=" << k_start
+           << ", m_step=" << m_step << ", k_step=" << k_step
+           << ", src_stride=" << src_stride << ", dst_stride=" << dst_stride;
+    if (transpose != 0) {
+      stream << ", transpose=True";
+    }
+    stream << ")\n";
+  } else {
+    DataType source_dtype =
+        GetAnnotatedPointerDtype(op->args[1], DataType::Float8E4M3FN());
+    DataType destination_dtype =
+        GetAnnotatedPointerDtype(op->args[0], source_dtype);
+    ICHECK(source_dtype.is_float8_e4m3fn() || source_dtype.is_float4_e2m1fn())
+        << "PTO blockscaled L0 staging currently supports only float8_e4m3fn "
+           "or float4_e2m1fn data, got "
+        << source_dtype;
+    ICHECK(IsSamePTOStorageDtype(destination_dtype, source_dtype))
+        << "PTO blockscaled L0 staging source and destination dtypes must "
+           "match";
+
+    std::string source = GetPtoLocalPtrExpr(op->args[1], "mat", source_dtype);
+    std::string destination = GetPtoLocalPtrExpr(
+        op->args[0], is_l0a ? "left" : "right", destination_dtype);
+    std::string scale_source = GetPtoE8M0ScalePtrExpr(op->args[9]);
+
+    PrintIndent();
+    stream << "pto.mte_l1_l0" << (is_l0a ? "a" : "b") << "(" << source << ", "
+           << destination << ", m_start=" << m_start << ", k_start=" << k_start
+           << ", m_step=" << m_step << ", k_step=" << k_step
+           << ", src_stride=" << src_stride << ", dst_stride=" << dst_stride;
+    if (transpose != 0) {
+      stream << ", transpose=True";
+    }
+    stream << ")\n";
+
+    PrintIndent();
+    stream
+        << "pto.mte_l1_l0" << (is_l0a ? "a" : "b") << "_mx(" << scale_source
+        << ", " << destination
+        << ", x_start=" << RemoveOutermostParentheses(PrintExpr_(op->args[10]))
+        << ", y_start=" << RemoveOutermostParentheses(PrintExpr_(op->args[11]))
+        << ", x_step=" << RemoveOutermostParentheses(PrintExpr_(op->args[12]))
+        << ", y_step=" << RemoveOutermostParentheses(PrintExpr_(op->args[13]))
+        << ", src_stride="
+        << RemoveOutermostParentheses(PrintExpr_(op->args[14]))
+        << ", dst_stride="
+        << RemoveOutermostParentheses(PrintExpr_(op->args[15])) << ")\n";
+  }
+}
+
 void CodeGenTileLangPTO::EmitPTOGemmRun(const std::string &a_mat,
                                         const std::string &b_mat,
                                         const std::string &acc,
@@ -1359,12 +1824,8 @@ void CodeGenTileLangPTO::EmitPTOGemmRun(const std::string &a_mat,
          << gemm_emit_ctx_.b_l0_name << ", " << acc
          << ", clear_accum=" << clear_accum
          << ", unit_flag_ctrl=" << unit_flag_ctrl;
-  if (IsFloat32(gemm_emit_ctx_.input_dtype) && hf32_mode != 0) {
-    // PTO names the hardware bit-47 mode ROUND_AWAY; CANN names the same
-    // setting HF32TransMode::NEAREST_ZERO.
-    stream << ", tf32_mode="
-           << (hf32_mode == 1 ? "pto.Tf32Mode.ROUND_AWAY"
-                              : "pto.Tf32Mode.ROUND_EVEN");
+  if (IsFloat32(gemm_emit_ctx_.input_dtype)) {
+    EmitPTOHf32ModeArgument(stream, hf32_mode);
   }
   stream << ")\n";
 }
@@ -1372,21 +1833,308 @@ void CodeGenTileLangPTO::EmitPTOGemmRun(const std::string &a_mat,
 void CodeGenTileLangPTO::EmitAscendGemmL1(const CallNode *op) {
   EnsurePTOGemmHelper(op);
   std::string acc = GetPtoAccPtrExpr(op->args[0], DataType::Float(32));
-  std::string a_mat =
-      GetPtoLocalPtrExpr(op->args[1], "mat", gemm_emit_ctx_.input_dtype);
-  std::string b_mat =
-      GetPtoLocalPtrExpr(op->args[2], "mat", gemm_emit_ctx_.input_dtype);
+  std::string a_mat = GetPtoMatPtrExpr(op->args[1], gemm_emit_ctx_.input_dtype);
+  std::string b_mat = GetPtoMatPtrExpr(op->args[2], gemm_emit_ctx_.input_dtype);
 
   int64_t hf32_mode = 0;
   if (IsFloat32(gemm_emit_ctx_.input_dtype)) {
-    auto it = hf32_mode_by_gemm_.find(GetRef<Call>(op));
-    ICHECK(it != hf32_mode_by_gemm_.end())
+    auto it = hf32_mode_by_cube_call_.find(GetRef<Call>(op));
+    ICHECK(it != hf32_mode_by_cube_call_.end())
         << "PTO codegen did not analyze HF32 mode for FP32 GEMM";
     hf32_mode = it->second;
   }
   EmitPTOGemmRun(
       a_mat, b_mat, acc, RemoveOutermostParentheses(PrintExpr_(op->args[8])),
       RemoveOutermostParentheses(PrintExpr_(op->args[11])), hf32_mode);
+}
+
+void CodeGenTileLangPTO::EmitUnitFlagDispatch(
+    const PrimExpr &unit_flag_expr,
+    const std::function<std::string(int64_t)> &map_unit_flag,
+    const std::function<void(const std::string &)> &emit_operation) {
+  int64_t unit_flag_value = 0;
+  if (TryGetConstInt(unit_flag_expr, &unit_flag_value)) {
+    emit_operation(map_unit_flag(unit_flag_value));
+    return;
+  }
+
+  if (const auto *select = unit_flag_expr.as<SelectNode>()) {
+    std::string select_cond =
+        RemoveOutermostParentheses(PrintExpr_(select->condition));
+    PrintIndent();
+    stream << "if " << select_cond << ":\n";
+    int then_scope = BeginScope();
+    EmitUnitFlagDispatch(select->true_value, map_unit_flag, emit_operation);
+    EndScope(then_scope);
+    PrintIndent();
+    stream << "else:\n";
+    int else_scope = BeginScope();
+    EmitUnitFlagDispatch(select->false_value, map_unit_flag, emit_operation);
+    EndScope(else_scope);
+    return;
+  }
+
+  std::string unit_flag_expr_text =
+      RemoveOutermostParentheses(PrintExpr_(unit_flag_expr));
+  // PTODSL's default AST rewrite converts these native Python conditions to
+  // structured device control flow. The public TileLang contract restricts
+  // runtime values to 0, 2, or 3, so the final branch represents 2.
+  PrintIndent();
+  stream << "if " << unit_flag_expr_text << " == 0:\n";
+  int no_flag_scope = BeginScope();
+  emit_operation(map_unit_flag(0));
+  EndScope(no_flag_scope);
+  PrintIndent();
+  stream << "elif " << unit_flag_expr_text << " == 3:\n";
+  int set_scope = BeginScope();
+  emit_operation(map_unit_flag(3));
+  EndScope(set_scope);
+  PrintIndent();
+  stream << "else:\n";
+  int check_scope = BeginScope();
+  emit_operation(map_unit_flag(2));
+  EndScope(check_scope);
+}
+
+void CodeGenTileLangPTO::EmitAscendMad(const CallNode *op) {
+  ICHECK_EQ(op->args.size(), 10U)
+      << "tl.ascend_mad expects exactly 10 arguments";
+  int64_t gemv_ctrl = ConstArgDim(op, 7, "tl.ascend_mad gemv_ctrl");
+  int64_t btbuf_ctrl = ConstArgDim(op, 8, "tl.ascend_mad BTbuf_ctrl");
+  ICHECK_EQ(btbuf_ctrl, 0) << "PTO MAD does not support nonzero BTbuf_ctrl";
+
+  std::string dst = GetPtoAccPtrExpr(op->args[0], DataType::Float(32));
+  DataType input_dtype = GetAscendMadInputDtype(op);
+  std::string lhs = GetPtoL0APtrExpr(op->args[1], input_dtype);
+  std::string rhs = GetPtoL0BPtrExpr(op->args[2], input_dtype);
+
+  int64_t hf32_mode = 0;
+  if (IsFloat32(input_dtype)) {
+    auto it = hf32_mode_by_cube_call_.find(GetRef<Call>(op));
+    ICHECK(it != hf32_mode_by_cube_call_.end())
+        << "PTO codegen did not analyze HF32 mode for FP32 L0 MAD";
+    hf32_mode = it->second;
+  }
+
+  auto emit_mad = [&](bool clear_accum, const std::string &unit_flag) {
+    PrintIndent();
+    stream << (clear_accum ? "pto.mad(" : "pto.mad_acc(") << lhs << ", " << rhs
+           << ", " << dst << ", " << PrintExpr_(op->args[3]) << ", "
+           << PrintExpr_(op->args[5]) << ", " << PrintExpr_(op->args[4]);
+    if (!unit_flag.empty()) {
+      stream << ", unit_flag=" << unit_flag;
+    }
+    if (gemv_ctrl != 0) {
+      stream << ", disable_gemv=True";
+    }
+    EmitPTOHf32ModeArgument(stream, hf32_mode);
+    stream << ")\n";
+  };
+  auto emit_mad_with_unit_flag = [&](bool clear_accum) {
+    EmitUnitFlagDispatch(op->args[6], MadUnitFlagArg,
+                         [&](const std::string &unit_flag) {
+                           emit_mad(clear_accum, unit_flag);
+                         });
+  };
+
+  int64_t zero_c = 0;
+  if (TryGetConstInt(op->args[9], &zero_c)) {
+    emit_mad_with_unit_flag(zero_c != 0);
+    return;
+  }
+
+  std::string zero_c_expr = RemoveOutermostParentheses(PrintExpr_(op->args[9]));
+  PrintIndent();
+  stream << "with pto.if_(" << zero_c_expr << ") as clear_br:\n";
+  int clear_scope = BeginScope();
+  PrintIndent();
+  stream << "with clear_br.then_:\n";
+  int then_scope = BeginScope();
+  emit_mad_with_unit_flag(true);
+  EndScope(then_scope);
+  PrintIndent();
+  stream << "with clear_br.else_:\n";
+  int else_scope = BeginScope();
+  emit_mad_with_unit_flag(false);
+  EndScope(else_scope);
+  EndScope(clear_scope);
+}
+
+void CodeGenTileLangPTO::EmitAscendCopyMatrixCcToUb(const CallNode *op) {
+  ICHECK_EQ(op->args.size(), 26U)
+      << "tl.ascend_copy_matrix_cc_to_ub expects exactly 26 arguments";
+  DataType dst_dtype =
+      GetAnnotatedPointerDtype(op->args[0], DataType::Float(32));
+  std::string dst = GetPtoLocalPtrExpr(op->args[0], "ub", dst_dtype);
+  std::string src = GetPtoAccPtrExpr(op->args[1], DataType::Float(32));
+  std::string n_size = RemoveOutermostParentheses(PrintExpr_(op->args[3]));
+  std::string m_size = RemoveOutermostParentheses(PrintExpr_(op->args[4]));
+  std::string dst_stride = RemoveOutermostParentheses(PrintExpr_(op->args[5]));
+  std::string src_stride = RemoveOutermostParentheses(PrintExpr_(op->args[6]));
+  std::string sub_blockid = RemoveOutermostParentheses(PrintExpr_(op->args[8]));
+
+  int64_t dual_dst_ctl = 0;
+  int64_t quant_pre = 0;
+  int64_t split_en = 0;
+  auto check_const = [&](size_t index, int64_t expected, const char *name) {
+    int64_t value = 0;
+    ICHECK(TryGetConstInt(op->args[index], &value) && value == expected)
+        << "PTO L0C-to-UB currently requires " << name << " == " << expected
+        << ", got " << op->args[index];
+  };
+  check_const(2, 0, "sid");
+  ICHECK(TryGetConstInt(op->args[7], &dual_dst_ctl) && dual_dst_ctl >= 0 &&
+         dual_dst_ctl <= 2)
+      << "PTO L0C-to-UB expects dual_dst_ctl in {0, 1, 2}";
+  ICHECK(TryGetConstInt(op->args[11], &quant_pre))
+      << "PTO L0C-to-UB expects constant quant_pre";
+  ICHECK(quant_pre == 0 || quant_pre == 1 || quant_pre == 16)
+      << "PTO L0C-to-UB currently supports quant_pre 0, 1, or 16";
+  DataType expected_dst_dtype = DataType::Float(32);
+  if (quant_pre == 1) {
+    expected_dst_dtype = DataType::Float(16);
+  } else if (quant_pre == 16) {
+    expected_dst_dtype = DataType::BFloat(16);
+  }
+  ICHECK_EQ(dst_dtype, expected_dst_dtype)
+      << "PTO L0C-to-UB destination dtype must match quant_pre " << quant_pre
+      << ", got " << dst_dtype;
+  ICHECK(TryGetConstInt(op->args[13], &split_en) && split_en == 0)
+      << "PTO L0C-to-UB currently requires split_en=0";
+  check_const(14, 1, "NZ2ND_en");
+  if (dual_dst_ctl != 0) {
+    check_const(8, 0, "sub_blockid with dual destination mode");
+    check_const(11, 0, "quant_pre with dual destination mode");
+  }
+  check_const(9, 0, "clip_relu_pre");
+  check_const(12, 0, "relu_pre");
+  check_const(15, 0, "quant_post");
+  check_const(16, 0, "relu_post");
+  check_const(17, 0, "clip_relu_post");
+  check_const(18, 0, "loop_enhance_en");
+  check_const(19, 0, "eltwise_op");
+  check_const(20, 0, "eltwise_antq_en");
+  check_const(21, 0, "loop_enhance_merge_en");
+  check_const(22, 0, "C0_pad_en");
+  check_const(23, 0, "wino_post_en");
+  check_const(24, 0, "broadcast_en");
+  check_const(25, 0, "NZ2DN_en");
+
+  auto emit_store = [&](const std::string &unit_flag) {
+    PrintIndent();
+    stream << "pto.mte_l0c_ub(" << src << ", " << dst << ", " << m_size << ", "
+           << n_size << ", " << src_stride << ", " << dst_stride;
+    if (dual_dst_ctl == 0) {
+      stream << ", " << sub_blockid;
+    } else {
+      stream << ", split=pto.SplitMode." << (dual_dst_ctl == 1 ? "M" : "N");
+    }
+    if (!unit_flag.empty()) {
+      stream << ", unit_flag=" << unit_flag;
+    }
+    if (quant_pre == 1) {
+      stream << ", pre_quant=(pto.f16(1.0), \"f32_f16\")";
+    } else if (quant_pre == 16) {
+      stream << ", pre_quant=(pto.bf16(1.0), \"f32_bf16\")";
+    }
+    stream << ", layout=\"nz2nd\")\n";
+  };
+  EmitUnitFlagDispatch(op->args[10], AccStoreUnitFlagArg, emit_store);
+}
+
+void CodeGenTileLangPTO::EmitPTOBlockscaledGemmRun(
+    const std::string &a_mat, const std::string &b_mat,
+    const std::string &sfa_e8m0_mat, const std::string &sfb_e8m0_mat,
+    const std::string &acc, const std::string &sf_k_offset,
+    const std::string &clear_accum, const std::string &unit_flag_ctrl) {
+  PrintIndent();
+  stream << blockscaled_gemm_emit_ctx_.helper_name << ".run_l1_tile(" << a_mat
+         << ", " << b_mat << ", " << sfa_e8m0_mat << ", " << sfb_e8m0_mat
+         << ", " << blockscaled_gemm_emit_ctx_.a_l0_name << ", "
+         << blockscaled_gemm_emit_ctx_.b_l0_name << ", " << acc
+         << ", sf_k_offset=" << sf_k_offset << ", clear_accum=" << clear_accum
+         << ", unit_flag_ctrl=" << unit_flag_ctrl << ")\n";
+}
+
+void CodeGenTileLangPTO::EmitAscendBlockscaledGemmL1(const CallNode *op) {
+  EnsurePTOBlockscaledGemmHelper(op);
+  std::string acc = GetPtoAccPtrExpr(op->args[0], DataType::Float(32));
+  std::string a_mat = GetPtoLocalPtrExpr(
+      op->args[1], "mat", blockscaled_gemm_emit_ctx_.input_dtype);
+  std::string b_mat = GetPtoLocalPtrExpr(
+      op->args[2], "mat", blockscaled_gemm_emit_ctx_.input_dtype);
+  std::string sfa_e8m0_mat = GetPtoE8M0ScalePtrExpr(op->args[3]);
+  std::string sfb_e8m0_mat = GetPtoE8M0ScalePtrExpr(op->args[4]);
+
+  EmitPTOBlockscaledGemmRun(
+      a_mat, b_mat, sfa_e8m0_mat, sfb_e8m0_mat, acc,
+      RemoveOutermostParentheses(PrintExpr_(op->args[15])),
+      RemoveOutermostParentheses(PrintExpr_(op->args[10])),
+      RemoveOutermostParentheses(PrintExpr_(op->args[17])));
+}
+
+void CodeGenTileLangPTO::EmitAscendMadMx(const CallNode *op) {
+  ICHECK_EQ(op->args.size(), 10U)
+      << "tl.ascend_mad_mx expects exactly 10 arguments";
+
+  DataType input_dtype =
+      GetAnnotatedPointerDtype(op->args[1], DataType::Float8E4M3FN());
+  DataType rhs_dtype = GetAnnotatedPointerDtype(op->args[2], input_dtype);
+  ICHECK((input_dtype.is_float8_e4m3fn() || input_dtype.is_float4_e2m1fn()) &&
+         IsSamePTOStorageDtype(rhs_dtype, input_dtype))
+      << "PTO blockscaled L0 MAD currently supports float8_e4m3fn or "
+         "float4_e2m1fn inputs";
+  DataType acc_dtype =
+      GetAnnotatedPointerDtype(op->args[0], DataType::Float(32));
+  ICHECK(IsFloat32(acc_dtype)) << "PTO blockscaled L0 MAD currently supports "
+                                  "only float32 accumulator, got "
+                               << acc_dtype;
+  int64_t gemv_ctrl = 0;
+  int64_t btbuf_ctrl = 0;
+  ICHECK(TryGetConstInt(op->args[7], &gemv_ctrl) && gemv_ctrl == 1)
+      << "PTO blockscaled L0 MAD requires gemv_ctrl=1";
+  ICHECK(TryGetConstInt(op->args[8], &btbuf_ctrl) && btbuf_ctrl == 0)
+      << "PTO blockscaled L0 MAD requires BTbuf_ctrl=0";
+
+  std::string acc = GetPtoAccPtrExpr(op->args[0], DataType::Float(32));
+  std::string lhs = GetPtoLocalPtrExpr(op->args[1], "left", input_dtype);
+  std::string rhs = GetPtoLocalPtrExpr(op->args[2], "right", input_dtype);
+  std::string m = RemoveOutermostParentheses(PrintExpr_(op->args[3]));
+  std::string k = RemoveOutermostParentheses(PrintExpr_(op->args[4]));
+  std::string n = RemoveOutermostParentheses(PrintExpr_(op->args[5]));
+  std::string clear_accum = RemoveOutermostParentheses(PrintExpr_(op->args[9]));
+
+  auto emit_mad = [&](bool clear, const std::string &unit_flag) {
+    PrintIndent();
+    stream << "pto." << (clear ? "mad_mx" : "mad_mx_acc") << "(" << lhs << ", "
+           << rhs << ", " << acc << ", " << m << ", " << n << ", " << k;
+    if (!unit_flag.empty()) {
+      stream << ", unit_flag=" << unit_flag;
+    }
+    stream << ", disable_gemv=True, sat=\"sat\")\n";
+  };
+  auto emit_mad_with_unit_flag = [&](bool clear) {
+    EmitUnitFlagDispatch(
+        op->args[6], MadUnitFlagArg,
+        [&](const std::string &unit_flag) { emit_mad(clear, unit_flag); });
+  };
+
+  int64_t clear_accum_value = 0;
+  if (TryGetConstInt(op->args[9], &clear_accum_value)) {
+    emit_mad_with_unit_flag(clear_accum_value != 0);
+    return;
+  }
+
+  PrintIndent();
+  stream << "if " << clear_accum << ":\n";
+  int clear_scope = BeginScope();
+  emit_mad_with_unit_flag(true);
+  EndScope(clear_scope);
+  PrintIndent();
+  stream << "else:\n";
+  int clear_else_scope = BeginScope();
+  emit_mad_with_unit_flag(false);
+  EndScope(clear_else_scope);
 }
 
 void CodeGenTileLangPTO::EmitAscendCopyMatrixCcToGm(const CallNode *op) {
@@ -1826,6 +2574,52 @@ void CodeGenTileLangPTO::VisitExpr_(const CallNode *op,
     LOG(FATAL) << "Unsupported PTO storage sync scope: " << sync_scope;
   }
 
+  if (op->op.same_as(tl::ascend_set_atomic())) {
+    ICHECK_EQ(op->args.size(), 2U)
+        << "tl.ascend_set_atomic expects (op_str, typed_zero)";
+    const std::string atomic_op = Downcast<StringImm>(op->args[0])->value;
+    ICHECK(atomic_op == "add" || atomic_op == "max" || atomic_op == "min")
+        << "tl.ascend_set_atomic op must be add/max/min, got " << atomic_op;
+
+    const DataType dtype = op->args[1].dtype();
+    const char *dtype_api = nullptr;
+    if (dtype == DataType::Float(32)) {
+      dtype_api = "set_atomic_f32";
+    } else if (dtype == DataType::Float(16)) {
+      dtype_api = "set_atomic_f16";
+    } else if (dtype == DataType::Int(16)) {
+      dtype_api = "set_atomic_s16";
+    } else if (dtype == DataType::Int(32)) {
+      dtype_api = "set_atomic_s32";
+    } else if (dtype == DataType::Int(8)) {
+      dtype_api = "set_atomic_s8";
+    } else if (dtype == DataType::BFloat(16)) {
+      dtype_api = "set_atomic_bf16";
+    }
+    ICHECK(dtype_api != nullptr)
+        << "Unsupported PTO store-atomic dtype: " << dtype;
+
+    // AscendC already lowers T.set_atomic / T.set_atomic_none in
+    // codegen_ascend.cc. Explicit T.set_atomic only needed this PTO
+    // VisitExpr_ path (e.g. GEMM split-K / multi-core flush).
+    PrintIndent();
+    if (atomic_op == "add") {
+      stream << "pto." << dtype_api << "(); pto.set_atomic_add()\n";
+    } else {
+      stream << "pto.set_atomic_" << atomic_op << "(); pto." << dtype_api
+             << "()\n";
+    }
+    return;
+  }
+
+  if (op->op.same_as(tl::ascend_set_atomic_none())) {
+    ICHECK_EQ(op->args.size(), 0U)
+        << "tl.ascend_set_atomic_none expects no arguments";
+    PrintIndent();
+    stream << "pto.set_atomic_none()\n";
+    return;
+  }
+
   if (op->op.same_as(tl::ascend_copy_gm_to_ubuf())) {
     PrintIndent();
     stream << GetAscendCopyGmUbExpr_(op) << "\n";
@@ -1843,6 +2637,12 @@ void CodeGenTileLangPTO::VisitExpr_(const CallNode *op,
     return;
   }
 
+  if (op->op.same_as(tl::ascend_load_cbuf_to_ca()) ||
+      op->op.same_as(tl::ascend_load_cbuf_to_cb())) {
+    EmitAscendLoadCbufToL0(op, op->op.same_as(tl::ascend_load_cbuf_to_ca()));
+    return;
+  }
+
   if (op->op.same_as(tl::ascend_gemm_l1())) {
     EmitAscendGemmL1(op);
     return;
@@ -1851,6 +2651,26 @@ void CodeGenTileLangPTO::VisitExpr_(const CallNode *op,
   if (op->op.same_as(tl::ascend_set_hf32_mode())) {
     // PTO represents HF32 as a per-MAD attribute. The mode analysis binds
     // each stateful TileLang setting to the GEMMs it reaches.
+    return;
+  }
+
+  if (op->op.same_as(tl::ascend_mad())) {
+    EmitAscendMad(op);
+    return;
+  }
+
+  if (op->op.same_as(tl::ascend_copy_matrix_cc_to_ub())) {
+    EmitAscendCopyMatrixCcToUb(op);
+    return;
+  }
+
+  if (op->op.same_as(tl::ascend_blockscaled_gemm_l1())) {
+    EmitAscendBlockscaledGemmL1(op);
+    return;
+  }
+
+  if (op->op.same_as(tl::ascend_mad_mx())) {
+    EmitAscendMadMx(op);
     return;
   }
 
@@ -1873,6 +2693,42 @@ void CodeGenTileLangPTO::VisitExpr_(const CallNode *op,
     auto pipe_name = Downcast<StringImm>(op->args[0])->value;
     PrintIndent();
     stream << "pto.pipe_barrier(\"" << StripPipePrefix(pipe_name) << "\")\n";
+    return;
+  }
+
+  if (op->op.same_as(tl::ascend_cross_core_set_flag())) {
+    ICHECK_EQ(op->args.size(), 3U)
+        << "tl.ascend_cross_core_set_flag expects exactly 3 arguments "
+           "(mode_id int, pipe string, flag_id)";
+    int64_t mode_id = 0;
+    ICHECK(TryGetConstInt(op->args[0], &mode_id))
+        << "PTO cross-core set mode_id must be a compile-time integer";
+    ICHECK_EQ(mode_id, 4) << "PTO cross-core set only supports mode_id=4 via "
+                             "pto.set_intra_flag";
+    const auto *pipe = op->args[1].as<StringImmNode>();
+    ICHECK(pipe) << "PTO cross-core set pipe must be a string";
+    std::string event_id = RemoveOutermostParentheses(PrintExpr_(op->args[2]));
+    PrintIndent();
+    stream << "pto.set_intra_flag(\"" << StripPipePrefix(pipe->value) << "\", "
+           << event_id << ")\n";
+    return;
+  }
+
+  if (op->op.same_as(tl::ascend_cross_core_wait_flag())) {
+    ICHECK_EQ(op->args.size(), 3U)
+        << "tl.ascend_cross_core_wait_flag expects exactly 3 arguments "
+           "(mode_id int, pipe string, flag_id)";
+    int64_t mode_id = 0;
+    ICHECK(TryGetConstInt(op->args[0], &mode_id))
+        << "PTO cross-core wait mode_id must be a compile-time integer";
+    ICHECK_EQ(mode_id, 4) << "PTO cross-core wait only supports mode_id=4 via "
+                             "pto.wait_intra_flag";
+    const auto *pipe = op->args[1].as<StringImmNode>();
+    ICHECK(pipe) << "PTO cross-core wait pipe must be a string";
+    std::string event_id = RemoveOutermostParentheses(PrintExpr_(op->args[2]));
+    PrintIndent();
+    stream << "pto.wait_intra_flag(\"" << StripPipePrefix(pipe->value) << "\", "
+           << event_id << ")\n";
     return;
   }
 
@@ -2339,10 +3195,12 @@ void CodeGenTileLangPTO::VisitStmt_(const BindNode *op) {
 }
 
 void CodeGenTileLangPTO::VisitStmt_(const AllocBufferNode *op) {
+  const Var &buffer_var = op->buffer->data;
+  std::string scope = GetPtrStorageScope(buffer_var);
+
   // VMI/SIMD mutable registers are local.var buffers even for vector-only
   // kernels (which do not enter the GEMM allocation path).
-  if (GetPtrStorageScope(op->buffer->data) == "local.var") {
-    const Var &buffer_var = op->buffer->data;
+  if (scope == "local.var") {
     CheckPTOLocalVarBuffer(op->buffer.get());
     PrintIndent();
     local_var_buffers_.insert(buffer_var.get());
@@ -2357,44 +3215,29 @@ void CodeGenTileLangPTO::VisitStmt_(const AllocBufferNode *op) {
     RegisterHandleType_(buffer_var.get(), op->buffer->dtype);
     return;
   }
+
+  // Local buffers retain their ordinary lexical allocation semantics even
+  // when another part of the function contains GEMM.  In particular, SIMT
+  // local buffers must materialize as pto.alloc_buffer instead of falling
+  // through the GEMM address-only allocation path.
+  if (scope == "local" || scope == "local.fragment") {
+    EmitPtoBufferAllocation(op->buffer);
+    return;
+  }
+
   if (!current_function_has_gemm_) {
     EmitPtoBufferAllocation(op->buffer);
     return;
   }
 
-  const Var &buffer_var = op->buffer->data;
-  std::string scope = GetPtrStorageScope(buffer_var);
   alloc_storage_scope_[buffer_var.get()] = scope;
 
-  if (scope == "shared" || scope == "shared.dyn" || scope == "shared.l1" ||
-      scope == "shared.l1.dyn" || scope == "shared.l0c") {
+  auto pto_space = PtoSpaceForStorageScope(scope);
+  if (pto_space.has_value() && *pto_space != "gm") {
     PrintIndent();
     stream << AllocVarID(buffer_var.get())
-           << " = pto.const(0, dtype=pto.int64)\n";
-  } else if (scope == "local.fragment") {
-    AllocVarID(buffer_var.get());
-    auto alloc_ref = GetRef<AllocBuffer>(op);
-    auto opt_size = alloc_ref.ConstantAllocationSize();
-    ICHECK(opt_size.has_value())
-        << "PTO local.fragment allocation expects a constant size";
-    FragmentInfo info;
-    info.lanes = static_cast<int>(opt_size.value());
-    info.dtype = op->buffer->dtype;
-    fragment_info_[buffer_var.get()] = info;
-  } else if (scope == "local.var") {
-    // Scalar alloc_var is used by GEMM tile mapping; vector alloc_var is a
-    // mutable VMI/SIMD register and is emitted as a PTODSL Vec value.
-    CheckPTOLocalVarBuffer(op->buffer.get());
-    PrintIndent();
-    local_var_buffers_.insert(buffer_var.get());
-    if (op->buffer->dtype.lanes() > 1) {
-      stream << AllocVarID(buffer_var.get()) << " = pto.vmi.vreg("
-             << op->buffer->dtype.lanes() << ", "
-             << PtoTypeName(op->buffer->dtype.element_of()) << ")\n";
-    } else {
-      stream << AllocVarID(buffer_var.get())
-             << " = pto.const(0, dtype=pto.int64)\n";
-    }
+           << " = pto.castptr(pto.const(0, dtype=pto.i64), "
+           << PtoPtrType(op->buffer->dtype, *pto_space) << ")\n";
   }
 
   RegisterHandleType_(buffer_var.get(), op->buffer->dtype);
@@ -2493,6 +3336,28 @@ void CodeGenTileLangPTO::VisitStmt_(const ForNode *op) {
 }
 
 void CodeGenTileLangPTO::VisitStmt_(const SBlockNode *op) {
+  if (op->name_hint == "CUBE" || op->name_hint == "VECTOR") {
+    PrintIndent();
+    stream << "with pto.section(\""
+           << (op->name_hint == "CUBE" ? "cube" : "vector") << "\"):\n";
+    int section_scope = BeginScope();
+    bool is_empty = op->alloc_buffers.empty() && !op->init.defined() &&
+                    tirx::is_no_op(op->body);
+    if (is_empty) {
+      PrintIndent();
+      stream << "pass\n";
+    }
+    for (const Buffer &buf : op->alloc_buffers) {
+      EmitPtoBufferAllocation(buf);
+    }
+    if (op->init.defined()) {
+      PrintStmt_(op->init.value());
+    }
+    PrintStmt_(op->body);
+    EndScope(section_scope);
+    return;
+  }
+
   if (op->name_hint == "SIMT_VF") {
     int64_t thread_x = 1;
     int64_t thread_y = 1;
@@ -2632,20 +3497,16 @@ void CodeGenTileLangPTO::EmitScalarizedLoad(const BufferLoadNode *op,
          << index_str << ", contiguous=" << lanes << ")";
       return;
     }
-    if (scope == "shared" || scope == "shared.dyn") {
+    if (auto pto_space = PtoSpaceForStorageScope(scope)) {
       std::string base = GetVarID(op->buffer->data.get());
-      if (HandleTypeMatch_(op->buffer->data.get(), DataType::Int(8)) ||
-          !HandleTypeMatch_(op->buffer->data.get(), element_dtype)) {
-        base = "pto.castptr(" + base + ", " + PtoPtrType(element_dtype, "ub") +
-               ")";
+      if (*pto_space != "gm" &&
+          (HandleTypeMatch_(op->buffer->data.get(), DataType::Int(8)) ||
+           !HandleTypeMatch_(op->buffer->data.get(), element_dtype))) {
+        base = "pto.castptr(" + base + ", " +
+               PtoPtrType(element_dtype, *pto_space) + ")";
       }
       os << "scalar.load(" << base << ", " << index_str
          << ", contiguous=" << lanes << ")";
-      return;
-    }
-    if (scope == "global" || scope.empty()) {
-      os << "scalar.load(" << GetVarID(op->buffer->data.get()) << ", "
-         << index_str << ", contiguous=" << lanes << ")";
       return;
     }
     LOG(FATAL) << "Unsupported PTO SIMT vector load scope: " << scope;
@@ -2742,20 +3603,16 @@ void CodeGenTileLangPTO::EmitScalarizedStore(const BufferStoreNode *op) {
              << GetVarID(op->buffer->data.get()) << ", " << index_str << ")\n";
       return;
     }
-    if (scope == "shared" || scope == "shared.dyn") {
+    if (auto pto_space = PtoSpaceForStorageScope(scope)) {
       std::string base = GetVarID(op->buffer->data.get());
-      if (HandleTypeMatch_(op->buffer->data.get(), DataType::Int(8)) ||
-          !HandleTypeMatch_(op->buffer->data.get(), op->buffer->dtype)) {
+      if (*pto_space != "gm" &&
+          (HandleTypeMatch_(op->buffer->data.get(), DataType::Int(8)) ||
+           !HandleTypeMatch_(op->buffer->data.get(), op->buffer->dtype))) {
         base = "pto.castptr(" + base + ", " +
-               PtoPtrType(op->buffer->dtype, "ub") + ")";
+               PtoPtrType(op->buffer->dtype, *pto_space) + ")";
       }
       stream << "scalar.store(" << value << ", " << base << ", " << index_str
              << ")\n";
-      return;
-    }
-    if (scope == "global" || scope.empty()) {
-      stream << "scalar.store(" << value << ", "
-             << GetVarID(op->buffer->data.get()) << ", " << index_str << ")\n";
       return;
     }
     LOG(FATAL) << "Unsupported PTO SIMT vector store scope: " << scope;
