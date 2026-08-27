@@ -5,7 +5,7 @@ import tilelang
 import pytest
 from example_gemm import gemm, ref_program
 
-TARGETS = ["ascend"]
+TARGETS = ["ascend", pytest.param("pto", marks=pytest.mark.pto)]
 
 
 def _test(dtype, thresh, out_dtype="float32", target="ascend", mixed=None, hf32=None):
@@ -39,28 +39,6 @@ def test_gemm_auto_fp8_mixed(target):
 def test_gemm_auto_bf16(target):
     _test("bfloat16", 1e-2, target=target, mixed=False)
     _test("bfloat16", 1e-2, "bfloat16", target=target, mixed=False)
-
-
-@pytest.mark.pto
-def test_gemm_auto_bf16_pto():
-    _test("bfloat16", 1e-2, target="pto", mixed=False)
-    _test("bfloat16", 1e-2, "bfloat16", target="pto", mixed=False)
-
-
-@pytest.mark.pto
-def test_gemm_auto_fp8_pto():
-    _test("float8_e4m3fn", 1e-1, target="pto", mixed=False)
-
-
-@pytest.mark.pto
-def test_gemm_auto_fp32_pto():
-    _test("float32", 5e-3, target="pto", mixed=False)
-
-
-@pytest.mark.pto
-@pytest.mark.parametrize("hf32", ["nearest_zero", "nearest_even"])
-def test_gemm_auto_fp32_hf32_pto(hf32):
-    _test("float32", 2e-1, target="pto", mixed=False, hf32=hf32)
 
 
 @pytest.mark.parametrize("target", TARGETS)
@@ -113,15 +91,6 @@ if __name__ == "__main__":
     print("PASS: test_gemm_auto_fp8_mixed")
     test_gemm_auto_bf16("ascend")
     print("PASS: test_gemm_auto_bf16")
-    test_gemm_auto_bf16_pto()
-    print("PASS: test_gemm_auto_bf16_pto")
-    test_gemm_auto_fp8_pto()
-    print("PASS: test_gemm_auto_fp8_pto")
-    test_gemm_auto_fp32_pto()
-    print("PASS: test_gemm_auto_fp32_pto")
-    for hf32 in ["nearest_zero", "nearest_even"]:
-        test_gemm_auto_fp32_hf32_pto(hf32)
-    print("PASS: test_gemm_auto_fp32_hf32_pto")
     test_gemm_auto_bf16_mixed("ascend")
     print("PASS: test_gemm_auto_bf16_mixed")
     test_gemm_auto_fp32("ascend")
