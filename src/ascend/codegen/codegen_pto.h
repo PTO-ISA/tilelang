@@ -51,7 +51,8 @@ protected:
   void VisitExpr_(const AndNode *op, std::ostream &os) override; // NOLINT(*)
   void VisitExpr_(const OrNode *op, std::ostream &os) override;  // NOLINT(*)
   void VisitExpr_(const SelectNode *op,
-                  std::ostream &os) override; // NOLINT(*)
+                  std::ostream &os) override;                    // NOLINT(*)
+  void VisitExpr_(const LetNode *op, std::ostream &os) override; // NOLINT(*)
 
 private:
   struct FragmentInfo {
