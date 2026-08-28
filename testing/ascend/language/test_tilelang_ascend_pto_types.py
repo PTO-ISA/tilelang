@@ -74,6 +74,10 @@ def _op_name(call_or_op):
     return getattr(op, "name", None)
 
 
+def _indent(line):
+    return len(line) - len(line.lstrip())
+
+
 def _collect_pto_calls(func):
     calls = []
 
@@ -1244,9 +1248,36 @@ def test_simdvf_pto_codegen_still_emits_existing_simd_source():
             T.copy(b_ub, B)
 
     source = lower(func, target="pto").kernel_source
+    compile(source, "<pto-source>", "exec")
+    vecscope_lines = [line for line in source.splitlines() if "with pto.vecscope():" in line]
+    assert len(vecscope_lines) == 1
+    vecscope_indent = _indent(vecscope_lines[0])
+    vector_lines = [line for line in source.splitlines() if any(op in line for op in ("pto.vlds(", "pto.vadd(", "pto.vsts("))]
+    assert vector_lines
+    assert all(_indent(line) > vecscope_indent for line in vector_lines)
     assert "pto.vlds(" in source
     assert "pto.vadd(" in source
     assert "pto.vsts(" in source
+
+
+@pytest.mark.pto
+def test_empty_simdvf_pto_codegen_emits_valid_python():
+    @T.prim_func
+    def func():
+        with T.Kernel(1) as _, T.SimdVF():
+            pass
+
+    source = lower(func, target="pto").kernel_source
+    compile(source, "<pto-empty-simdvf>", "exec")
+
+    lines = source.splitlines()
+    vecscope_lines = [(index, line) for index, line in enumerate(lines) if "with pto.vecscope():" in line]
+    assert len(vecscope_lines) == 1
+    vecscope_index, vecscope_line = vecscope_lines[0]
+    body_lines = [line for line in lines[vecscope_index + 1 :] if line.strip()]
+    assert body_lines
+    assert body_lines[0].strip() == "pass"
+    assert _indent(body_lines[0]) > _indent(vecscope_line)
 
 
 @pytest.mark.parametrize("op_name", PTO_VMI_OPAQUE_OPS)
