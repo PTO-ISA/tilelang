@@ -4289,6 +4289,10 @@ void CodeGenTileLangPTO::VisitStmt_(const SBlockNode *op) {
   }
 
   if (op->name_hint == "SIMD_VF") {
+    PrintIndent();
+    stream << "with pto.vecscope():\n";
+    int vecscope = BeginScope();
+    const auto body_start = stream.tellp();
     for (const Buffer &buf : op->alloc_buffers) {
       EmitPtoBufferAllocation(buf);
     }
@@ -4296,6 +4300,11 @@ void CodeGenTileLangPTO::VisitStmt_(const SBlockNode *op) {
       PrintStmt_(op->init.value());
     }
     PrintStmt_(op->body);
+    if (stream.tellp() == body_start) {
+      PrintIndent();
+      stream << "pass\n";
+    }
+    EndScope(vecscope);
     return;
   }
 
