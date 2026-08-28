@@ -79,7 +79,8 @@ def _require_vmi_lane_count(lanes: int, *, context: str) -> int:
     return lanes
 
 
-# PTODSL signed integer names. TIR still uses signless int*; codegen emits si*.
+# PTODSL signed integer names. TileLang/TIR distinguishes signed and unsigned
+# integer dtypes; codegen preserves that distinction in the generated PTO type.
 _PTO_SIGNED_DTYPE = {
     "si8": "int8",
     "si16": "int16",
@@ -453,9 +454,9 @@ def vload(
     if to_dtype is not None and dist_mode != "unpack":
         raise TypeError('T.vmi.vload(...) accepts to_dtype only when dist_mode="unpack"')
     source_elem = _require_address_element_dtype(source, context="T.vmi.vload(...)")
-    # Keep si*/ui* spelling for PTODSL annotations (signless TIR int* -> pto.i*
-    # is wrong for int-to-int widen). Unpack vload itself is not legalized on
-    # the current VPTO path; this preserves a correct annotation if enabled later.
+    # Keep si*/ui* spelling for PTODSL annotations. Unpack vload itself is not
+    # legalized on the current VPTO path; this preserves a correct annotation
+    # if enabled later.
     to_dtype_annot = None
     is_packed_fp4 = str(source_elem) == "float4_e2m1fn"
     if is_packed_fp4:

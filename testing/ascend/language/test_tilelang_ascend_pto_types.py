@@ -1137,14 +1137,14 @@ def test_pto_codegen_wraps_literal_scalar_sources_by_dtype():
     assert "pto.vmi.vbrc(pto.f16(" in source
     assert "pto.vmi.vbrc(pto.bf16(" in source
     assert "pto.vmi.vbrc(pto.f8e4m3(" in source
-    assert "pto.vmi.vbrc(pto.i64(7), size=64)" in source
-    assert "pto.vmi.vbrc(pto.i32(7), size=64)" in source
-    assert "pto.vmi.vbrc(pto.i16(7), size=64)" in source
-    assert "pto.vmi.vbrc(pto.i8(7), size=64)" in source
-    assert "pto.vmi.vci(pto.i64(0), size=64)" in source
-    assert "pto.vmi.vci(pto.i32(0), size=64)" in source
-    assert "pto.vmi.vci(pto.i16(0), size=64)" in source
-    assert "pto.vmi.vci(pto.i8(0), size=64)" in source
+    assert "pto.vmi.vbrc(pto.si64(7), size=64)" in source
+    assert "pto.vmi.vbrc(pto.si32(7), size=64)" in source
+    assert "pto.vmi.vbrc(pto.si16(7), size=64)" in source
+    assert "pto.vmi.vbrc(pto.si8(7), size=64)" in source
+    assert "pto.vmi.vci(pto.si64(0), size=64)" in source
+    assert "pto.vmi.vci(pto.si32(0), size=64)" in source
+    assert "pto.vmi.vci(pto.si16(0), size=64)" in source
+    assert "pto.vmi.vci(pto.si8(0), size=64)" in source
 
 
 @pytest.mark.parametrize(
