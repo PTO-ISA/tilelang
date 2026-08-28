@@ -34,6 +34,7 @@ protected:
   void VisitStmt_(const AllocBufferNode *op) override;
   void VisitStmt_(const AttrStmtNode *op) override;
   void VisitStmt_(const ForNode *op) override;
+  void VisitStmt_(const WhileNode *op) override;
   void VisitStmt_(const SBlockNode *op) override;
   void VisitStmt_(const IfThenElseNode *op) override;
   void VisitStmt_(const EvaluateNode *op) override;
@@ -50,6 +51,7 @@ protected:
   void VisitExpr_(const MaxNode *op, std::ostream &os) override; // NOLINT(*)
   void VisitExpr_(const AndNode *op, std::ostream &os) override; // NOLINT(*)
   void VisitExpr_(const OrNode *op, std::ostream &os) override;  // NOLINT(*)
+  void VisitExpr_(const NotNode *op, std::ostream &os) override; // NOLINT(*)
   void VisitExpr_(const SelectNode *op,
                   std::ostream &os) override;                    // NOLINT(*)
   void VisitExpr_(const LetNode *op, std::ostream &os) override; // NOLINT(*)
@@ -89,12 +91,27 @@ private:
 
   std::string PtoScalarType(DataType t) const;
   std::string PtoPtrType(DataType t, const std::string &space) const;
+  bool NeedsPtoCastptr_(const VarNode *buffer_var, DataType elem_dtype) const;
+  std::string PtoScalarPointerBase_(const VarNode *buffer_var,
+                                    DataType elem_dtype,
+                                    const std::string &scope);
   std::string GetAccessPtrExpr_(const CallNode *op);
   std::string GetPtoPointerExpr(const VarNode *buffer_var, DataType elem_dtype,
                                 const PrimExpr &index);
   std::string GetPtoPointerExpr(const BufferNode *buffer,
                                 const PrimExpr &index);
   std::string GetAddressOfExpr_(const CallNode *op);
+  std::string GetPTOCopyPadValueExpr_(const PrimExpr &value);
+  void GetPTOCopyEndpoint_(const PrimExpr &expr, const char *context,
+                           const VarNode **buffer_var, PrimExpr *index,
+                           DataType *dtype, std::string *scope) const;
+  void ValidatePTOUBCopyLayout_(const PrimExpr &index, DataType dtype,
+                                const PrimExpr &burst_num,
+                                const PrimExpr &burst_len,
+                                const PrimExpr &ub_stride,
+                                const PrimExpr &left_padding,
+                                const PrimExpr &right_padding,
+                                bool uses_padding, const char *context) const;
   std::string GetAscendCopyGmUbExpr_(const CallNode *op);
   std::string GetAscendCopyUbGmExpr_(const CallNode *op);
   std::string EmitPTOAllReduceExpr_(const std::string &func_name,
@@ -112,6 +129,13 @@ private:
   std::string ScopeOfBuffer(const BufferNode *buffer) const;
   std::optional<std::string>
   PtoSpaceForStorageScope(const std::string &scope) const;
+  void PrintPtoSelectValue_(const PrimExpr &value, DataType dtype,
+                            std::ostream &os);
+  void PrintPtoSelect_(const PrimExpr &condition, const PrimExpr &true_value,
+                       const PrimExpr &false_value, DataType dtype,
+                       std::ostream &os);
+  void PrintPtoIfThenElse_(const CallNode *op, std::ostream &os);
+  void PrintPtoLogicalNot_(const PrimExpr &value, std::ostream &os);
   void PrintBinaryExpr_(const std::string &opstr, DataType dtype, PrimExpr lhs,
                         PrimExpr rhs,
                         std::ostream &os) override; // NOLINT(*)
@@ -121,9 +145,26 @@ private:
   // tirx intrinsic names). Returns false when `name` is not covered.
   bool TryEmitPtoUnaryMath_(const std::string &name, const PrimExpr &arg,
                             std::ostream &os); // NOLINT(*)
+  // tl.rng_init: bind a fresh PhiloxRNG helper in the SIMT body.
+  void EmitRngInit(const CallNode *op);
+  // tl.rng_rand / tl.rng_rand_float: return the inline draw expression.
+  std::string EmitRngDrawExpr(const CallNode *op);
+  // Broadcast(rng_expression, 2) store: evaluate the complete scalar
+  // expression twice and emit two ordered scalar stores. Returns true when
+  // `op` was handled.
+  bool TryEmitRngBroadcastStore(const BufferStoreNode *op);
 
   std::string current_function_name_;
   bool inside_simtvf_body_{false};
+  // Nonzero while emitting a runtime loop or a dynamic branch. PhiloxRNG owns
+  // trace-time SSA state, so initializing or drawing in device-side control
+  // flow would silently produce incorrect runtime state transitions.
+  int inside_dynamic_control_flow_{0};
+  // Active Philox helper variable emitted by tl.rng_init. It is reset at each
+  // PrimFunc and SIMT VF boundary because the helper owns section-local SSA
+  // state and cannot be shared by sibling sections.
+  std::string rng_state_var_;
+  bool uses_rng_{false};
   // Outer local buffers referenced by a SIMT section. Var identity is the
   // ownership key because lowering can leave duplicate name hints behind.
   std::unordered_set<const VarNode *> persistent_buffer_vars_;
@@ -145,6 +186,7 @@ private:
       const std::function<std::string(int64_t)> &map_unit_flag,
       const std::function<void(const std::string &)> &emit_operation);
   void EmitAscendCopyGmToCbuf(const CallNode *op);
+  void EmitAscendFillL1(const CallNode *op);
   void EmitAscendLoadCbufToL0(const CallNode *op, bool is_l0a);
   void EmitAscendGemmL1(const CallNode *op);
   void EmitAscendMad(const CallNode *op);
@@ -182,6 +224,13 @@ private:
   std::unordered_set<const VarNode *> local_var_buffers_;
   std::unordered_map<Call, int64_t, ObjectPtrHash, ObjectPtrEqual>
       hf32_mode_by_cube_call_;
+  // Pad bindings are resolved once before printing. The maps are keyed by the
+  // exact TIR Call nodes so codegen does not infer state from print order.
+  std::unordered_map<Call, int64_t, ObjectPtrHash, ObjectPtrEqual>
+      pad_binding_by_copy_;
+  std::unordered_map<Call, int64_t, ObjectPtrHash, ObjectPtrEqual>
+      pad_binding_by_setter_;
+  std::unordered_map<int64_t, DataType> pad_binding_dtype_by_id_;
   PTOGemmEmitContext gemm_emit_ctx_;
   PTOBlockscaledGemmEmitContext blockscaled_gemm_emit_ctx_;
   std::pair<std::string, std::string>

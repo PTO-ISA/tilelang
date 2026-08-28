@@ -11,6 +11,7 @@ from example_simtvf_rng import rng_fill
     "target",
     [
         "ascend",
+        pytest.param("pto", marks=pytest.mark.pto),
     ],
 )
 def test_simtvf_rng(target):
@@ -38,3 +39,5 @@ def test_simtvf_rng(target):
 if __name__ == "__main__":
     test_simtvf_rng("ascend")
     print("PASS: test_simtvf_rng (ascend)")
+    test_simtvf_rng("pto")
+    print("PASS: test_simtvf_rng (pto)")
