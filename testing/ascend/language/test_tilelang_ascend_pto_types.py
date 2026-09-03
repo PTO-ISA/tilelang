@@ -949,6 +949,28 @@ def test_pto_codegen_emits_vector_calls_and_pair_indexing():
     assert "[1]" in source
 
 
+@pytest.mark.pto
+def test_pto_codegen_preserves_vmi_merge_mode():
+    @T.prim_func
+    def func(A: T.Buffer((64,), "float32"), B: T.Buffer((64,), "float32")):
+        with T.Kernel(1) as _:
+            a_ub = T.alloc_shared((64,), "float32")
+            b_ub = T.alloc_shared((64,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                mask = T.vmi.create_mask(37, size=64)
+                x = T.vmi.vload(a_ub[0], size=64)
+                y = T.vmi.vbrc(T.float32(1), size=64)
+                merged = T.vmi.vdiv(x, y, mask, pmode="merge")
+                T.vmi.vstore(merged, b_ub[0], mask)
+            T.copy(b_ub, B)
+
+    source = lower(func, target="pto").kernel_source
+    assert "pto.vmi.vdiv(" in source
+    assert 'pmode="merge"' in source
+
+
+@pytest.mark.pto
 def test_pto_codegen_keeps_dintlv_vstore_pair_grouped():
     @T.prim_func
     def func(A: T.Buffer((64,), "float32"), B: T.Buffer((64,), "float32")):
@@ -1145,6 +1167,38 @@ def test_pto_codegen_wraps_literal_scalar_sources_by_dtype():
     assert "pto.vmi.vci(pto.i32(0), size=64)" in source
     assert "pto.vmi.vci(pto.i16(0), size=64)" in source
     assert "pto.vmi.vci(pto.i8(0), size=64)" in source
+
+
+@pytest.mark.pto
+def test_pto_codegen_vdup_types_scalar_sources():
+    """vdup must make PTOAS scalar/result element types explicit."""
+
+    @T.prim_func
+    def func(x: T.int32, f: T.float32):
+        with T.Kernel(1) as _, T.SimdVF():
+            mask = T.vmi.create_mask(64, size=64)
+            # Integer literals lose signedness when printed bare; the target
+            # element type must therefore be materialized in the PTO source.
+            signed = T.simd.vdup(T.int32(1), "int32", mask)
+            unsigned = T.simd.vdup(T.int32(1), "uint32", mask)
+            matching = T.simd.vdup(x, "int32", mask)
+            dynamic = T.simd.vdup(x, "uint32", mask)
+            float_to_int = T.simd.vdup(T.float32(1.5), "int32", mask)
+            dynamic_float_to_int = T.simd.vdup(f, "int32", mask)
+            T.evaluate(signed)
+            T.evaluate(unsigned)
+            T.evaluate(matching)
+            T.evaluate(dynamic)
+            T.evaluate(float_to_int)
+            T.evaluate(dynamic_float_to_int)
+
+    source = lower(func, target="pto").kernel_source
+    assert "pto.vdup(pto.si32(1)," in source
+    assert "pto.vdup(pto.ui32(1)," in source
+    assert "pto.vdup(x, mask)" in source
+    assert "pto.vdup(scalar.cast(x, pto.ui32)," in source
+    assert 'pto.vcvt(pto.vdup(pto.f32(float.fromhex(\'0x1.8p+0\')), mask), pto.si32, mask, rnd="Z", sat="SAT")' in source
+    assert 'pto.vcvt(pto.vdup(f, mask), pto.si32, mask, rnd="Z", sat="SAT")' in source
 
 
 @pytest.mark.parametrize(
