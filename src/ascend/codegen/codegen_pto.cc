@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/extra/structural_equal.h>
+#include <tvm/ir/transform.h>
 #include <tvm/tirx/analysis.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/expr_functor.h>
@@ -206,8 +207,63 @@ bool IsFloat32(DataType t) {
   return t.is_float() && t.bits() == 32 && t.lanes() == 1;
 }
 
+constexpr const char *kPtoModeZeroing = "MODE_ZEROING";
+constexpr const char *kPtoModeMerging = "MODE_MERGING";
+
+void RejectPtoSimdMerging(const CallNode *op) {
+  auto call_op = op->op.as<Op>();
+  if (!call_op.has_value() || !StartsWith(call_op.value()->name, "tl.simd.") ||
+      op->args.empty()) {
+    return;
+  }
+  const auto *mode = op->args.back().as<StringImmNode>();
+  if (mode != nullptr && mode->value == kPtoModeMerging) {
+    LOG(FATAL) << "PTO codegen does not support MODE_MERGING for "
+               << call_op.value()->name
+               << ": physical pto.* SIMD operations have no merge-mode "
+                  "operand; use tl.vmi.* with pmode=\"merge\" or lower the "
+                  "merge into an explicit read-modify-write sequence";
+  }
+}
+
+void CheckPtoSimdMode(const CallNode *op, size_t mode_index,
+                      const char *op_name) {
+  ICHECK_LT(mode_index, op->args.size())
+      << op_name << " is missing its mode argument";
+  const auto *mode = op->args[mode_index].as<StringImmNode>();
+  ICHECK(mode) << op_name << " mode must be a constant string";
+  ICHECK_EQ(mode->value, kPtoModeZeroing)
+      << "PTO codegen currently supports only MODE_ZEROING for " << op_name
+      << "; MODE_MERGING is not representable by the physical pto.* op";
+}
+
+void CheckPtoVdivPrecision(const CallNode *op, bool enable_fast_math) {
+  if (!IsFloat32(op->dtype.element_of())) {
+    return;
+  }
+
+  if (auto precision = op->annotations.Get("precision")) {
+    const auto *value = precision.value().as<IntImmNode>();
+    ICHECK(value)
+        << "tl.simd.vdiv precision annotation must be an integer code";
+    ICHECK_EQ(value->value, 0)
+        << "PTO codegen cannot lower precise tl.simd.vdiv: PTOAS "
+           "pto.vdiv has no precision operand; vector high-precision vdiv "
+           "requires a newer PTOAS version; use "
+           "precision=\"ftz_true\" for the vector hardware operation";
+    return;
+  }
+
+  ICHECK(enable_fast_math)
+      << "PTO codegen cannot lower precise default tl.simd.vdiv: fast math "
+         "is disabled; vector high-precision vdiv requires a newer PTOAS "
+         "version. Use precision=\"ftz_true\" or enable "
+         "tl.enable_fast_math";
+}
+
 bool IsPTOLocalVarScalarDtype(DataType dtype) {
-  return dtype.is_int() || dtype.is_uint() || IsFloat32(dtype);
+  return dtype.is_int() || dtype.is_uint() || IsFloat32(dtype) ||
+         dtype.is_handle();
 }
 
 std::string PtoLocalVarInitialValue(DataType dtype) {
@@ -218,6 +274,9 @@ std::string PtoLocalVarInitialValue(DataType dtype) {
 }
 
 std::string PtoLocalVarStoreValue(DataType dtype, const std::string &value) {
+  if (dtype.is_handle()) {
+    return value;
+  }
   if (dtype.is_int() || dtype.is_uint()) {
     return "_tl_wrap_surface_value(_tl_coerce_i64(" + value +
            ", context=\"PTO local.var store\"))";
@@ -419,8 +478,8 @@ void CheckPTOLocalVarBuffer(const BufferNode *buffer) {
     return;
   }
   ICHECK(IsPTOLocalVarScalarDtype(dtype))
-      << "PTO local.var only supports integer and floating-point scalar "
-         "values, got "
+      << "PTO local.var only supports integer, floating-point, or handle "
+         "scalar values, got "
       << dtype;
 }
 
@@ -1047,6 +1106,12 @@ bool UsesVar(const Stmt &body, const VarNode *target) {
 }
 
 } // namespace
+
+CodeGenTileLangPTO::CodeGenTileLangPTO() {
+  auto pass_ctx = tvm::transform::PassContext::Current();
+  enable_fast_math_ =
+      pass_ctx->GetConfig<Bool>(tl::kEnableFastMath, Bool(false)).value();
+}
 
 void CodeGenTileLangPTO::AddFunction(const GlobalVar &gvar,
                                      const PrimFunc &func) {
@@ -3145,6 +3210,12 @@ void CodeGenTileLangPTO::PrintPtoIfThenElse_(const CallNode *op,
 
 void CodeGenTileLangPTO::VisitExpr_(const CallNode *op,
                                     std::ostream &os) { // NOLINT(*)
+  // MODE_MERGING is legalized before codegen on the Ascend pipeline. The
+  // resulting read-modify-write call still carries MODE_MERGING as its last
+  // argument, so reject both raw and legalized forms before an arity check
+  // can obscure the unsupported PTO limitation.
+  RejectPtoSimdMerging(op);
+
   if (op->op.same_as(builtin::bitwise_and())) {
     PrintBinaryExpr_("&", op->dtype, op->args[0], op->args[1], os);
     return;
@@ -3496,6 +3567,15 @@ void CodeGenTileLangPTO::VisitExpr_(const CallNode *op,
     return;
   }
 
+  if (op->op.same_as(tl::simd_mem_bar())) {
+    ICHECK_EQ(op->args.size(), 1U)
+        << "tl.simd.mem_bar expects exactly one barrier type";
+    auto barrier_type = Downcast<StringImm>(op->args[0])->value;
+    PrintIndent();
+    stream << "pto.mem_bar(pto.BarrierType." << barrier_type << ")\n";
+    return;
+  }
+
   if (op->op.same_as(tl::ascend_cross_core_set_flag())) {
     ICHECK_EQ(op->args.size(), 3U)
         << "tl.ascend_cross_core_set_flag expects exactly 3 arguments "
@@ -3608,14 +3688,179 @@ void CodeGenTileLangPTO::VisitExpr_(const CallNode *op,
     return;
   }
 
+  if (op->op.same_as(tl::simd_vld2())) {
+    ICHECK(op->args.size() >= 2U && op->args.size() <= 3U)
+        << "tl.simd.vld2 expects 2 or 3 arguments (addr, dist[, offset])";
+    std::string dist = Downcast<StringImm>(op->args[1])->value;
+    std::string offset =
+        op->args.size() == 3U
+            ? RemoveOutermostParentheses(PrintExpr_(op->args[2]))
+            : "pto.const(0)";
+    os << "pto.vldsx2(" << PrintExpr_(op->args[0]) << ", " << offset << ", \""
+       << dist << "\")";
+    return;
+  }
+
+  if (op->op.same_as(tl::simd_pair_get())) {
+    ICHECK_EQ(op->args.size(), 2U)
+        << "tl.simd.pair_get expects exactly 2 arguments";
+    os << "(" << PrintExpr_(op->args[0]) << ")[" << PrintExpr_(op->args[1])
+       << "]";
+    return;
+  }
+
   if (op->op.same_as(tl::simd_vadd())) {
     ICHECK_EQ(op->args.size(), 4U)
         << "tl.simd.vadd expects 4 arguments (src0, src1, mask, mode)";
-    std::string mode = Downcast<StringImm>(op->args[3])->value;
-    ICHECK_EQ(mode, "MODE_ZEROING")
-        << "PTO codegen currently only supports MODE_ZEROING for tl.simd.vadd";
+    CheckPtoSimdMode(op, 3, "tl.simd.vadd");
     os << "pto.vadd(" << PrintExpr_(op->args[0]) << ", "
        << PrintExpr_(op->args[1]) << ", " << PrintExpr_(op->args[2]) << ")";
+    return;
+  }
+
+  if (op->op.same_as(tl::simd_vmul()) || op->op.same_as(tl::simd_vdiv()) ||
+      op->op.same_as(tl::simd_vmax()) || op->op.same_as(tl::simd_vor())) {
+    ICHECK_EQ(op->args.size(), 4U) << "PTO binary SIMD op expects 4 arguments";
+    const char *pto_op = op->op.same_as(tl::simd_vmul())   ? "vmul"
+                         : op->op.same_as(tl::simd_vdiv()) ? "vdiv"
+                         : op->op.same_as(tl::simd_vmax()) ? "vmax"
+                                                           : "vor";
+    const std::string op_name = std::string("tl.simd.") + pto_op;
+    CheckPtoSimdMode(op, 3, op_name.c_str());
+    if (op->op.same_as(tl::simd_vdiv())) {
+      CheckPtoVdivPrecision(op, enable_fast_math_);
+    }
+    os << "pto." << pto_op << "(" << PrintExpr_(op->args[0]) << ", "
+       << PrintExpr_(op->args[1]) << ", " << PrintExpr_(op->args[2]) << ")";
+    return;
+  }
+
+  if (op->op.same_as(tl::simd_vmuls())) {
+    ICHECK_EQ(op->args.size(), 4U) << "tl.simd.vmuls expects 4 arguments";
+    CheckPtoSimdMode(op, 3, "tl.simd.vmuls");
+    os << "pto.vmuls(" << PrintExpr_(op->args[0]) << ", "
+       << PrintExpr_(op->args[1]) << ", " << PrintExpr_(op->args[2]) << ")";
+    return;
+  }
+
+  if (op->op.same_as(tl::simd_vdup())) {
+    ICHECK_EQ(op->args.size(), 3U) << "tl.simd.vdup expects 3 arguments";
+    CheckPtoSimdMode(op, 2, "tl.simd.vdup");
+    const DataType target_dtype = op->dtype.element_of();
+    const DataType source_dtype = op->args[0].dtype();
+    const std::string pto_dtype = PtoScalarType(target_dtype);
+
+    const bool source_integer = source_dtype.is_int() || source_dtype.is_uint();
+    const bool target_integer = target_dtype.is_int() || target_dtype.is_uint();
+    const bool source_float =
+        source_dtype.is_float() || source_dtype.is_bfloat16();
+    const bool target_float =
+        target_dtype.is_float() || target_dtype.is_bfloat16();
+
+    // PTOAS infers the vdup result element type from the scalar operand and
+    // mask; it does not see TileLang's result dtype.  Keep literals typed and
+    // coerce dynamic scalars when the frontend source type differs from the
+    // requested vector element type.
+    auto print_vdup_scalar = [&](DataType scalar_dtype) {
+      const std::string scalar_pto_dtype = PtoScalarType(scalar_dtype);
+      if (const auto *imm = op->args[0].as<IntImmNode>()) {
+        if (scalar_dtype.is_bool()) {
+          os << (imm->value ? "True" : "False");
+        } else {
+          os << scalar_pto_dtype << "(" << imm->value << ")";
+        }
+        return;
+      }
+      if (const auto *imm = op->args[0].as<FloatImmNode>()) {
+        os << scalar_pto_dtype << "(float.fromhex('"
+           << FlexibleHexFormat(imm->value) << "'))";
+        return;
+      }
+      if (source_dtype != scalar_dtype) {
+        os << "scalar.cast(" << PrintExpr_(op->args[0]) << ", " << pto_dtype
+           << ")";
+      } else {
+        PrintExpr_(op->args[0], os);
+      }
+    };
+
+    if ((source_float && target_integer) || (source_integer && target_float)) {
+      ICHECK_EQ(source_dtype.bits(), target_dtype.bits())
+          << "PTO tl.simd.vdup cross-domain conversion requires matching "
+             "widths, got "
+          << source_dtype << " -> " << target_dtype;
+      os << "pto.vcvt(pto.vdup(";
+      print_vdup_scalar(source_dtype);
+      os << ", " << PrintExpr_(op->args[1]) << "), " << pto_dtype << ", "
+         << PrintExpr_(op->args[1]);
+      if (source_float) {
+        os << ", rnd=\"Z\", sat=\"SAT\"";
+      } else {
+        os << ", rnd=\"R\"";
+      }
+      os << ")";
+      return;
+    }
+
+    os << "pto.vdup(";
+    print_vdup_scalar(target_dtype);
+    os << ", " << PrintExpr_(op->args[1]) << ")";
+    return;
+  }
+
+  if (op->op.same_as(tl::simd_vcmax()) || op->op.same_as(tl::simd_vcadd())) {
+    ICHECK_EQ(op->args.size(), 3U) << "tl.simd.vcmax/vcadd expects 3 arguments";
+    CheckPtoSimdMode(op, 2,
+                     op->op.same_as(tl::simd_vcmax()) ? "tl.simd.vcmax"
+                                                      : "tl.simd.vcadd");
+    os << (op->op.same_as(tl::simd_vcmax()) ? "pto.vcmax(" : "pto.vcadd(")
+       << PrintExpr_(op->args[0]) << ", " << PrintExpr_(op->args[1]) << ")";
+    return;
+  }
+
+  if (op->op.same_as(tl::simd_vexpdif())) {
+    ICHECK_EQ(op->args.size(), 4U) << "tl.simd.vexpdif expects 4 arguments";
+    int64_t part = ConstArgDim(op, 3, "tl.simd.vexpdif part");
+    ICHECK(part == 0 || part == 1)
+        << "tl.simd.vexpdif part must be 0 (EVEN) or 1 (ODD), got " << part;
+    os << "pto.vexpdif(" << PrintExpr_(op->args[0]) << ", "
+       << PrintExpr_(op->args[1]) << ", " << PrintExpr_(op->args[2])
+       << ", part=\"" << (part == 0 ? "EVEN" : "ODD") << "\")";
+    return;
+  }
+
+  if (op->op.same_as(tl::simd_vcvt())) {
+    ICHECK_GE(op->args.size(), 3U)
+        << "tl.simd.vcvt expects source, mask, and mode";
+    CheckPtoSimdMode(op, op->args.size() - 1, "tl.simd.vcvt");
+    os << "pto.vcvt(" << PrintExpr_(op->args[0]) << ", "
+       << PtoScalarType(op->dtype.element_of()) << ", "
+       << PrintExpr_(op->args[1]);
+    for (size_t i = 2; i + 1 < op->args.size(); ++i) {
+      const auto *value = op->args[i].as<StringImmNode>();
+      ICHECK(value) << "tl.simd.vcvt option " << i
+                    << " must be a constant string, got " << op->args[i];
+      const std::string &token = value->value;
+      if (StartsWith(token, "ROUND_")) {
+        ICHECK(token == "ROUND_R" || token == "ROUND_A" || token == "ROUND_F" ||
+               token == "ROUND_C" || token == "ROUND_Z" || token == "ROUND_O" ||
+               token == "ROUND_H")
+            << "Unsupported tl.simd.vcvt rounding token: " << token;
+        os << ", rnd=\"" << token.substr(6) << "\"";
+      } else if (token == "RS_ENABLE" || token == "RS_DISABLE") {
+        os << ", sat=\"" << (token == "RS_ENABLE" ? "SAT" : "NOSAT") << "\"";
+      } else if (StartsWith(token, "PART_")) {
+        const std::string part = token.substr(5);
+        ICHECK(part == "EVEN" || part == "ODD" || part == "P0" ||
+               part == "P1" || part == "P2" || part == "P3")
+            << "Unsupported tl.simd.vcvt part token: " << token;
+        // PTODSL expects P0..P3, while the frontend token is PART_P0..P3.
+        os << ", part=\"" << part << "\"";
+      } else {
+        LOG(FATAL) << "Unsupported tl.simd.vcvt option token: " << token;
+      }
+    }
+    os << ")";
     return;
   }
 
@@ -3627,6 +3872,9 @@ void CodeGenTileLangPTO::VisitExpr_(const CallNode *op,
     int offset_index = -1;
     if (op->args.size() >= 4U && op->args[3].as<StringImmNode>()) {
       dist = Downcast<StringImm>(op->args[3])->value;
+      if (StartsWith(dist, "ONEPT_")) {
+        dist = "1PT_" + dist.substr(6);
+      }
       if (op->args.size() == 5U) {
         offset_index = 4;
       }
@@ -3645,6 +3893,20 @@ void CodeGenTileLangPTO::VisitExpr_(const CallNode *op,
       stream << ", dist=\"" << dist << "\"";
     }
     stream << ")\n";
+    return;
+  }
+
+  if (op->op.same_as(tl::simd_vsstb())) {
+    ICHECK(op->args.size() == 4U || op->args.size() == 5U)
+        << "tl.simd.vsstb expects 4 or 5 arguments";
+    std::string stride = PrintExpr_(op->args[2]);
+    os << "pto.vsstb(" << PrintExpr_(op->args[0]) << ", "
+       << PrintExpr_(op->args[1]) << ", ((" << stride << " >> 16) & 65535), ("
+       << stride << " & 65535), " << PrintExpr_(op->args[3]);
+    if (op->args.size() == 5U) {
+      os << ", post_update=pto.PostUpdate.ON";
+    }
+    os << ")";
     return;
   }
 
@@ -3673,6 +3935,12 @@ void CodeGenTileLangPTO::VisitExpr_(const CallNode *op,
     }
     if (op_name == "tl.loop_break") {
       os << "break";
+      return;
+    }
+    if (op_name == "tir.reinterpret" || op_name == "tirx.reinterpret") {
+      ICHECK_EQ(op->args.size(), 1U) << op_name << " expects one argument";
+      os << "pto.vbitcast(" << PrintExpr_(op->args[0]) << ", "
+         << PtoScalarType(op->dtype.element_of()) << ")";
       return;
     }
     if (StartsWith(op_name, "tl.")) {
@@ -4082,7 +4350,9 @@ void CodeGenTileLangPTO::VisitStmt_(const AllocBufferNode *op) {
     CheckPTOLocalVarBuffer(op->buffer.get());
     PrintIndent();
     local_var_buffers_.insert(buffer_var.get());
-    if (op->buffer->dtype.lanes() > 1) {
+    if (op->buffer->dtype.is_handle()) {
+      stream << AllocVarID(buffer_var.get()) << " = None\n";
+    } else if (op->buffer->dtype.lanes() > 1) {
       stream << AllocVarID(buffer_var.get()) << " = pto.vmi.vreg("
              << op->buffer->dtype.lanes() << ", "
              << PtoTypeName(op->buffer->dtype.element_of()) << ")\n";

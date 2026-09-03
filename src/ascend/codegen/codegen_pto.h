@@ -19,6 +19,8 @@ namespace codegen {
 
 class CodeGenTileLangPTO final : public CodeGenTileLangPY {
 public:
+  CodeGenTileLangPTO();
+
   void AddFunction(const GlobalVar &gvar, const PrimFunc &func) override;
   std::string Finish() override;
 
@@ -155,6 +157,10 @@ private:
   bool TryEmitRngBroadcastStore(const BufferStoreNode *op);
 
   std::string current_function_name_;
+  // `tl.simd.vdiv` defaults to precise fp32 division when fast math is off.
+  // PTOAS exposes that precision only for tile-level `tdiv`, not for the
+  // vector-level `pto.vdiv` used by this backend.
+  bool enable_fast_math_{false};
   bool inside_simtvf_body_{false};
   // Nonzero while emitting a runtime loop or a dynamic branch. PhiloxRNG owns
   // trace-time SSA state, so initializing or drawing in device-side control
