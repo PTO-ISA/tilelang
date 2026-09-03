@@ -162,6 +162,40 @@ def pairwise_sum_kernel():
     return main
 
 
+def vdup_float_to_int_kernel():
+    """PTO physical SIMD vdup followed by f32->s32 conversion."""
+
+    @T.prim_func
+    def main(OUT: T.Buffer((128,), "int32")):
+        with T.Kernel(1):
+            out_ub = T.alloc_shared((128,), "int32")
+            with T.SimdVF():
+                mask = T.simd.pset(32)
+                positive = T.simd.vdup(T.float32(1.5), "int32", mask)
+                negative = T.simd.vdup(T.float32(-1.5), "int32", mask)
+                T.simd.vsts(out_ub[0], positive, mask)
+                T.simd.vsts(out_ub[VL], negative, mask)
+            T.copy(out_ub, OUT)
+
+    return main
+
+
+def vdup_int_to_float_kernel():
+    """PTO physical SIMD vdup followed by s32->f32 conversion."""
+
+    @T.prim_func
+    def main(OUT: T.Buffer((VL,), "float32")):
+        with T.Kernel(1):
+            out_ub = T.alloc_shared((VL,), "float32")
+            with T.SimdVF():
+                mask = T.simd.pset(32)
+                value = T.simd.vdup(T.int32(7), "float32", mask)
+                T.simd.vsts(out_ub[0], value, mask)
+            T.copy(out_ub, OUT)
+
+    return main
+
+
 @pytest.mark.pto
 def test_pto_arith_select_pipeline():
     kernel = tilelang.compile(arith_select_kernel(), target="pto", out_idx=-1)
@@ -229,6 +263,29 @@ def test_pto_pairwise_sum():
     out = kernel(a)
     torch.npu.synchronize()
     torch.testing.assert_close(out.cpu(), a.cpu().reshape(32, 2).sum(dim=1), rtol=0, atol=0)
+
+
+@pytest.mark.pto
+def test_pto_vdup_float_to_int():
+    kernel = tilelang.compile(vdup_float_to_int_kernel(), target="pto", out_idx=-1)
+    out = kernel()
+    torch.npu.synchronize()
+    expected = torch.cat(
+        (
+            torch.ones(VL, dtype=torch.int32),
+            -torch.ones(VL, dtype=torch.int32),
+        )
+    )
+    assert torch.equal(out.cpu(), expected)
+
+
+@pytest.mark.pto
+def test_pto_vdup_int_to_float():
+    kernel = tilelang.compile(vdup_int_to_float_kernel(), target="pto", out_idx=-1)
+    out = kernel()
+    torch.npu.synchronize()
+    expected = torch.full((VL,), 7.0, dtype=torch.float32)
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":
