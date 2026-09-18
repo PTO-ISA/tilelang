@@ -10,9 +10,17 @@ from types import SimpleNamespace
 import pytest
 
 import tilelang.ascend.language as T
-from tilelang.engine.lower import lower
+from tilelang.engine.lower import lower as _lower
+from tvm.target import Target
+from tilelang.ascend.target import normalize_pto_target
 from tvm import tirx
 from tvm.tirx import Call
+
+def _lower_in_target(func, target, **kwargs):
+    resolved_target = normalize_pto_target(target) if target == "pto" else Target(target)
+    with resolved_target:
+        return _lower(func, target=resolved_target, **kwargs)
+
 
 PTO_VMI_OPAQUE_OPS = [
     "vload",
@@ -111,7 +119,7 @@ def test_pto_float32x2_minmax_codegen(op_name, combine):
                     c_ub[i] = combine(a_ub[i], b_ub[i])
             T.copy(c_ub, C)
 
-    source = lower(func, target="pto").kernel_source
+    source = _lower_in_target(func, "pto").kernel_source
     assert f"_tl_vectorize_binary_f32x2(pto.{op_name}," in source
     compile(source, "<pto-float32x2-minmax>", "exec")
 
@@ -137,7 +145,7 @@ def test_pto_float32x2_unary_math_codegen(scalar_op, unary):
                     b_ub[i] = unary(a_ub[i])
             T.copy(b_ub, B)
 
-    source = lower(func, target="pto").kernel_source
+    source = _lower_in_target(func, "pto").kernel_source
     assert f"_tl_vectorize_unary_f32x2({scalar_op}," in source
     compile(source, "<pto-float32x2-unary-math>", "exec")
 
@@ -161,7 +169,7 @@ def test_pto_float32x2_div_codegen():
                     c_ub[i] = a_ub[i] / b_ub[i]
             T.copy(c_ub, C)
 
-    source = lower(func, target="pto").kernel_source
+    source = _lower_in_target(func, "pto").kernel_source
     assert "from tilelang.contrib.ptodsl.simt import (" in source
     assert "def _tl_vectorize_binary_f32x2" not in source
     assert "_tl_vectorize_binary_f32x2(_tl_scalar_div," in source
@@ -191,7 +199,7 @@ def test_pto_packed_float_cast_and_local_fragment_codegen(src_dtype, dst_dtype, 
                 T.copy(local, b_ub)
             T.copy(b_ub, B)
 
-    source = lower(func, target="pto").kernel_source
+    source = _lower_in_target(func, "pto").kernel_source
     assert f', {dst_pto_type}, rounding="r", saturation="nosat")' in source
     assert "pto.alloc_buffer((2,)," in source
     compile(source, "<pto-packed-float-cast>", "exec")
@@ -1011,7 +1019,7 @@ def test_pto_codegen_emits_static_local_register_lists():
                         regs[i * 2 + j] = T.vmi.vload(a_ub[0], size=64)
                 T.vmi.vstore(T.vmi.vadd(regs[0], regs[3], mask), b_ub[0], mask)
 
-    source = lower(func, target="pto").kernel_source
+    source = _lower_in_target(func, "pto").kernel_source
     assert "= [None] * 4" in source
     assert "pto.static_range(" not in source
     for index in range(4):
@@ -1032,7 +1040,7 @@ def test_pto_codegen_emits_range_for_non_explicit_unroll():
                     value = T.vmi.vload(a_ub[i * 64], size=64)
                     T.vmi.vstore(value, b_ub[i * 64], mask)
 
-    lower(func, target="pto")
+    _lower_in_target(func, "pto")
 
 
 @pytest.mark.pto
@@ -1045,7 +1053,7 @@ def test_pto_codegen_rejects_non_explicit_unroll_local_register_index():
                 regs[i] = T.vmi.vbrc(T.float32(1), size=64)
 
     with pytest.raises(Exception, match=r"T\.unroll\(\.\.\., explicit=False\)"):
-        lower(func, target="pto")
+        _lower_in_target(func, "pto")
 
 
 @pytest.mark.pto
@@ -1058,7 +1066,7 @@ def test_pto_codegen_rejects_runtime_local_register_index():
                 regs[i] = T.vmi.vbrc(T.float32(1), size=64)
 
     with pytest.raises(Exception, match="requires a compile-time constant index"):
-        lower(func, target="pto")
+        _lower_in_target(func, "pto")
 
 
 @pytest.mark.pto
@@ -1077,7 +1085,7 @@ def test_pto_codegen_emits_vector_calls_and_pair_indexing():
                 T.vmi.vstore(out, b_ub[0], mask)
             T.copy(b_ub, B)
 
-    source = lower(func, target="pto").kernel_source
+    source = _lower_in_target(func, "pto").kernel_source
     assert "pto.vmi.create_mask(" in source
     assert "group=2" in source
     assert "group_size=" not in source
@@ -1108,7 +1116,7 @@ def test_pto_codegen_preserves_vmi_merge_mode():
                 T.vmi.vstore(merged, b_ub[0], mask)
             T.copy(b_ub, B)
 
-    source = lower(func, target="pto").kernel_source
+    source = _lower_in_target(func, "pto").kernel_source
     assert "pto.vmi.vdiv(" in source
     assert 'pmode="merge"' in source
 
@@ -1128,7 +1136,7 @@ def test_pto_codegen_keeps_dintlv_vstore_pair_grouped():
                 T.vmi.vstore(interleaved, b_ub[0], mask, dist_mode="dintlv")
             T.copy(b_ub, B)
 
-    source = lower(func, target="pto").kernel_source
+    source = _lower_in_target(func, "pto").kernel_source
     vstore_line = next(line for line in source.splitlines() if "pto.vmi.vstore(" in line and 'dist_mode="dintlv"' in line)
     assert re.search(r"pto\.vmi\.vstore\(\(\(.+\)\[0\], \(.+\)\[1\]\), ", vstore_line)
     assert not re.search(r"pto\.vmi\.vstore\(\(.+\)\[0\], \(.+\)\[1\], ", vstore_line)
@@ -1258,7 +1266,7 @@ def test_pto_codegen_covers_every_public_vector_op():
                 T.evaluate(dintlv_lo)
                 T.evaluate(dintlv_hi)
 
-    source = lower(func, target="pto").kernel_source
+    source = _lower_in_target(func, "pto").kernel_source
     missing = sorted(op_name for op_name in PTO_VMI_OPAQUE_OPS if f"pto.vmi.{op_name}(" not in source)
     assert not missing, f"missing PTO source generation coverage for {missing}"
     assert "pto.vmi.vmull(" in source
@@ -1299,7 +1307,7 @@ def test_pto_codegen_wraps_literal_scalar_sources_by_dtype():
             T.evaluate(idx_i16)
             T.evaluate(idx_i8)
 
-    source = lower(func, target="pto").kernel_source
+    source = _lower_in_target(func, "pto").kernel_source
     assert "pto.vmi.vbrc(pto.f32(" in source
     assert "pto.vmi.vbrc(pto.f16(" in source
     assert "pto.vmi.vbrc(pto.bf16(" in source
@@ -1337,7 +1345,7 @@ def test_pto_codegen_vdup_types_scalar_sources():
             T.evaluate(float_to_int)
             T.evaluate(dynamic_float_to_int)
 
-    source = lower(func, target="pto").kernel_source
+    source = _lower_in_target(func, "pto").kernel_source
     assert "pto.vdup(pto.si32(1)," in source
     assert "pto.vdup(pto.ui32(1)," in source
     assert "pto.vdup(x, mask)" in source
@@ -1367,7 +1375,7 @@ def test_pto_codegen_uses_signed_integers_for_vcvt(source_dtype, target_dtype, s
                 converted = T.vmi.vcvt(source, target_dtype)
                 T.evaluate(converted)
 
-    source = lower(func, target="pto").kernel_source
+    source = _lower_in_target(func, "pto").kernel_source
     assert "pto.vbitcast(" not in source
     assert f"to_dtype={signed_dtype}" in source
     assert f"to_dtype=pto.i{target_dtype.removeprefix('int')}" not in source
@@ -1391,7 +1399,7 @@ def test_vmi_pto_codegen_uses_physical_fp4_storage_units():
                 loaded = T.vmi.vload(b_ub[256], size=256)
                 T.evaluate(loaded)
 
-    source = lower(func, target="pto").kernel_source
+    source = _lower_in_target(func, "pto").kernel_source
     vstore_line = next(line for line in source.splitlines() if "pto.vmi.vstore(fp4," in line)
     vload_line = next(line for line in source.splitlines() if "pto.vmi.vload(" in line and "f4e2m1x2" in line)
     assert "mask = pto.vmi.create_mask(128, size=128)" in source
@@ -1415,7 +1423,7 @@ def test_vmi_pto_codegen_preserves_physical_fp4_mask_group():
                 fp4 = T.vmi.vcvt(T.vmi.vload(a_ub[0], size=256), "float4_e2m1fn")
                 T.vmi.vstore(fp4, b_ub[0], physical_mask)
 
-    source = lower(func, target="pto").kernel_source
+    source = _lower_in_target(func, "pto").kernel_source
     assert "physical_mask = pto.vmi.create_mask(4, group=4, size=128)" in source
 
 
@@ -1430,7 +1438,7 @@ def test_pto_codegen_rejects_non_pto_ascend_backend():
             T.evaluate(mask)
 
     with pytest.raises(Exception, match=r"Ascend CCE codegen does not support tl\.vmi\.create_mask"):
-        lower(func, target="ascend")
+        _lower_in_target(func, "ascend")
 
 
 @pytest.mark.pto
@@ -1447,7 +1455,7 @@ def test_simdvf_pto_codegen_still_emits_existing_simd_source():
                 T.simd.vsts(b_ub[0], y)
             T.copy(b_ub, B)
 
-    source = lower(func, target="pto").kernel_source
+    source = _lower_in_target(func, "pto").kernel_source
     compile(source, "<pto-source>", "exec")
     vecscope_lines = [line for line in source.splitlines() if "with pto.vecscope():" in line]
     assert len(vecscope_lines) == 1
@@ -1467,7 +1475,7 @@ def test_empty_simdvf_pto_codegen_emits_valid_python():
         with T.Kernel(1) as _, T.SimdVF():
             pass
 
-    source = lower(func, target="pto").kernel_source
+    source = _lower_in_target(func, "pto").kernel_source
     compile(source, "<pto-empty-simdvf>", "exec")
 
     lines = source.splitlines()
