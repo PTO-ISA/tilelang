@@ -207,6 +207,14 @@ bool IsFloat32(DataType t) {
   return t.is_float() && t.bits() == 32 && t.lanes() == 1;
 }
 
+bool IsFloat32Pair(DataType t) {
+  return t.is_float() && t.bits() == 32 && t.lanes() == 2;
+}
+
+bool IsPTOInteger32(DataType t) {
+  return t.is_scalar() && t.bits() == 32 && (t.is_int() || t.is_uint());
+}
+
 constexpr const char *kPtoModeZeroing = "MODE_ZEROING";
 constexpr const char *kPtoModeMerging = "MODE_MERGING";
 
@@ -287,20 +295,40 @@ std::string PtoLocalVarStoreValue(DataType dtype, const std::string &value) {
 bool IsSupportedPTOFloatMinMaxType(DataType t) {
   if (t.is_scalar())
     return t.is_float16() || IsFloat32(t) || t.is_bfloat16();
-  return t.lanes() == 2 && (t.is_float16() || t.is_bfloat16());
+  return t.lanes() == 2 &&
+         (t.is_float16() || IsFloat32Pair(t) || t.is_bfloat16());
 }
 
 bool IsSupportedPTOSIMTUnaryMathType(DataType t) {
-  return IsFloat32(t) || (t.is_float16() && (t.is_scalar() || t.lanes() == 2));
+  const bool scalar_or_pair = t.is_scalar() || t.lanes() == 2;
+  return scalar_or_pair && (t.is_float16() || (t.is_float() && t.bits() == 32));
 }
 
 bool IsSupportedPTOScalarUnaryMathType(DataType t) {
   return t.is_scalar() && (t.is_float16() || IsFloat32(t) || t.is_bfloat16());
 }
 
+bool IsSupportedPTOSIMTAllReduceType(DataType t) {
+  return t.is_scalar() && (t.is_float16() || IsFloat32(t) ||
+                           t == DataType::Int(32) || t == DataType::UInt(32));
+}
+
+bool IsSupportedSIMTLocalScalarAccessType(DataType t) {
+  return t.is_scalar() && (t.is_float16() || IsFloat32(t) ||
+                           t == DataType::Int(32) || t == DataType::UInt(32));
+}
+
 bool IsSupportedSIMTLocalStorageType(DataType t) {
-  return IsFloat32(t) || t == DataType::UInt(32) ||
-         (t.is_scalar() && tl::IsAscendVectorizableFP8(t));
+  return t.is_scalar() && (t.is_float16() || IsFloat32(t) || t.is_bfloat16() ||
+                           t == DataType::Int(32) || t == DataType::UInt(32) ||
+                           tl::IsAscendVectorizableFP8(t));
+}
+
+std::string PtoSIMTLocalStorageTypeName(DataType t) {
+  ICHECK(IsSupportedSIMTLocalStorageType(t));
+  // LLVM stack allocations require signless integer element types. Preserve
+  // TileLang's signedness at load/store boundaries instead.
+  return IsPTOInteger32(t) ? "pto.i32" : PtoTypeName(t);
 }
 
 bool IsSupportedSIMTFP8ContiguousLaneCount(int lanes) {
@@ -483,6 +511,18 @@ void CheckPTOLocalVarBuffer(const BufferNode *buffer) {
       << dtype;
 }
 
+void CheckPTOAllReduceDtype(const CallNode *call) {
+  ICHECK_GE(call->args.size(), 2U)
+      << "tl::AscendAllReduce call expects a value argument";
+  DataType dtype = call->args[1].dtype();
+  ICHECK(IsSupportedPTOSIMTAllReduceType(dtype))
+      << "PTO cross-thread allreduce currently supports float16, float32, "
+         "int32, and uint32 only, got "
+      << dtype
+      << ". Use a supported reducer dtype, such as float32, and cast the "
+         "finalized result afterward.";
+}
+
 void CheckPTOKernel(const PrimFunc &func) {
   bool has_cube_block = false;
   bool has_supported_cube_op = false;
@@ -496,6 +536,15 @@ void CheckPTOKernel(const PrimFunc &func) {
     }
 
     if (const auto *call = node.as<CallNode>()) {
+      if ((call->op.same_as(builtin::call_extern()) ||
+           call->op.same_as(builtin::call_pure_extern())) &&
+          !call->args.empty()) {
+        const auto *func_name = call->args[0].as<StringImmNode>();
+        if (func_name != nullptr &&
+            func_name->value.find("tl::AscendAllReduce") != std::string::npos) {
+          CheckPTOAllReduceDtype(call);
+        }
+      }
       if (call->op.same_as(tl::ascend_gemm_l1()) ||
           call->op.same_as(tl::ascend_blockscaled_gemm_l1()) ||
           call->op.same_as(tl::ascend_mad()) ||
@@ -1240,6 +1289,15 @@ std::string CodeGenTileLangPTO::Finish() {
           "  pto_read_gm_bypass_dcache as _tl_pto_read_gm_bypass_dcache,\n"
           "  pto_write_gm_bypass_dcache as _tl_pto_write_gm_bypass_dcache,\n"
           ")\n";
+  code << "from tilelang.contrib.ptodsl.simt import (\n"
+          "  scalar_div as _tl_scalar_div,\n"
+          "  scalar_rsqrt as _tl_scalar_rsqrt,\n"
+          "  simt_allreduce_max as _tl_simt_allreduce_max,\n"
+          "  simt_allreduce_min as _tl_simt_allreduce_min,\n"
+          "  simt_allreduce_sum as _tl_simt_allreduce_sum,\n"
+          "  vectorize_binary_f32x2 as _tl_vectorize_binary_f32x2,\n"
+          "  vectorize_unary_f32x2 as _tl_vectorize_unary_f32x2,\n"
+          ")\n";
   code << "from ptodsl._ops import _coerce_i64 as _tl_coerce_i64\n";
   code << "from ptodsl._surface_values import wrap_surface_value as "
           "_tl_wrap_surface_value\n";
@@ -1549,11 +1607,16 @@ std::string CodeGenTileLangPTO::PtoScalarLoad(const BufferNode *buffer,
 
   std::string index_str = RemoveOutermostParentheses(PrintExpr_(index));
   if (inside_simtvf_body_ && (scope == "local.fragment" || scope == "local")) {
-    ICHECK(IsFloat32(buffer->dtype))
-        << "PTO SIMT local scalar load currently supports float32 only, got "
+    ICHECK(IsSupportedSIMTLocalScalarAccessType(buffer->dtype))
+        << "PTO SIMT local scalar load currently supports float16, float32, "
+           "int32, and uint32 only, got "
         << buffer->dtype;
-    return "scalar.load(" + GetVarID(buffer->data.get()) + ", " + index_str +
-           ")";
+    std::string value =
+        "scalar.load(" + GetVarID(buffer->data.get()) + ", " + index_str + ")";
+    if (IsPTOInteger32(buffer->dtype)) {
+      return "scalar.cast(" + value + ", " + PtoTypeName(buffer->dtype) + ")";
+    }
+    return value;
   }
 
   auto pto_space = PtoSpaceForStorageScope(scope);
@@ -1592,11 +1655,16 @@ void CodeGenTileLangPTO::EmitPtoScalarStore(const BufferNode *buffer,
 
   if (scope == "local.fragment" || scope == "local") {
     if (inside_simtvf_body_) {
-      ICHECK(IsFloat32(buffer->dtype))
-          << "PTO SIMT local scalar store currently supports float32 only, got "
+      ICHECK(IsSupportedSIMTLocalScalarAccessType(buffer->dtype))
+          << "PTO SIMT local scalar store currently supports float16, "
+             "float32, int32, and uint32 only, got "
           << buffer->dtype;
-      stream << "scalar.store(" << value << ", " << GetVarID(buffer->data.get())
-             << ", " << index_str << ")\n";
+      std::string store_value = value;
+      if (IsPTOInteger32(buffer->dtype)) {
+        store_value = "scalar.cast(" + store_value + ", pto.i32)";
+      }
+      stream << "scalar.store(" << store_value << ", "
+             << GetVarID(buffer->data.get()) << ", " << index_str << ")\n";
       return;
     }
     stream << GetVarID(buffer->data.get()) << "[" << index_str
@@ -1651,11 +1719,12 @@ void CodeGenTileLangPTO::EmitPtoBufferAllocation(const Buffer &buffer) {
         persistent_buffer_vars_.count(buffer->data.get()) != 0;
     if (inside_simtvf_body_) {
       ICHECK(IsSupportedSIMTLocalStorageType(buffer->dtype))
-          << "PTO SIMT local allocation currently supports float32, uint32, "
-             "and float8_e4m3fn/float8_e5m2, got "
+          << "PTO SIMT local allocation currently supports float16, "
+             "bfloat16, float32, int32, uint32, and "
+             "float8_e4m3fn/float8_e5m2, got "
           << buffer->dtype;
       stream << vid << " = pto.alloc_buffer((" << opt_size.value() << ",), "
-             << PtoTypeName(buffer->dtype) << ")\n";
+             << PtoSIMTLocalStorageTypeName(buffer->dtype) << ")\n";
     } else if (persistent) {
       ICHECK(IsFloat32(buffer->dtype))
           << "PTO persistent local allocation currently supports float32 "
@@ -2866,8 +2935,7 @@ void CodeGenTileLangPTO::EmitAscendCopyMatrixCcToGm(const CallNode *op) {
 std::string
 CodeGenTileLangPTO::EmitPTOAllReduceExpr_(const std::string &func_name,
                                           const CallNode *op) {
-  ICHECK_GE(op->args.size(), 2U)
-      << "tl::AscendAllReduce call expects a value argument";
+  CheckPTOAllReduceDtype(op);
 
   const size_t begin = func_name.find("tl::AscendAllReduce");
   ICHECK_NE(begin, std::string::npos)
@@ -2877,9 +2945,9 @@ CodeGenTileLangPTO::EmitPTOAllReduceExpr_(const std::string &func_name,
     const char *pto_name;
   };
   const ReductionInfo reductions[] = {
-      {"tl::SumOp", "pto.simt_allreduce_sum"},
-      {"tl::MaxOp", "pto.simt_allreduce_max"},
-      {"tl::MinOp", "pto.simt_allreduce_min"},
+      {"tl::SumOp", "_tl_simt_allreduce_sum"},
+      {"tl::MaxOp", "_tl_simt_allreduce_max"},
+      {"tl::MinOp", "_tl_simt_allreduce_min"},
   };
   const ReductionInfo *reduction = nullptr;
   for (const ReductionInfo &candidate : reductions) {
@@ -4061,6 +4129,26 @@ void CodeGenTileLangPTO::VisitExpr_(const CastNode *op,
     }
   }
 
+  const bool from_float32_pair = IsFloat32Pair(from);
+  const bool to_float32_pair = IsFloat32Pair(to);
+  const bool from_half_pair =
+      from.lanes() == 2 && (from.is_float16() || from.is_bfloat16());
+  const bool to_half_pair =
+      to.lanes() == 2 && (to.is_float16() || to.is_bfloat16());
+  if ((from_float32_pair && to_half_pair) ||
+      (from_half_pair && to_float32_pair)) {
+    ICHECK(inside_simtvf_body_)
+        << "PTO packed float cast is supported only inside SIMT, got " << from
+        << " -> " << to;
+    const char *to_pto_type = to_float32_pair   ? "pto.f32x2"
+                              : to.is_float16() ? "pto.f16x2"
+                                                : "pto.bf16x2";
+    os << "pto.convert(";
+    PrintExpr_(op->value, os);
+    os << ", " << to_pto_type << ", rounding=\"r\", saturation=\"nosat\")";
+    return;
+  }
+
   const bool supported_float_cast = from.is_scalar() && to.is_scalar() &&
                                     ((IsFloat32(from) && to.is_bfloat16()) ||
                                      (from.is_bfloat16() && IsFloat32(to)));
@@ -4133,9 +4221,19 @@ void CodeGenTileLangPTO::PrintPtoFloatMinMax_(const char *op_name,
                                               std::ostream &os) { // NOLINT(*)
   ICHECK(IsSupportedPTOFloatMinMaxType(dtype))
       << "PTO floating min/max currently supports f16, f32, bf16, "
-         "vector<2xf16>, and vector<2xbf16>, got "
+         "vector<2xf16>, vector<2xf32>, and vector<2xbf16>, got "
       << dtype;
 
+  // PTO's packed min/max micro-ops omit f32x2. Apply the supported scalar f32
+  // operation lane-by-lane and repack the pair instead.
+  if (inside_simtvf_body_ && IsFloat32Pair(dtype)) {
+    os << "_tl_vectorize_binary_f32x2(pto.f" << op_name << ", ";
+    PrintExpr_(lhs, os);
+    os << ", ";
+    PrintExpr_(rhs, os);
+    os << ")";
+    return;
+  }
   if (!inside_simtvf_body_) {
     ICHECK(dtype.is_scalar())
         << "PTO floating min/max outside SIMT requires a scalar dtype, got "
@@ -4188,7 +4286,9 @@ bool CodeGenTileLangPTO::TryEmitPtoUnaryMath_(const std::string &name,
   if (inside_simtvf_body_) {
     ICHECK(IsSupportedPTOSIMTUnaryMathType(dtype))
         << "PTO SIMT " << name
-        << " currently supports f16, f32, and vector<2xf16>, got " << dtype;
+        << " currently supports f16, f32, vector<2xf16>, and vector<2xf32>, "
+           "got "
+        << dtype;
   } else {
     ICHECK(IsSupportedPTOScalarUnaryMathType(dtype))
         << "PTO scalar " << name
@@ -4196,6 +4296,19 @@ bool CodeGenTileLangPTO::TryEmitPtoUnaryMath_(const std::string &name,
   }
   const UnaryMathForm &form = it->second;
   std::string value = PrintExpr_(arg);
+  // PTO's packed unary micro-ops omit f32x2. Scalarize these operations just
+  // like min/max above so PTOAS receives only supported scalar f32 ops.
+  if (inside_simtvf_body_ && IsFloat32Pair(dtype)) {
+    if (form.reciprocal) {
+      os << "_tl_vectorize_unary_f32x2(_tl_scalar_rsqrt, " << value << ")";
+    } else {
+      std::string simt_op = form.simt;
+      ICHECK(!simt_op.empty() && simt_op.back() == '(');
+      simt_op.pop_back();
+      os << "_tl_vectorize_unary_f32x2(" << simt_op << ", " << value << ")";
+    }
+    return true;
+  }
   const char *fn = inside_simtvf_body_ ? form.simt : form.scalar;
   if (form.reciprocal) {
     os << "(1.0 / " << fn << value << "))";
@@ -4302,7 +4415,16 @@ void CodeGenTileLangPTO::PrintBinaryExpr_(const std::string &opstr,
 
   ICHECK(inside_simtvf_body_)
       << "PTO vector binary expressions are only supported inside SIMT bodies";
-  if (opstr != "+" && opstr != "-" && opstr != "*" && opstr != "/") {
+  if (opstr == "/") {
+    ICHECK(IsFloat32Pair(dtype))
+        << "PTO SIMT vector division currently supports vector<2xf32> only, "
+           "got "
+        << dtype;
+    os << "_tl_vectorize_binary_f32x2(_tl_scalar_div, " << PrintExpr_(lhs)
+       << ", " << PrintExpr_(rhs) << ")";
+    return;
+  }
+  if (opstr != "+" && opstr != "-" && opstr != "*") {
     LOG(FATAL) << "Unsupported PTO SIMT vector binary op: " << opstr;
   }
   os << "(" << PrintExpr_(lhs) << " " << opstr << " " << PrintExpr_(rhs) << ")";
@@ -4789,8 +4911,9 @@ void CodeGenTileLangPTO::EmitScalarizedLoad(const BufferLoadNode *op,
 
   if (inside_simtvf_body_) {
     ICHECK(IsSupportedSIMTLocalStorageType(element_dtype))
-        << "PTO SIMT vector BufferLoad currently supports float32, uint32, "
-           "and float8_e4m3fn/float8_e5m2 storage, got "
+        << "PTO SIMT vector BufferLoad currently supports float16, bfloat16, "
+           "float32, int32, uint32, and float8_e4m3fn/float8_e5m2 storage, "
+           "got "
         << element_dtype;
     ICHECK_EQ(value_dtype.element_of(), element_dtype)
         << "PTO SIMT vector BufferLoad expects the value element dtype to "
@@ -4895,8 +5018,9 @@ void CodeGenTileLangPTO::EmitScalarizedStore(const BufferStoreNode *op) {
   if (inside_simtvf_body_) {
     DataType value_dtype = op->value.dtype();
     ICHECK(IsSupportedSIMTLocalStorageType(op->buffer->dtype))
-        << "PTO SIMT vector BufferStore currently supports float32, uint32, "
-           "and float8_e4m3fn/float8_e5m2 storage only, got "
+        << "PTO SIMT vector BufferStore currently supports float16, "
+           "bfloat16, float32, int32, uint32, and "
+           "float8_e4m3fn/float8_e5m2 storage only, got "
         << op->buffer->dtype;
     ICHECK_EQ(value_dtype.element_of(), op->buffer->dtype)
         << "PTO SIMT vector BufferStore expects the value element dtype to "
