@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from tilelang.ascend.target import target_is_ascend
+from tilelang.ascend.target import target_is_plain_ascend, target_is_pto
 from tilelang.backend.host_codegen import STANDARD_HOST_CODEGENS
 from tilelang.backend.module import BackendModule, register_backend
 from tilelang.contrib import bisheng
@@ -52,11 +52,25 @@ BACKEND = register_backend(
     BackendModule(
         name="ascend",
         target_kinds=("ascend",),
-        supports_target=target_is_ascend,
+        supports_target=target_is_plain_ascend,
         pipelines={"ascend": pipeline.ascend_pipeline},
         device_codegens={"ascend": codegen.ASCEND_CODEGEN},
         execution_backends=execution_backend.ASCEND_EXECUTION_BACKENDS,
         host_codegens=STANDARD_HOST_CODEGENS,
         callbacks={"tilelang_callback_ascend_compile": tilelang_callback_ascend_compile},
+    )
+)
+
+# PTO and AscendC share the target kind and lowering pipeline, but select a
+# different device codegen and execution backend.
+PTO_BACKEND = register_backend(
+    BackendModule(
+        name="pto",
+        target_kinds=("ascend",),
+        supports_target=target_is_pto,
+        pipelines={"ascend": pipeline.ascend_pipeline},
+        device_codegens={"ascend": codegen.PTO_CODEGEN},
+        execution_backends=execution_backend.PTO_EXECUTION_BACKENDS,
+        host_codegens=STANDARD_HOST_CODEGENS,
     )
 )

@@ -19,3 +19,8 @@ ASCEND_EXECUTION_BACKENDS = [
     ),
     ExecutionBackendSpec("cython"),
 ]
+
+# PTO emits source-only PTODSL and uses the Cython AOT pipeline.
+PTO_EXECUTION_BACKENDS = [
+    ExecutionBackendSpec("cython"),
+]
