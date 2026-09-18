@@ -4,9 +4,9 @@
  */
 #include "ascend/codegen/codegen_pto.h"
 
+#include "ascend/op/builtin.h"
 #include "backend/common/codegen/codegen_utils.h"
 #include "backend/common/target_utils.h"
-#include "ascend/op/builtin.h"
 #include "support/check.h"
 #include "tvm/ir/repr.h"
 

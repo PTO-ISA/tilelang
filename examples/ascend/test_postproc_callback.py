@@ -3,7 +3,7 @@
 import pytest
 import tilelang
 
-from example_ascend_postproc_callback import CUSTOM_MARKER, vector_add
+from example_ascend_postproc_callback import CUSTOM_MARKER, CUSTOM_MARKER_PTO, vector_add
 
 
 @pytest.mark.parametrize(

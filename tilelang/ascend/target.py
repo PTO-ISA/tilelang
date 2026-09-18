@@ -114,6 +114,8 @@ def normalize_pto_target(target: TargetLike) -> Target | None:
         return _make_pto_target()
     except Exception:
         return None
+
+
 register_target_detector("ascend", _detect_ascend_target, override=True)
 register_target_normalizer("ascend", normalize_ascend_target, override=True)
 register_target_normalizer("asc", normalize_asc_target, override=True)

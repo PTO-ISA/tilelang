@@ -1,5 +1,6 @@
 """pytest test for example_gemm_ub_merge.py — UB merge with Cube + Vector."""
 
+import pytest
 import torch
 import tilelang
 

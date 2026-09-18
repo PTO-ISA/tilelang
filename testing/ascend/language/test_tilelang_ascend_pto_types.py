@@ -16,6 +16,7 @@ from tilelang.ascend.target import normalize_pto_target
 from tvm import tirx
 from tvm.tirx import Call
 
+
 def _lower_in_target(func, target, **kwargs):
     resolved_target = normalize_pto_target(target) if target == "pto" else Target(target)
     with resolved_target:

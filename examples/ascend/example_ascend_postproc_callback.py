@@ -30,6 +30,7 @@ def vector_add(N):
 
 
 CUSTOM_MARKER = "// [POSTPROC] Modified by register_ascend_postproc_callback"
+CUSTOM_MARKER_PTO = "# [POSTPROC] Modified by register_ascend_postproc_callback"
 
 
 @register_ascend_postproc_callback
