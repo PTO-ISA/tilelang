@@ -114,15 +114,6 @@ def normalize_pto_target(target: TargetLike) -> Target | None:
         return _make_pto_target()
     except Exception:
         return None
-
-
-def normalize_asc_target(target: TargetLike) -> Target | None:
-    """Accept ``asc`` as the concise name for the AscendC backend."""
-    if isinstance(target, str) and target.strip() == "asc":
-        return normalize_ascend_target("ascend")
-    return None
-
-
 register_target_detector("ascend", _detect_ascend_target, override=True)
 register_target_normalizer("ascend", normalize_ascend_target, override=True)
 register_target_normalizer("asc", normalize_asc_target, override=True)

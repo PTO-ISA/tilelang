@@ -20,7 +20,7 @@ ASCEND_EXECUTION_BACKENDS = [
     ExecutionBackendSpec("cython"),
 ]
 
-# PTO's execution backend owns the AOT pipeline (ptodsl -> ptoas -> bisheng).
+# PTO emits source-only PTODSL and uses the Cython AOT pipeline.
 PTO_EXECUTION_BACKENDS = [
-    ExecutionBackendSpec("pto"),
+    ExecutionBackendSpec("cython"),
 ]
