@@ -441,8 +441,9 @@ class LibraryGenerator:
     def _create_pto_temp_dir(self) -> str:
         if self._pto_temp_dir is not None:
             return self._pto_temp_dir.temp_dir
-        os.makedirs(env.TILELANG_TMP_DIR, exist_ok=True)
-        work_path = os.path.join(env.TILELANG_TMP_DIR, f"pto_{os.getpid()}_{uuid.uuid4().hex}")
+        temp_root = os.environ.get("TILELANG_TMP_DIR") or os.path.join(tempfile.gettempdir(), "tilelang")
+        os.makedirs(temp_root, exist_ok=True)
+        work_path = os.path.join(temp_root, f"pto_{os.getpid()}_{uuid.uuid4().hex}")
         self._keep_pto_temp_files = not env.should_cleanup_temp_files()
         self._pto_temp_dir = utils.tempdir(
             custom_path=work_path,
