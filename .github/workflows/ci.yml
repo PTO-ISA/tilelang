@@ -205,7 +205,38 @@ jobs:
           # pip recognizes inherited packages; uv pip would install another Torch copy.
           python -m pip install --upgrade pip setuptools wheel
           python -m pip install -v -r requirements-test.txt
-          python -m pip install pybind11==2.12.0
+          # Self-contained PTO toolchain from the official hw-native-sys/PTOAS
+          # vmi-v0.1.8 release (ptodsl + MLIR dialects + ptoas CLI).
+          case "${RUNNER_ARCH}" in
+            ARM64)
+              PTOAS_ARCH=aarch64
+              PTOAS_SHA256=88f726c88109a707a0fb54b91f854db9987823168aeac0c5fe5a81de0ae54c6c
+              ;;
+            X64)
+              PTOAS_ARCH=x86_64
+              PTOAS_SHA256=6363b908fe61fd63fd5b15baad594fa98054874cfe82b95e28c96f6a4c1f368d
+              ;;
+            *)
+              echo "Unsupported runner architecture: ${RUNNER_ARCH}" >&2
+              exit 1
+              ;;
+          esac
+          PTOAS_CACHE_DIR="${XDG_CACHE_HOME}/ptoas"
+          PTOAS_FILENAME="ptoas_vmi-0.1.8-cp312-cp312-manylinux_2_34_${PTOAS_ARCH}.whl"
+          PTOAS_WHEEL="${PTOAS_CACHE_DIR}/${PTOAS_FILENAME}"
+          mkdir -p "${PTOAS_CACHE_DIR}"
+          if ! [[ -f "${PTOAS_WHEEL}" ]] || \
+             ! printf '%s  %s\n' "${PTOAS_SHA256}" "${PTOAS_WHEEL}" | sha256sum --check --status -; then
+            PTOAS_DOWNLOAD="$(mktemp "${PTOAS_WHEEL}.tmp.XXXXXX")"
+            trap 'rm -f "${PTOAS_DOWNLOAD}"' EXIT
+            curl --fail --location --retry 3 \
+              --output "${PTOAS_DOWNLOAD}" \
+              "https://github.com/hw-native-sys/PTOAS/releases/download/vmi-v0.1.8/${PTOAS_FILENAME}"
+            printf '%s  %s\n' "${PTOAS_SHA256}" "${PTOAS_DOWNLOAD}" | sha256sum --check -
+            mv "${PTOAS_DOWNLOAD}" "${PTOAS_WHEEL}"
+            trap - EXIT
+          fi
+          python -m pip install "${PTOAS_WHEEL}"
           echo "::group::torch.utils.collect_env"
           python -m torch.utils.collect_env
 
