@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import tilelang.ascend.language as T
+import tilelang.language as T
 from tilelang.engine.lower import lower
 from tvm import tirx
 from tvm.tirx import Call
@@ -91,12 +91,120 @@ def _collect_pto_calls(func):
     return calls
 
 
+@pytest.mark.parametrize("op_name,combine", [("fmax", T.max), ("fmin", T.min)])
+@pytest.mark.pto
+def test_pto_float32x2_minmax_codegen(op_name, combine):
+    @T.prim_func
+    def func(
+        A: T.Tensor((2,), "float32"),
+        B: T.Tensor((2,), "float32"),
+        C: T.Tensor((2,), "float32"),
+    ):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((2,), "float32")
+            b_ub = T.alloc_shared((2,), "float32")
+            c_ub = T.alloc_shared((2,), "float32")
+            T.copy(A, a_ub)
+            T.copy(B, b_ub)
+            with T.SimtVF(threads=1):
+                for i in T.vectorized(2):
+                    c_ub[i] = combine(a_ub[i], b_ub[i])
+            T.copy(c_ub, C)
+
+    source = lower(func, target="pto").kernel_source
+    assert f"_tl_vectorize_binary_f32x2(pto.{op_name}," in source
+    compile(source, "<pto-float32x2-minmax>", "exec")
+
+
+@pytest.mark.parametrize(
+    "scalar_op,unary",
+    [
+        ("pto.exp", T.exp),
+        ("pto.log", T.log),
+        ("pto.sqrt", T.sqrt),
+    ],
+)
+@pytest.mark.pto
+def test_pto_float32x2_unary_math_codegen(scalar_op, unary):
+    @T.prim_func
+    def func(A: T.Tensor((2,), "float32"), B: T.Tensor((2,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((2,), "float32")
+            b_ub = T.alloc_shared((2,), "float32")
+            T.copy(A, a_ub)
+            with T.SimtVF(threads=1):
+                for i in T.vectorized(2):
+                    b_ub[i] = unary(a_ub[i])
+            T.copy(b_ub, B)
+
+    source = lower(func, target="pto").kernel_source
+    assert f"_tl_vectorize_unary_f32x2({scalar_op}," in source
+    compile(source, "<pto-float32x2-unary-math>", "exec")
+
+
+@pytest.mark.pto
+def test_pto_float32x2_div_codegen():
+    @T.prim_func
+    def func(
+        A: T.Tensor((2,), "float32"),
+        B: T.Tensor((2,), "float32"),
+        C: T.Tensor((2,), "float32"),
+    ):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((2,), "float32")
+            b_ub = T.alloc_shared((2,), "float32")
+            c_ub = T.alloc_shared((2,), "float32")
+            T.copy(A, a_ub)
+            T.copy(B, b_ub)
+            with T.SimtVF(threads=1):
+                for i in T.vectorized(2):
+                    c_ub[i] = a_ub[i] / b_ub[i]
+            T.copy(c_ub, C)
+
+    source = lower(func, target="pto").kernel_source
+    assert "from tilelang.contrib.ptodsl.simt import (" in source
+    assert "def _tl_vectorize_binary_f32x2" not in source
+    assert "_tl_vectorize_binary_f32x2(_tl_scalar_div," in source
+    compile(source, "<pto-float32x2-div>", "exec")
+
+
+@pytest.mark.parametrize(
+    "src_dtype,dst_dtype,dst_pto_type",
+    [
+        ("float32", "float16", "pto.f16x2"),
+        ("float32", "bfloat16", "pto.bf16x2"),
+        ("float16", "float32", "pto.f32x2"),
+        ("bfloat16", "float32", "pto.f32x2"),
+    ],
+)
+@pytest.mark.pto
+def test_pto_packed_float_cast_and_local_fragment_codegen(src_dtype, dst_dtype, dst_pto_type):
+    @T.prim_func
+    def func(A: T.Tensor((2,), src_dtype), B: T.Tensor((2,), dst_dtype)):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((2,), src_dtype)
+            b_ub = T.alloc_shared((2,), dst_dtype)
+            T.copy(A, a_ub)
+            with T.SimtVF(threads=1):
+                local = T.alloc_fragment((2,), src_dtype)
+                T.copy(a_ub, local)
+                T.copy(local, b_ub)
+            T.copy(b_ub, B)
+
+    source = lower(func, target="pto").kernel_source
+    assert f', {dst_pto_type}, rounding="r", saturation="nosat")' in source
+    assert "pto.alloc_buffer((2,)," in source
+    compile(source, "<pto-packed-float-cast>", "exec")
+
+
+@pytest.mark.pto
 def test_pto_type_helpers():
     assert str(T.vmi.vreg(64, T.float32)) == "float32x64"
     assert str(T.vmi.vreg(8, "float16")) == "float16x8"
     assert str(T.vmi.mask(64)) == "boolx64"
 
 
+@pytest.mark.pto
 def test_pto_alloc_local_builds_vector_register_buffer():
     @T.prim_func
     def func():
@@ -122,6 +230,7 @@ def test_pto_alloc_local_builds_vector_register_buffer():
     assert stores and str(stores[0].value.dtype) == "float32x64"
 
 
+@pytest.mark.pto
 def test_pto_alloc_local_validates_vreg_type_and_shape(monkeypatch):
     monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
     with pytest.raises(TypeError, match="VMI vector type"):
@@ -134,6 +243,7 @@ def test_pto_alloc_local_validates_vreg_type_and_shape(monkeypatch):
         T.vmi.alloc_local((), T.vmi.vreg(64, T.float32))
 
 
+@pytest.mark.pto
 def test_pto_namespace_exports_public_ops():
     expected = [
         "alloc_local",
@@ -195,6 +305,7 @@ def test_pto_namespace_exports_public_ops():
     assert not hasattr(T.vmi, "pair_get")
 
 
+@pytest.mark.pto
 def test_pto_tir_call_dtypes_preserve_vector_and_mask_lanes():
     @T.prim_func
     def func(A: T.Buffer((64,), "float32"), B: T.Buffer((64,), "float16")):
@@ -226,6 +337,7 @@ def test_pto_tir_call_dtypes_preserve_vector_and_mask_lanes():
     assert dict(vcadd_call.annotations)["reassoc"] == 0
 
 
+@pytest.mark.pto
 def test_pto_integer_vcadd_allows_omitted_reassoc():
     @T.prim_func
     def func(A: T.Buffer((64,), "int32")):
@@ -239,6 +351,7 @@ def test_pto_integer_vcadd_allows_omitted_reassoc():
     assert "reassoc" not in dict(vcadd_call.annotations)
 
 
+@pytest.mark.pto
 def test_pto_create_mask_tir_annotations_match_ptodsl_surface():
     @T.prim_func
     def func(A: T.Buffer((64,), "float32")):
@@ -253,6 +366,7 @@ def test_pto_create_mask_tir_annotations_match_ptodsl_surface():
     assert dict(call.annotations) == {"group": 4, "size": 32}
 
 
+@pytest.mark.pto
 def test_pto_scope_guard_allows_ops_inside_simdvf():
     @T.prim_func
     def func(A: T.Buffer((64,), "float32"), B: T.Buffer((64,), "float32")):
@@ -268,6 +382,7 @@ def test_pto_scope_guard_allows_ops_inside_simdvf():
     assert {"tl.vmi.create_mask", "tl.vmi.vload", "tl.vmi.vstore"}.issubset(names)
 
 
+@pytest.mark.pto
 def test_pto_bufferload_addresses_lower_to_explicit_ptr_offset_args():
     @T.prim_func
     def func(A: T.Buffer((128,), "float32"), B: T.Buffer((128,), "float32")):
@@ -289,6 +404,7 @@ def test_pto_bufferload_addresses_lower_to_explicit_ptr_offset_args():
     assert str(vstore_call.args[2]) == "32"
 
 
+@pytest.mark.pto
 def test_pto_fp4_multidim_bufferload_uses_packed_linear_offset():
     @T.prim_func
     def func(
@@ -423,6 +539,7 @@ def test_pto_fp4_multidim_bufferload_uses_packed_linear_offset():
         ),
     ],
 )
+@pytest.mark.pto
 def test_pto_wrappers_reject_invalid_mode_combinations(monkeypatch, call, message):
     value = SimpleNamespace(dtype="float16x16")
     mask = SimpleNamespace(dtype="boolx16")
@@ -432,6 +549,7 @@ def test_pto_wrappers_reject_invalid_mode_combinations(monkeypatch, call, messag
         call(value, mask)
 
 
+@pytest.mark.pto
 def test_pto_vinterpret_cast_width_changing_bit_totals(monkeypatch):
     """Same-width keeps lanes; width change requires matching bit totals (ASC vintlv)."""
     monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
@@ -463,6 +581,7 @@ def test_pto_vinterpret_cast_width_changing_bit_totals(monkeypatch):
         T.vmi.vinterpret_cast(SimpleNamespace(dtype="int8x128"), "int64")
 
 
+@pytest.mark.pto
 def test_pto_wrappers_reject_invalid_operand_contracts(monkeypatch):
     monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
     f32 = SimpleNamespace(dtype="float32x16")
@@ -483,6 +602,7 @@ def test_pto_wrappers_reject_invalid_operand_contracts(monkeypatch):
         T.vmi.vdhist(i32, i32, mask16)
 
 
+@pytest.mark.pto
 def test_pto_gather_rejects_non_ub_buffer():
     with pytest.raises(TypeError, match="requires a UB pointer"):
 
@@ -494,6 +614,7 @@ def test_pto_gather_rejects_non_ub_buffer():
                 T.evaluate(T.vmi.vgather(A[0], offsets, mask))
 
 
+@pytest.mark.pto
 def test_pto_vload_supports_buffer_address_and_pointer_offset(monkeypatch):
     class FakeBuffer:
         pass
@@ -560,6 +681,7 @@ def test_pto_vload_supports_buffer_address_and_pointer_offset(monkeypatch):
     assert calls[-1][2] == (ptr, 7)
 
 
+@pytest.mark.pto
 def test_pto_loads_derive_element_dtype_from_real_pointer_annotations(monkeypatch):
     monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
     monkeypatch.setattr(
@@ -589,6 +711,7 @@ def test_pto_loads_derive_element_dtype_from_real_pointer_annotations(monkeypatc
         lambda source, offsets, mask: T.vmi.vgatherb(source, offsets, mask),
     ],
 )
+@pytest.mark.pto
 def test_pto_loads_reject_pointer_without_element_dtype(monkeypatch, call):
     monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
     source = T.ptr(storage_scope="shared")
@@ -599,6 +722,7 @@ def test_pto_loads_reject_pointer_without_element_dtype(monkeypatch, call):
         call(source, offsets, mask)
 
 
+@pytest.mark.pto
 def test_pto_vstore_supports_buffer_address_and_pointer_offset(monkeypatch):
     class FakeBuffer:
         pass
@@ -663,6 +787,7 @@ def test_pto_vstore_supports_buffer_address_and_pointer_offset(monkeypatch):
     assert calls[-1][2][1:4] == (ptr, 7, "pred")
 
 
+@pytest.mark.pto
 def test_pto_pair_unpacks_and_indexes_once(monkeypatch):
     calls = []
 
@@ -687,6 +812,7 @@ def test_pto_pair_unpacks_and_indexes_once(monkeypatch):
     assert len(pair) == 2
 
 
+@pytest.mark.pto
 def test_pto_vload_dintlv_returns_pair(monkeypatch):
     calls = []
 
@@ -728,6 +854,7 @@ def test_pto_vload_dintlv_returns_pair(monkeypatch):
     assert pair[1][2] == "tl.vmi.pair_get"
 
 
+@pytest.mark.pto
 def test_vmi_fp4_rejects_unsupported_paths(monkeypatch):
     monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
     fp4 = SimpleNamespace(dtype="float4_e2m1fnx256")
@@ -744,6 +871,7 @@ def test_vmi_fp4_rejects_unsupported_paths(monkeypatch):
         T.vmi.vsel(SimpleNamespace(dtype="boolx256"), fp4, fp4)
 
 
+@pytest.mark.pto
 def test_vmi_fp4_vcvt_validates_pto_specific_options(monkeypatch):
     calls = []
     monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
@@ -762,6 +890,7 @@ def test_vmi_fp4_vcvt_validates_pto_specific_options(monkeypatch):
         T.vmi.vcvt(bf16, "float4_e2m1fn", saturate="SAT")
 
 
+@pytest.mark.pto
 def test_vmi_gather_rejects_packed_fp4_source(monkeypatch):
     monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
     fp4_ptr = SimpleNamespace(dtype="ptr", type_annotation=SimpleNamespace(element_type=SimpleNamespace(dtype="float4_e2m1fn")))
@@ -774,6 +903,7 @@ def test_vmi_gather_rejects_packed_fp4_source(monkeypatch):
         T.vmi.vgatherb(fp4_ptr, offsets, mask)
 
 
+@pytest.mark.pto
 def test_vmi_fp4_vstore_requires_physical_mask_lanes(monkeypatch):
     monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
     monkeypatch.setattr(T.vmi, "_call_vmi", lambda *args, **kwargs: "ok")
@@ -785,6 +915,7 @@ def test_vmi_fp4_vstore_requires_physical_mask_lanes(monkeypatch):
     assert T.vmi.vstore(fp4, ptr, mask=SimpleNamespace(dtype="boolx128")) == "ok"
 
 
+@pytest.mark.pto
 def test_vmi_vstore_dintlv_rejects_mismatched_pair_types(monkeypatch):
     monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
     with pytest.raises(TypeError, match="requires identical VMI vector types"):
@@ -795,6 +926,7 @@ def test_vmi_vstore_dintlv_rejects_mismatched_pair_types(monkeypatch):
         )
 
 
+@pytest.mark.pto
 def test_vmi_fp4_vload_keeps_logical_size_and_packs_offset(monkeypatch):
     calls = []
     monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
@@ -824,6 +956,7 @@ def test_vmi_fp4_vload_keeps_logical_size_and_packs_offset(monkeypatch):
     )
 
 
+@pytest.mark.pto
 def test_vmi_fp4_rejects_non_contiguous_modes(monkeypatch):
     monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
     fp4_ptr = SimpleNamespace(dtype="ptr", type_annotation=SimpleNamespace(element_type=SimpleNamespace(dtype="float4_e2m1fn")))
@@ -835,6 +968,7 @@ def test_vmi_fp4_rejects_non_contiguous_modes(monkeypatch):
         T.vmi.vstore(SimpleNamespace(dtype="float4_e2m1fnx256"), fp4_ptr, group=2, stride=128)
 
 
+@pytest.mark.pto
 def test_pto_pair_return_path_can_be_reused_for_vstore(monkeypatch):
     pair = T.vmi.VmiPair(SimpleNamespace(dtype="float32x64"))
     calls = []
@@ -862,6 +996,7 @@ def test_pto_pair_return_path_can_be_reused_for_vstore(monkeypatch):
     assert calls[-1][2][1][2] == "tl.vmi.pair_get"
 
 
+@pytest.mark.pto
 def test_pto_codegen_emits_static_local_register_lists():
     @T.prim_func
     def func(A: T.Buffer((64,), "float32"), B: T.Buffer((64,), "float32")):
@@ -884,6 +1019,7 @@ def test_pto_codegen_emits_static_local_register_lists():
     assert re.search(r"pto\.vmi\.vadd\([^\n]*\[0\], [^\n]*\[3\]", source)
 
 
+@pytest.mark.pto
 def test_pto_codegen_emits_range_for_non_explicit_unroll():
     @T.prim_func
     def func(A: T.Buffer((256,), "float32"), B: T.Buffer((256,), "float32")):
@@ -899,6 +1035,7 @@ def test_pto_codegen_emits_range_for_non_explicit_unroll():
     lower(func, target="pto")
 
 
+@pytest.mark.pto
 def test_pto_codegen_rejects_non_explicit_unroll_local_register_index():
     @T.prim_func
     def func():
@@ -911,6 +1048,7 @@ def test_pto_codegen_rejects_non_explicit_unroll_local_register_index():
         lower(func, target="pto")
 
 
+@pytest.mark.pto
 def test_pto_codegen_rejects_runtime_local_register_index():
     @T.prim_func
     def func():
@@ -923,6 +1061,7 @@ def test_pto_codegen_rejects_runtime_local_register_index():
         lower(func, target="pto")
 
 
+@pytest.mark.pto
 def test_pto_codegen_emits_vector_calls_and_pair_indexing():
     @T.prim_func
     def func(A: T.Buffer((64,), "float32"), B: T.Buffer((64,), "float32")):
@@ -953,6 +1092,28 @@ def test_pto_codegen_emits_vector_calls_and_pair_indexing():
     assert "[1]" in source
 
 
+@pytest.mark.pto
+def test_pto_codegen_preserves_vmi_merge_mode():
+    @T.prim_func
+    def func(A: T.Buffer((64,), "float32"), B: T.Buffer((64,), "float32")):
+        with T.Kernel(1) as _:
+            a_ub = T.alloc_shared((64,), "float32")
+            b_ub = T.alloc_shared((64,), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF():
+                mask = T.vmi.create_mask(37, size=64)
+                x = T.vmi.vload(a_ub[0], size=64)
+                y = T.vmi.vbrc(T.float32(1), size=64)
+                merged = T.vmi.vdiv(x, y, mask, pmode="merge")
+                T.vmi.vstore(merged, b_ub[0], mask)
+            T.copy(b_ub, B)
+
+    source = lower(func, target="pto").kernel_source
+    assert "pto.vmi.vdiv(" in source
+    assert 'pmode="merge"' in source
+
+
+@pytest.mark.pto
 def test_pto_codegen_keeps_dintlv_vstore_pair_grouped():
     @T.prim_func
     def func(A: T.Buffer((64,), "float32"), B: T.Buffer((64,), "float32")):
@@ -973,6 +1134,7 @@ def test_pto_codegen_keeps_dintlv_vstore_pair_grouped():
     assert not re.search(r"pto\.vmi\.vstore\(\(.+\)\[0\], \(.+\)\[1\], ", vstore_line)
 
 
+@pytest.mark.pto
 def test_pto_codegen_covers_every_public_vector_op():
     @T.prim_func
     def func(
@@ -1107,6 +1269,7 @@ def test_pto_codegen_covers_every_public_vector_op():
     assert "pto.vmi.vinterpret_cast(" not in source or "to_dtype=pto.f32" in source
 
 
+@pytest.mark.pto
 def test_pto_codegen_wraps_literal_scalar_sources_by_dtype():
     @T.prim_func
     def func():
@@ -1151,6 +1314,38 @@ def test_pto_codegen_wraps_literal_scalar_sources_by_dtype():
     assert "pto.vmi.vci(pto.si8(0), size=64)" in source
 
 
+@pytest.mark.pto
+def test_pto_codegen_vdup_types_scalar_sources():
+    """vdup must make PTOAS scalar/result element types explicit."""
+
+    @T.prim_func
+    def func(x: T.int32, f: T.float32):
+        with T.Kernel(1) as _, T.SimdVF():
+            mask = T.vmi.create_mask(64, size=64)
+            # Integer literals lose signedness when printed bare; the target
+            # element type must therefore be materialized in the PTO source.
+            signed = T.simd.vdup(T.int32(1), "int32", mask)
+            unsigned = T.simd.vdup(T.int32(1), "uint32", mask)
+            matching = T.simd.vdup(x, "int32", mask)
+            dynamic = T.simd.vdup(x, "uint32", mask)
+            float_to_int = T.simd.vdup(T.float32(1.5), "int32", mask)
+            dynamic_float_to_int = T.simd.vdup(f, "int32", mask)
+            T.evaluate(signed)
+            T.evaluate(unsigned)
+            T.evaluate(matching)
+            T.evaluate(dynamic)
+            T.evaluate(float_to_int)
+            T.evaluate(dynamic_float_to_int)
+
+    source = lower(func, target="pto").kernel_source
+    assert "pto.vdup(pto.si32(1)," in source
+    assert "pto.vdup(pto.ui32(1)," in source
+    assert "pto.vdup(x, mask)" in source
+    assert "pto.vdup(scalar.cast(x, pto.ui32)," in source
+    assert 'pto.vcvt(pto.vdup(pto.f32(float.fromhex(\'0x1.8p+0\')), mask), pto.si32, mask, rnd="Z", sat="SAT")' in source
+    assert 'pto.vcvt(pto.vdup(f, mask), pto.si32, mask, rnd="Z", sat="SAT")' in source
+
+
 @pytest.mark.parametrize(
     ("source_dtype", "target_dtype", "signed_dtype"),
     [
@@ -1160,6 +1355,7 @@ def test_pto_codegen_wraps_literal_scalar_sources_by_dtype():
         ("float32", "int64", "pto.si64"),
     ],
 )
+@pytest.mark.pto
 def test_pto_codegen_uses_signed_integers_for_vcvt(source_dtype, target_dtype, signed_dtype):
     @T.prim_func
     def func(A: T.Buffer((256,), source_dtype)):
@@ -1177,6 +1373,7 @@ def test_pto_codegen_uses_signed_integers_for_vcvt(source_dtype, target_dtype, s
     assert f"to_dtype=pto.i{target_dtype.removeprefix('int')}" not in source
 
 
+@pytest.mark.pto
 def test_vmi_pto_codegen_uses_physical_fp4_storage_units():
     @T.prim_func
     def func(
@@ -1203,6 +1400,7 @@ def test_vmi_pto_codegen_uses_physical_fp4_storage_units():
     assert "size=(256 // 2)" in vload_line
 
 
+@pytest.mark.pto
 def test_vmi_pto_codegen_preserves_physical_fp4_mask_group():
     @T.prim_func
     def func(
@@ -1221,6 +1419,7 @@ def test_vmi_pto_codegen_preserves_physical_fp4_mask_group():
     assert "physical_mask = pto.vmi.create_mask(4, group=4, size=128)" in source
 
 
+@pytest.mark.pto
 def test_pto_codegen_rejects_non_pto_ascend_backend():
     # Use a boolx256 mask so Ascend SimdVF type checks (#353) pass and we still
     # hit the VMI-on-AscendC rejection (boolx64 masks fail earlier on predicates).
@@ -1234,6 +1433,7 @@ def test_pto_codegen_rejects_non_pto_ascend_backend():
         lower(func, target="ascend")
 
 
+@pytest.mark.pto
 def test_simdvf_pto_codegen_still_emits_existing_simd_source():
     @T.prim_func
     def func(A: T.Buffer((64,), "float32"), B: T.Buffer((64,), "float32")):
@@ -1281,11 +1481,13 @@ def test_empty_simdvf_pto_codegen_emits_valid_python():
 
 
 @pytest.mark.parametrize("op_name", PTO_VMI_OPAQUE_OPS)
+@pytest.mark.pto
 def test_pto_builtin_effects_are_opaque(op_name):
     effect = T.vmi.tirx.op.Op.get(f"tl.vmi.{op_name}").get_attr("TCallEffectKind")
     assert effect == T.vmi.tirx.CallEffectKind.Opaque
 
 
+@pytest.mark.pto
 def test_pto_pair_get_is_pure():
     effect = T.vmi.tirx.op.Op.get("tl.vmi.pair_get").get_attr("TCallEffectKind")
     assert effect == T.vmi.tirx.CallEffectKind.Pure
@@ -1299,6 +1501,7 @@ def test_pto_pair_get_is_pure():
         lambda: T.vmi.vreg(64, T.float32x2),
     ],
 )
+@pytest.mark.pto
 def test_pto_type_helpers_reject_invalid_input(call):
     with pytest.raises((TypeError, ValueError)):
         call()
