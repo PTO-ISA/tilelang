@@ -125,7 +125,6 @@ def test_ascend_simd_mem_bar_pto_codegen():
     assert "pto.mem_bar(pto.BarrierType.VST_VLD)" in source
 
 
-
 @pytest.mark.parametrize("dtype", ["int32", "uint32"])
 def test_ascend_simd_vaddc_codegen(dtype):
     @T.prim_func
