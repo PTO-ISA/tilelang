@@ -1,5 +1,7 @@
 """Source-level coverage for PTO modules containing multiple kernels."""
 
+import pytest
+
 from tilelang import tvm
 import tilelang.ascend.language as T
 from tilelang.backend.target import determine_target
@@ -21,6 +23,7 @@ def _two_kernel_program():
     return main
 
 
+@pytest.mark.pto
 def test_pto_wrapper_supports_multiple_device_kernels_in_host_call_order():
     program = _two_kernel_program()
     module = tvm.IRModule({"main": program})
