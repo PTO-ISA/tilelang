@@ -5,9 +5,22 @@ import torch
 import tilelang
 from tilelang.ascend import language as T
 from tilelang.ascend.language import simd as S
+from tilelang.ascend.target import normalize_pto_target
+from tilelang.engine.lower import lower as _lower
+from tvm.target import Target
 
 
-def bitwise_kernel(n):
+def _lower_in_target(func, target, **kwargs):
+    resolved_target = normalize_pto_target(target) if target == "pto" else Target(target)
+    with resolved_target:
+        return _lower(func, target=resolved_target, **kwargs)
+
+
+def bitwise_kernel(n, backend="asc"):
+    lanes = 64
+    if backend == "pto" and n != lanes:
+        raise ValueError(f"PTO bitwise test requires {lanes} lanes, got {n}")
+
     @T.prim_func
     def main(
         A: T.Tensor((n,), "int32"),
@@ -24,20 +37,28 @@ def bitwise_kernel(n):
             T.copy(A, a_ub)
             T.copy(B, b_ub)
             with T.SimdVF():
-                mask = T.simd.pset(32)
-                a = T.simd.vld(a_ub[0])
-                b = T.simd.vld(b_ub[0])
-                T.simd.vsts(xor_ub[0], T.simd.vxor(a, b), mask)
-                T.simd.vsts(not_ub[0], T.simd.vnot(a), mask)
+                if backend == "pto":
+                    mask = T.vmi.create_mask(lanes, size=lanes)
+                    a = T.vmi.vload(a_ub[0], size=lanes)
+                    b = T.vmi.vload(b_ub[0], size=lanes)
+                    T.vmi.vstore(T.vmi.vxor(a, b, mask), xor_ub[0], mask)
+                    T.vmi.vstore(T.vmi.vnot(a, mask), not_ub[0], mask)
+                else:
+                    mask = T.simd.pset(32)
+                    a = T.simd.vld(a_ub[0])
+                    b = T.simd.vld(b_ub[0])
+                    T.simd.vsts(xor_ub[0], T.simd.vxor(a, b), mask)
+                    T.simd.vsts(not_ub[0], T.simd.vnot(a), mask)
             T.copy(xor_ub, Xor)
             T.copy(not_ub, Not)
 
     return main
 
 
-def test_simdvf_vxor_vnot():
+@pytest.mark.parametrize("backend", ["asc", pytest.param("pto", marks=pytest.mark.pto)])
+def test_simdvf_vxor_vnot(backend):
     n = 64
-    kernel = tilelang.compile(bitwise_kernel(n), target="ascend", out_idx=[2, 3])
+    kernel = tilelang.compile(bitwise_kernel(n, backend), target=backend, out_idx=[2, 3])
     device = torch.device("npu")
     a = torch.randint(-(2**30), 2**30, (n,), dtype=torch.int32, device="cpu").to(device)
     b = torch.randint(-(2**30), 2**30, (n,), dtype=torch.int32, device="cpu").to(device)
@@ -49,7 +70,7 @@ def test_simdvf_vxor_vnot():
     torch.testing.assert_close(not_.cpu(), torch.bitwise_not(a.cpu()), rtol=0, atol=0)
 
 
-def vcpadd_kernel():
+def vcpadd_kernel(backend="asc"):
     @T.prim_func
     def main(A: T.Tensor((64,), "float32"), B: T.Tensor((32,), "float32")):
         with T.Kernel(1):
@@ -58,17 +79,30 @@ def vcpadd_kernel():
 
             T.copy(A, a_ub)
             with T.SimdVF():
-                low_half = T.simd.pset(32, "PAT_VL32")
-                src = T.simd.vld(a_ub[0])
-                result = T.simd.vcpadd(src)
-                T.simd.vsts(b_ub[0], result, low_half, extent=32)
+                if backend == "pto":
+                    # Emulate Ascend vcpadd: pairwise even/odd lane sums into 32 results.
+                    full = T.vmi.create_mask(64, size=64)
+                    src = T.vmi.vload(a_ub[0], size=64)
+                    zeros = T.vmi.vbrc(T.float32(0), size=64)
+                    even, odd = T.vmi.vdintlv(src, zeros, full)
+                    T.vmi.vstore(
+                        T.vmi.vadd(even, odd, full),
+                        b_ub[0],
+                        T.vmi.create_mask(32, size=64),
+                    )
+                else:
+                    low_half = T.simd.pset(32, "PAT_VL32")
+                    src = T.simd.vld(a_ub[0])
+                    result = T.simd.vcpadd(src)
+                    T.simd.vsts(b_ub[0], result, low_half, extent=32)
             T.copy(b_ub, B)
 
     return main
 
 
-def test_simdvf_vcpadd():
-    kernel = tilelang.compile(vcpadd_kernel(), target="ascend", out_idx=-1)
+@pytest.mark.parametrize("backend", ["asc", pytest.param("pto", marks=pytest.mark.pto)])
+def test_simdvf_vcpadd(backend):
+    kernel = tilelang.compile(vcpadd_kernel(backend), target=backend, out_idx=-1)
     a = torch.arange(64, dtype=torch.float32, device="cpu").to("npu")
 
     result = kernel(a)
@@ -82,7 +116,7 @@ NUM_ITERS = 4
 LANES = 64
 
 
-def serial_vreg_accum_kernel():
+def serial_vreg_accum_kernel(backend="asc"):
     @T.prim_func
     def main(
         A: T.Tensor((NUM_ITERS * LANES,), T.float32),
@@ -96,21 +130,44 @@ def serial_vreg_accum_kernel():
             T.copy(A, a_ub)
             T.copy(B, b_ub)
             with T.SimdVF():
-                mask = T.simd.pset(32)
-                acc = T.simd.alloc_var(T.float32)
-                acc = T.simd.vdup(0.0, T.float32)
-                for i in T.serial(NUM_ITERS):
-                    a = T.simd.vld(a_ub[i * LANES])
-                    b = T.simd.vld(b_ub[i * LANES])
-                    T.simd.vmula(acc, a, b, mask)
-                T.simd.vsts(out_ub[0], acc, mask)
+                if backend == "pto":
+                    mask = T.vmi.create_mask(LANES, size=LANES)
+                    acc = T.vmi.alloc_var(T.float32, size=LANES)
+                    acc = T.vmi.vbrc(T.float32(0), size=LANES)
+                    for i in T.serial(NUM_ITERS):
+                        a = T.vmi.vload(a_ub[i * LANES], size=LANES)
+                        b = T.vmi.vload(b_ub[i * LANES], size=LANES)
+                        acc = T.vmi.vmula(acc, a, b, mask)
+                    T.vmi.vstore(acc, out_ub[0], mask)
+                else:
+                    mask = T.simd.pset(32)
+                    acc = T.simd.alloc_var(T.float32)
+                    acc = T.simd.vdup(0.0, T.float32)
+                    for i in T.serial(NUM_ITERS):
+                        a = T.simd.vld(a_ub[i * LANES])
+                        b = T.simd.vld(b_ub[i * LANES])
+                        T.simd.vmula(acc, a, b, mask)
+                    T.simd.vsts(out_ub[0], acc, mask)
             T.copy(out_ub, Out)
 
     return main
 
 
-def test_serial_vreg_accum():
-    kernel = tilelang.compile(serial_vreg_accum_kernel(), target="ascend", out_idx=[2])
+@pytest.mark.pto
+def test_serial_vreg_accum_pto_codegen_carries_local_var():
+    source = _lower_in_target(serial_vreg_accum_kernel("pto"), "pto").kernel_source
+    assert "pto.vmi.vmula" in source
+    assert "T.unroll" not in source
+    assert "pto.static_range" not in source
+    has_python_range = " in range(" in source
+    has_explicit_carry = ".carry(" in source
+    assert has_python_range or has_explicit_carry, source
+    assert "with pto.for_(" not in source or has_explicit_carry, source
+
+
+@pytest.mark.parametrize("backend", ["asc", pytest.param("pto", marks=pytest.mark.pto)])
+def test_serial_vreg_accum(backend):
+    kernel = tilelang.compile(serial_vreg_accum_kernel(backend), target=backend, out_idx=[2])
     device = torch.device("npu")
     torch.manual_seed(0)
     a = torch.randn(NUM_ITERS * LANES, dtype=torch.float32, device=device)
@@ -159,7 +216,8 @@ def test_vlrelu_vprelu():
 
 
 @pytest.mark.parametrize("dtype", ["float32", "float16"])
-def test_absolute_difference(dtype):
+@pytest.mark.parametrize("backend", ["asc", pytest.param("pto", marks=pytest.mark.pto)])
+def test_absolute_difference(dtype, backend):
     lanes = 2048 // tilelang.tvm.DataType(dtype).bits
 
     @T.prim_func
@@ -171,11 +229,26 @@ def test_absolute_difference(dtype):
             T.copy(a, left)
             T.copy(b, right)
             with T.SimdVF():
-                mask = T.simd.pset(2048 // lanes)
-                T.simd.vsts(result[0], T.simd.vabsdif(T.simd.vld(left[0]), T.simd.vld(right[0]), mask), mask)
+                if backend == "pto":
+                    mask = T.vmi.create_mask(lanes, size=lanes)
+                    T.vmi.vstore(
+                        T.vmi.vabs(
+                            T.vmi.vsub(
+                                T.vmi.vload(left[0], size=lanes),
+                                T.vmi.vload(right[0], size=lanes),
+                                mask,
+                            ),
+                            mask,
+                        ),
+                        result[0],
+                        mask,
+                    )
+                else:
+                    mask = T.simd.pset(2048 // lanes)
+                    T.simd.vsts(result[0], T.simd.vabsdif(T.simd.vld(left[0]), T.simd.vld(right[0]), mask), mask)
             T.copy(result, out)
 
-    run = tilelang.compile(kernel, target="ascend", out_idx=-1)
+    run = tilelang.compile(kernel, target=backend, out_idx=-1)
     a = torch.randn(lanes, dtype=getattr(torch, dtype), device="npu")
     b = torch.randn_like(a)
     torch.testing.assert_close(run(a, b), (a - b).abs(), rtol=0, atol=0)
