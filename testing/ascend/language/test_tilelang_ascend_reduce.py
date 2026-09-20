@@ -5,6 +5,7 @@ import torch
 import tilelang
 import tilelang.ascend.language as T
 import tilelang.testing
+from tilelang.backend.target import determine_target
 
 DTYPE_MAP = {"float32": torch.float32, "int32": torch.int32, "int64": torch.int64}
 
@@ -134,7 +135,9 @@ def test_reducer_v2_rejects_unsupported_bitwise_collectives(op, target):
             T.finalize_reducer(partial, result)
             T.copy(result, B)
 
-    with pytest.raises(Exception, match="bitand, bitor, and bitxor are not supported"):
+    # tilelang.lower expects the caller to hold the target scope; the
+    # vectorize planner consults Target.current().
+    with determine_target(target, return_object=True), pytest.raises(Exception, match="bitand, bitor, and bitxor are not supported"):
         tilelang.lower(kernel, target=target)
 
 
@@ -187,7 +190,9 @@ def test_pto_reducer_v2_rejects_bfloat16_allreduce():
             T.finalize_reducer(partial, result)
             T.copy(result, B)
 
-    with pytest.raises(Exception, match="PTO cross-thread allreduce.*got bfloat16"):
+    # tilelang.lower expects the caller to hold the target scope; the
+    # vectorize planner consults Target.current().
+    with determine_target("pto", return_object=True), pytest.raises(Exception, match="PTO cross-thread allreduce.*got bfloat16"):
         tilelang.lower(kernel, target="pto")
 
 
