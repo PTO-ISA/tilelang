@@ -1171,8 +1171,9 @@ void CodeGenTileLangPTO::AddFunction(const GlobalVar &gvar,
   fragment_info_.clear();
   local_var_buffers_.clear();
   inside_simtvf_body_ = false;
-  inside_dynamic_control_flow_ = 0;
   rng_state_var_.clear();
+  unroll_factor_.clear();
+  explicit_unroll_vars_.clear();
   persistent_buffer_vars_ = SimtPersistentBufferCollector().Collect(func->body);
   current_function_has_mixed_sections_ = false;
   int64_t cube_section_count = 0;
@@ -2124,26 +2125,6 @@ std::string CodeGenTileLangPTO::LocalVarID(const VarNode *var) {
 
 bool CodeGenTileLangPTO::IsLocalVarBuffer(const VarNode *var) const {
   return local_var_buffers_.count(var) != 0;
-}
-
-std::vector<const VarNode *>
-CodeGenTileLangPTO::CollectLoopCarriedLocalVars(const Stmt &body) const {
-  std::vector<const VarNode *> carry_vars;
-  std::unordered_set<const VarNode *> seen;
-  PostOrderVisit(body, [&](const ObjectRef &node) {
-    const auto *store = node.as<BufferStoreNode>();
-    if (store == nullptr) {
-      return;
-    }
-    const VarNode *var = store->buffer->data.get();
-    if (!IsLocalVarBuffer(var) || store->buffer->dtype.lanes() <= 1) {
-      return;
-    }
-    if (seen.insert(var).second) {
-      carry_vars.push_back(var);
-    }
-  });
-  return carry_vars;
 }
 
 bool CodeGenTileLangPTO::IsVmiLocalRegisterBuffer(
@@ -3246,14 +3227,8 @@ void CodeGenTileLangPTO::PrintPtoIfThenElse_(const CallNode *op,
   PrintIndent();
   stream << "if " << condition << ":\n";
   int then_scope = BeginScope();
-  if (is_dynamic) {
-    ++inside_dynamic_control_flow_;
-  }
   std::ostringstream true_value;
   PrintPtoSelectValue_(op->args[1], op->dtype, true_value);
-  if (is_dynamic) {
-    --inside_dynamic_control_flow_;
-  }
   PrintIndent();
   stream << result << " = " << true_value.str() << "\n";
   EndScope(then_scope);
@@ -3261,14 +3236,8 @@ void CodeGenTileLangPTO::PrintPtoIfThenElse_(const CallNode *op,
   PrintIndent();
   stream << "else:\n";
   int else_scope = BeginScope();
-  if (is_dynamic) {
-    ++inside_dynamic_control_flow_;
-  }
   std::ostringstream false_value;
   PrintPtoSelectValue_(op->args[2], op->dtype, false_value);
-  if (is_dynamic) {
-    --inside_dynamic_control_flow_;
-  }
   PrintIndent();
   stream << result << " = " << false_value.str() << "\n";
   EndScope(else_scope);
@@ -4562,12 +4531,47 @@ void CodeGenTileLangPTO::VisitStmt_(const AttrStmtNode *op) {
     return;
   }
 
+  if (op->attr_key == "pragma_unroll_factor") {
+    const auto *factor = op->value.as<IntImmNode>();
+    ICHECK(factor != nullptr)
+        << "pragma_unroll_factor must be a constant integer, got " << op->value;
+    ICHECK_GT(factor->value, 0)
+        << "pragma_unroll_factor must be positive, got " << factor->value;
+    // PTODSL/PTOAS encode unroll_factor as a signless i32; reject values that
+    // would only fail later during PTODSL tracing.
+    ICHECK_LE(factor->value, std::numeric_limits<int32_t>::max())
+        << "pragma_unroll_factor exceeds the signless i32 range supported by "
+           "PTODSL/PTOAS, got "
+        << factor->value;
+    const auto *loop_var = op->node.as<VarNode>();
+    ICHECK(loop_var != nullptr)
+        << "pragma_unroll_factor must annotate a loop variable";
+    unroll_factor_[loop_var] = factor->value;
+    VisitStmt(op->body);
+    return;
+  }
+
+  if (op->attr_key == tirx::attr::pragma_unroll_explicit) {
+    const auto *flag = op->value.as<IntImmNode>();
+    ICHECK(flag != nullptr && (flag->value == 0 || flag->value == 1))
+        << "pragma_unroll_explicit must be a boolean, got " << op->value;
+    const auto *loop_var = op->node.as<VarNode>();
+    ICHECK(loop_var != nullptr)
+        << "pragma_unroll_explicit must annotate a loop variable";
+    if (flag->value != 0) {
+      explicit_unroll_vars_.insert(loop_var);
+    }
+    VisitStmt(op->body);
+    return;
+  }
+
   VisitStmt(op->body);
 }
 
 void CodeGenTileLangPTO::VisitStmt_(const ForNode *op) {
-  // Trace-time Python iteration is safe only for explicitly unrolled loops
-  // whose full triplet is known. Every other loop must remain device-side.
+  // Loops stay device-side so the compiler (PTOAS/LLVM) decides unrolling.
+  // Every kUnrolled loop forwards a hint through pto.range: unroll_factor=N
+  // when annotated, otherwise the weak unroll="enable" hint.
   arith::Analyzer analyzer;
   PrimExpr start = analyzer.Simplify(op->min);
   PrimExpr extent = analyzer.Simplify(op->extent);
@@ -4575,13 +4579,14 @@ void CodeGenTileLangPTO::VisitStmt_(const ForNode *op) {
                                        : make_const(op->loop_var.dtype(), 1);
   PrimExpr stop = analyzer.Simplify(start + extent);
 
-  int64_t start_value = 0;
-  int64_t extent_value = 0;
-  int64_t step_value = 0;
-  const bool use_static_range = op->kind == tirx::ForKind::kUnrolled &&
-                                TryGetConstInt(start, &start_value) &&
-                                TryGetConstInt(extent, &extent_value) &&
-                                TryGetConstInt(step, &step_value);
+  const bool is_unrolled = op->kind == tirx::ForKind::kUnrolled;
+  const bool explicit_unroll =
+      explicit_unroll_vars_.count(op->loop_var.get()) > 0;
+  const auto factor_it = unroll_factor_.find(op->loop_var.get());
+  ICHECK(!(explicit_unroll && factor_it != unroll_factor_.end()))
+      << "T.unroll's explicit and unroll_factor params are mutually exclusive, "
+         "but both annotate loop "
+      << op->loop_var->name_hint;
 
   // Print bounds before the header so nested Let assignments land above it.
   std::string start_str = PrintExpr_(start);
@@ -4589,34 +4594,30 @@ void CodeGenTileLangPTO::VisitStmt_(const ForNode *op) {
   std::string step_str = PrintExpr_(step);
   PrintIndent();
   std::string vid = AllocVarID(op->loop_var.get());
-  const std::vector<const VarNode *> carry_vars =
-      use_static_range ? std::vector<const VarNode *>{}
-                       : CollectLoopCarriedLocalVars(op->body);
-  if (use_static_range) {
-    stream << "for " << vid << " in pto.static_range(" << start_str << ", "
-           << stop_str << ", " << step_str << "):\n";
-  } else if (!carry_vars.empty()) {
-    // Python range + PTODSL ast_rewrite infers scf.for iter_args from
-    // ``acc = f(acc, ...)`` stores of an outer vector local.var.
-    stream << "for " << vid << " in range(" << start_str << ", " << stop_str
-           << ", " << step_str << "):\n";
+  // The plain range is rewritten to scf.for by the PTODSL AST rewriter
+  // (iter_args inferred from ``acc = f(acc, ...)`` stores); hinted loops use
+  // the pto.range marker so the rewrite carries the hint keywords.
+  stream << "for " << vid << " in ";
+  if (is_unrolled) {
+    stream << "pto.range(" << start_str << ", " << stop_str << ", " << step_str;
+    if (factor_it != unroll_factor_.end()) {
+      stream << ", unroll_factor=" << factor_it->second;
+    } else {
+      stream << ", unroll=\"enable\"";
+    }
+    stream << "):\n";
   } else {
-    stream << "for " << vid << " in range(" << start_str << ", " << stop_str
-           << ", " << step_str << "):\n";
+    stream << "range(" << start_str << ", " << stop_str << ", " << step_str
+           << "):\n";
   }
   int scope = BeginScope();
-  if (!use_static_range) {
-    ++inside_dynamic_control_flow_;
-  }
   PrintStmt_(op->body);
   EndScope(scope);
-  if (!use_static_range) {
-    --inside_dynamic_control_flow_;
-  }
+  unroll_factor_.erase(op->loop_var.get());
+  explicit_unroll_vars_.erase(op->loop_var.get());
 }
 
 void CodeGenTileLangPTO::VisitStmt_(const WhileNode *op) {
-  ++inside_dynamic_control_flow_;
   std::string cond = RemoveOutermostParentheses(PrintExpr_(op->condition));
   PrintIndent();
   stream << "while " << cond << ":\n";
@@ -4628,7 +4629,6 @@ void CodeGenTileLangPTO::VisitStmt_(const WhileNode *op) {
     PrintStmt_(op->body);
   }
   EndScope(while_scope);
-  --inside_dynamic_control_flow_;
 }
 
 void CodeGenTileLangPTO::VisitStmt_(const SBlockNode *op) {
@@ -4707,34 +4707,18 @@ void CodeGenTileLangPTO::VisitStmt_(const SBlockNode *op) {
 }
 
 void CodeGenTileLangPTO::VisitStmt_(const IfThenElseNode *op) {
-  PrimExpr simplified_condition = arith::Analyzer().Simplify(op->condition);
-  int64_t constant_condition = 0;
-  const bool is_dynamic =
-      !TryGetConstInt(simplified_condition, &constant_condition);
   std::string cond = RemoveOutermostParentheses(PrintExpr_(op->condition));
   PrintIndent();
   stream << "if " << cond << ":\n";
   int if_scope = BeginScope();
-  if (is_dynamic) {
-    ++inside_dynamic_control_flow_;
-  }
   PrintStmt_(op->then_case);
-  if (is_dynamic) {
-    --inside_dynamic_control_flow_;
-  }
   EndScope(if_scope);
 
   if (op->else_case) {
     PrintIndent();
     stream << "else:\n";
     int else_scope = BeginScope();
-    if (is_dynamic) {
-      ++inside_dynamic_control_flow_;
-    }
     PrintStmt_(op->else_case.value());
-    if (is_dynamic) {
-      --inside_dynamic_control_flow_;
-    }
     EndScope(else_scope);
   }
 }
@@ -4765,10 +4749,6 @@ void CodeGenTileLangPTO::EmitRngInit(const CallNode *op) {
                                     "(seed, seq, off, generator)";
   ICHECK(inside_simtvf_body_)
       << "tl.rng_init on PTO must be used inside a T.SimtVF(...) block";
-  ICHECK_EQ(inside_dynamic_control_flow_, 0)
-      << "PTO RNG initialization is not supported inside dynamic control "
-         "flow; RNG state is tracked at trace time, so initialize it in "
-         "straight-line code before entering a dynamic branch or loop";
   // args[3] (generator string) is intentionally ignored, matching the Ascend
   // backend: both targets fix Philox as the generator.
   uses_rng_ = true;
@@ -4784,10 +4764,6 @@ std::string CodeGenTileLangPTO::EmitRngDrawExpr(const CallNode *op) {
   ICHECK(!rng_state_var_.empty())
       << "PTO RNG draw requires a preceding T.rng_init call in the same "
          "T.SimtVF(...) block";
-  ICHECK(inside_dynamic_control_flow_ == 0)
-      << "PTO RNG draw is not supported inside dynamic control flow; RNG "
-         "state is tracked at trace time, so use straight-line code or "
-         "statically unrolled loops (pto.static_range)";
   if (op->op.same_as(tl::rng_rand())) {
     ICHECK_EQ(op->args.size(), 0U) << "tl.rng_rand expects no arguments";
     return rng_state_var_ + ".rand()";
