@@ -162,10 +162,6 @@ private:
   // vector-level `pto.vdiv` used by this backend.
   bool enable_fast_math_{false};
   bool inside_simtvf_body_{false};
-  // Nonzero while emitting a runtime loop or a dynamic branch. PhiloxRNG owns
-  // trace-time SSA state, so initializing or drawing in device-side control
-  // flow would silently produce incorrect runtime state transitions.
-  int inside_dynamic_control_flow_{0};
   // Active Philox helper variable emitted by tl.rng_init. It is reset at each
   // PrimFunc and SIMT VF boundary because the helper owns section-local SSA
   // state and cannot be shared by sibling sections.
@@ -214,10 +210,6 @@ private:
   std::string LocalVarID(const VarNode *var);
   bool IsLocalVarBuffer(const VarNode *var) const;
   bool IsVmiLocalRegisterBuffer(const BufferNode *buffer) const;
-  // Vector local.var buffers allocated before ``for_stmt`` and stored in its
-  // body. These must be emitted as PTODSL loop-carried state for ``T.serial``.
-  std::vector<const VarNode *>
-  CollectLoopCarriedLocalVars(const Stmt &body) const;
   void CheckVmiLocalRegisterIndex(const BufferNode *buffer,
                                   const PrimExpr &index) const;
   bool HasAscendGemm(const PrimFunc &func) const;
@@ -228,6 +220,11 @@ private:
   bool has_gemm_l1_{false};
   std::unordered_map<const VarNode *, FragmentInfo> fragment_info_;
   std::unordered_set<const VarNode *> local_var_buffers_;
+  // Loop-unroll hints lifted by LowerOpaqueBlock into pragma AttrStmts that
+  // wrap a For loop. Keyed by loop var, consumed by VisitStmt_(ForNode) and
+  // erased after the loop body is printed.
+  std::unordered_map<const VarNode *, int64_t> unroll_factor_;
+  std::unordered_set<const VarNode *> explicit_unroll_vars_;
   std::unordered_map<Call, int64_t, ObjectPtrHash, ObjectPtrEqual>
       hf32_mode_by_cube_call_;
   // Pad bindings are resolved once before printing. The maps are keyed by the
