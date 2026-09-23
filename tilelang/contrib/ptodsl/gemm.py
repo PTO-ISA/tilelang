@@ -184,7 +184,7 @@ class PTOGemmL1Template:
     def _emit_l1_to_l0_static(self, a_mat, b_mat, a_l0_0, b_l0_0, sk: int):
         stage = sk & 1
         sub_k_storage_col = sk * self.sub_k_storage_cols
-        pto.wait_flag("M", "MTE1", event_id=stage)
+        pto.get_buf("MTE1", stage)
         if sk == 0:
             pto.mte_l1_l0a(a_mat, self._a_l0_stage(a_l0_0, stage), self.tile_m, self.base_k)
         else:
@@ -196,7 +196,7 @@ class PTOGemmL1Template:
                 start_col=sub_k_storage_col,
             )
         self._emit_l1_to_l0b_static(b_mat, b_l0_0, stage, sk)
-        pto.set_flag("MTE1", "M", event_id=stage)
+        pto.rls_buf("MTE1", stage)
 
     @staticmethod
     def _is_static_int(value):
@@ -317,7 +317,7 @@ class PTOGemmL1Template:
         tf32_mode,
     ):
         stage = sk & 1
-        pto.wait_flag("MTE1", "M", event_id=stage)
+        pto.get_buf("M", stage)
         if sk == 0 and not isinstance(clear_accum, bool):
             with pto.if_(clear_accum) as clear_br:
                 with clear_br.then_:
@@ -327,56 +327,7 @@ class PTOGemmL1Template:
         else:
             use_mad = sk == 0 and bool(clear_accum)
             self._emit_mad_with_unit_flag(a_l0_0, b_l0_0, acc, sk, use_mad, unit_flag_ctrl, tf32_mode)
-        pto.set_flag("M", "MTE1", event_id=stage)
-
-    def _emit_pipeline_init(self):
-        pto.set_flag("M", "MTE1", event_id=0)
-        pto.set_flag("M", "MTE1", event_id=1)
-
-    def _emit_pipeline_drain(self):
-        pto.wait_flag("M", "MTE1", event_id=0)
-        pto.wait_flag("M", "MTE1", event_id=1)
-
-    def _emit_pipeline_init_if_enabled_first_k(self, clear_accum):
-        if isinstance(clear_accum, (bool, int)):
-            if bool(clear_accum):
-                self._emit_pipeline_init()
-            return
-
-        with pto.if_(clear_accum) as first_k, first_k.then_:
-            self._emit_pipeline_init()
-
-    def _emit_pipeline_init_for_tile(self, clear_accum, unit_flag_ctrl):
-        if self._is_static_int(unit_flag_ctrl):
-            self._validate_static_unit_flag_ctrl(unit_flag_ctrl)
-            if unit_flag_ctrl == 0:
-                self._emit_pipeline_init()
-            else:
-                self._emit_pipeline_init_if_enabled_first_k(clear_accum)
-            return
-        if isinstance(unit_flag_ctrl, bool):
-            raise TypeError("unit_flag_ctrl must be 0, 2, or 3, not bool")
-
-        with pto.if_(unit_flag_ctrl == 0) as uf_disabled:
-            with uf_disabled.then_:
-                self._emit_pipeline_init()
-            with uf_disabled.else_:
-                self._emit_pipeline_init_if_enabled_first_k(clear_accum)
-
-    def _emit_pipeline_drain_for_tile(self, unit_flag_ctrl):
-        if self._is_static_int(unit_flag_ctrl):
-            self._validate_static_unit_flag_ctrl(unit_flag_ctrl)
-            if unit_flag_ctrl == 0 or unit_flag_ctrl == 3:
-                self._emit_pipeline_drain()
-            return
-        if isinstance(unit_flag_ctrl, bool):
-            raise TypeError("unit_flag_ctrl must be 0, 2, or 3, not bool")
-
-        with pto.if_(unit_flag_ctrl == 0) as uf_disabled:
-            with uf_disabled.then_:
-                self._emit_pipeline_drain()
-            with uf_disabled.else_, pto.if_(unit_flag_ctrl == 3) as last_k, last_k.then_:
-                self._emit_pipeline_drain()
+        pto.rls_buf("M", stage)
 
     def run_l1_tile(
         self,
@@ -392,12 +343,9 @@ class PTOGemmL1Template:
     ):
         """Emit GEMM for one L1 A/B tile into ``acc``."""
 
-        self._emit_pipeline_init_for_tile(clear_accum, unit_flag_ctrl)
-
         self._emit_l1_to_l0_static(a_mat, b_mat, a_l0_0, b_l0_0, 0)
         if self.sub_k_tiles == 1:
             self._emit_mad_static(a_l0_0, b_l0_0, acc, 0, clear_accum, unit_flag_ctrl, tf32_mode)
-            self._emit_pipeline_drain_for_tile(unit_flag_ctrl)
             return
 
         self._emit_l1_to_l0_static(a_mat, b_mat, a_l0_0, b_l0_0, 1)
@@ -414,7 +362,7 @@ class PTOGemmL1Template:
                 b_l0_0,
                 scalar.muli(l0_stage_i64, pto.const(self.b_l0_stage_elems, dtype=pto.int64)),
             )
-            pto.wait_flag("M", "MTE1", event_id=l0_stage)
+            pto.get_buf("MTE1", l0_stage)
             pto.mte_l1_l0a(
                 a_mat,
                 a_l0,
@@ -429,7 +377,7 @@ class PTOGemmL1Template:
                 self.tile_n,
                 start_col=sub_k_storage_col,
             )
-            pto.set_flag("MTE1", "M", event_id=l0_stage)
+            pto.rls_buf("MTE1", l0_stage)
 
             prev_stage = (sk - 1) % 2
             prev_stage_i64 = _coerce_i64(prev_stage, context="previous L0 stage index")
@@ -441,7 +389,7 @@ class PTOGemmL1Template:
                 b_l0_0,
                 scalar.muli(prev_stage_i64, pto.const(self.b_l0_stage_elems, dtype=pto.int64)),
             )
-            pto.wait_flag("MTE1", "M", event_id=prev_stage)
+            pto.get_buf("M", prev_stage)
             if self._is_static_int(unit_flag_ctrl):
                 pto.mad_acc(
                     a_l0_prev,
@@ -478,7 +426,7 @@ class PTOGemmL1Template:
                             unit_flag=pto.MadUnitFlagMode.CHECK_ONLY,
                             tf32_mode=tf32_mode,
                         )
-            pto.set_flag("M", "MTE1", event_id=prev_stage)
+            pto.rls_buf("M", prev_stage)
 
         self._emit_mad_static(
             a_l0_0,
@@ -489,7 +437,6 @@ class PTOGemmL1Template:
             unit_flag_ctrl,
             tf32_mode,
         )
-        self._emit_pipeline_drain_for_tile(unit_flag_ctrl)
 
 
 class PTOBlockscaledGemmL1Template(PTOGemmL1Template):
@@ -587,8 +534,7 @@ class PTOBlockscaledGemmL1Template(PTOGemmL1Template):
         sf_y = sf_k_offset + sk * self.sf_pairs_per_inner
         a_l0 = self._a_l0_stage(a_l0_0, stage)
         b_l0 = self._b_l0_stage(b_l0_0, stage)
-
-        pto.wait_flag("M", "MTE1", event_id=stage)
+        pto.get_buf("MTE1", stage)
         if sk == 0:
             pto.mte_l1_l0a(a_mat, a_l0, self.tile_m, self.base_k)
             pto.mte_l1_l0b(b_mat, b_l0, self.base_k, self.tile_n)
@@ -627,7 +573,7 @@ class PTOBlockscaledGemmL1Template(PTOGemmL1Template):
             src_stride=self.sf_nz_stride,
             dst_stride=self.sf_pairs_per_inner,
         )
-        pto.set_flag("MTE1", "M", event_id=stage)
+        pto.rls_buf("MTE1", stage)
 
     def _emit_mad_op(
         self,
@@ -683,8 +629,6 @@ class PTOBlockscaledGemmL1Template(PTOGemmL1Template):
     ):
         """Emit one blockscaled L1 tile with E8M0 scale staging."""
 
-        self._emit_pipeline_init_for_tile(clear_accum, unit_flag_ctrl)
-
         # Keep each MX stage ordered until a prefetching schedule is validated.
         for sk in range(self.sub_k_tiles):
             self._emit_l1_to_l0_static(
@@ -706,4 +650,3 @@ class PTOBlockscaledGemmL1Template(PTOGemmL1Template):
                 unit_flag_ctrl,
                 None,
             )
-        self._emit_pipeline_drain_for_tile(unit_flag_ctrl)
