@@ -100,7 +100,7 @@ def _collect_pto_calls(func):
     return calls
 
 
-@pytest.mark.parametrize("op_name,combine", [("fmax", T.max), ("fmin", T.min)])
+@pytest.mark.parametrize("op_name,combine", [("max", T.max), ("min", T.min)])
 @pytest.mark.pto
 def test_pto_float32x2_minmax_codegen(op_name, combine):
     @T.prim_func
@@ -121,7 +121,10 @@ def test_pto_float32x2_minmax_codegen(op_name, combine):
             T.copy(c_ub, C)
 
     source = _lower_in_target(func, "pto").kernel_source
-    assert f"_tl_vectorize_binary_f32x2(pto.{op_name}," in source
+    # The unified pto.min/max accept vector<2xf32> operands directly, so the
+    # lane-by-lane fallback is no longer emitted for binary min/max.
+    assert f"pto.{op_name}(" in source
+    assert "_tl_vectorize_binary_f32x2(pto.f" not in source
     compile(source, "<pto-float32x2-minmax>", "exec")
 
 
@@ -1350,7 +1353,7 @@ def test_pto_codegen_vdup_types_scalar_sources():
     assert "pto.vdup(pto.si32(1)," in source
     assert "pto.vdup(pto.ui32(1)," in source
     assert "pto.vdup(x, mask)" in source
-    assert "pto.vdup(scalar.cast(x, pto.ui32)," in source
+    assert "pto.vdup(pto.cast(x, pto.ui32)," in source
     assert 'pto.vcvt(pto.vdup(pto.f32(float.fromhex(\'0x1.8p+0\')), mask), pto.si32, mask, rnd="Z", sat="SAT")' in source
     assert 'pto.vcvt(pto.vdup(f, mask), pto.si32, mask, rnd="Z", sat="SAT")' in source
 

@@ -15,7 +15,7 @@ block every four draws" decision is a runtime ``pto.if_`` on the device, not a
 Python ``if`` at trace time.
 """
 
-from ptodsl import pto, scalar
+from ptodsl import pto
 
 # Philox4x32-10 constants, identical to random_kernel_base.h.
 _PHILOX_M4X32_A = 0xD2511F53
@@ -60,14 +60,14 @@ def _split_i64_bits(value):
     if isinstance(value, int):
         return _i32(value), _i32(value >> 32)
 
-    value64 = scalar.cast(value, pto.i64)
-    low = scalar.cast(value64, pto.i32)
+    value64 = pto.cast(value, pto.i64)
+    low = pto.cast(value64, pto.i32)
     high = pto.mulhi(
         value64,
         pto.const(1 << 32, dtype=pto.i64),
         signedness="unsigned",
     )
-    return low, scalar.cast(high, pto.i32)
+    return low, pto.cast(high, pto.i32)
 
 
 class PhiloxRNG:
@@ -101,18 +101,18 @@ class PhiloxRNG:
         ctr0, ctr1 = _split_i64_bits(block_offset)
         ctr2, ctr3 = _split_i64_bits(seq)
 
-        scalar.store(key0, self._state, _KEY0)
-        scalar.store(key1, self._state, _KEY1)
-        scalar.store(ctr0, self._state, _CTR0)
-        scalar.store(ctr1, self._state, _CTR1)
-        scalar.store(ctr2, self._state, _CTR2)
-        scalar.store(ctr3, self._state, _CTR3)
+        pto.store(key0, self._state, _KEY0)
+        pto.store(key1, self._state, _KEY1)
+        pto.store(ctr0, self._state, _CTR0)
+        pto.store(ctr1, self._state, _CTR1)
+        pto.store(ctr2, self._state, _CTR2)
+        pto.store(ctr3, self._state, _CTR3)
         # Buffer contents are irrelevant while idx == 4 (forces generation on
         # the first draw), but keep the state fully initialized anyway.
         for slot in (_BUF0, _BUF1, _BUF2, _BUF3):
-            scalar.store(_i32(0), self._state, slot)
-        scalar.store(_i32(4), self._state, _IDX)
-        scalar.store(_i32(0), self._state, _HAS_NORMAL)
+            pto.store(_i32(0), self._state, slot)
+        pto.store(_i32(4), self._state, _IDX)
+        pto.store(_i32(0), self._state, _HAS_NORMAL)
 
     @staticmethod
     def _mulhi(a, b):
@@ -130,20 +130,20 @@ class PhiloxRNG:
     def _generate(self):
         # PhiloxRandomSimt: 10 rounds on temporaries; the key is bumped after
         # every round. State slots are updated only after the block finishes.
-        c0 = scalar.load(self._state, _CTR0)
-        c1 = scalar.load(self._state, _CTR1)
-        c2 = scalar.load(self._state, _CTR2)
-        c3 = scalar.load(self._state, _CTR3)
-        k0 = scalar.load(self._state, _KEY0)
-        k1 = scalar.load(self._state, _KEY1)
+        c0 = pto.load(self._state, _CTR0)
+        c1 = pto.load(self._state, _CTR1)
+        c2 = pto.load(self._state, _CTR2)
+        c3 = pto.load(self._state, _CTR3)
+        k0 = pto.load(self._state, _KEY0)
+        k1 = pto.load(self._state, _KEY1)
         for _ in range(10):
             c0, c1, c2, c3 = self._round(c0, c1, c2, c3, k0, k1)
             k0 = k0 + _i32(_PHILOX_W32_A)
             k1 = k1 + _i32(_PHILOX_W32_B)
-        scalar.store(c0, self._state, _BUF0)
-        scalar.store(c1, self._state, _BUF1)
-        scalar.store(c2, self._state, _BUF2)
-        scalar.store(c3, self._state, _BUF3)
+        pto.store(c0, self._state, _BUF0)
+        pto.store(c1, self._state, _BUF1)
+        pto.store(c2, self._state, _BUF2)
+        pto.store(c3, self._state, _BUF3)
 
     def _skip_one(self):
         # 128-bit increment of (ctr0..ctr3) with explicit carry propagation,
@@ -152,56 +152,51 @@ class PhiloxRNG:
         # cannot be traced.
         one = _i32(1)
         zero = _i32(0)
-        ctr0 = scalar.load(self._state, _CTR0) + one
-        scalar.store(ctr0, self._state, _CTR0)
-        k1 = scalar.select(ctr0 == 0, one, zero)
-        ctr1 = scalar.load(self._state, _CTR1) + k1
-        scalar.store(ctr1, self._state, _CTR1)
-        k2 = scalar.select(ctr1 == 0, k1, zero)
-        ctr2 = scalar.load(self._state, _CTR2) + k2
-        scalar.store(ctr2, self._state, _CTR2)
-        k3 = scalar.select(ctr2 == 0, k2, zero)
-        ctr3 = scalar.load(self._state, _CTR3) + k3
-        scalar.store(ctr3, self._state, _CTR3)
+        ctr0 = pto.load(self._state, _CTR0) + one
+        pto.store(ctr0, self._state, _CTR0)
+        k1 = pto.select(ctr0 == 0, one, zero)
+        ctr1 = pto.load(self._state, _CTR1) + k1
+        pto.store(ctr1, self._state, _CTR1)
+        k2 = pto.select(ctr1 == 0, k1, zero)
+        ctr2 = pto.load(self._state, _CTR2) + k2
+        pto.store(ctr2, self._state, _CTR2)
+        k3 = pto.select(ctr2 == 0, k2, zero)
+        ctr3 = pto.load(self._state, _CTR3) + k3
+        pto.store(ctr3, self._state, _CTR3)
 
     def _rand_i32(self):
         # Regenerate the block when exhausted: a runtime branch on the device,
         # so the draw works inside device loops and runtime branches alike.
-        idx = scalar.load(self._state, _IDX)
+        idx = pto.load(self._state, _IDX)
         with pto.if_(idx >= 4) as br, br.then_:
             self._generate()
             self._skip_one()
-            scalar.store(_i32(0), self._state, _IDX)
-        idx = scalar.load(self._state, _IDX)
+            pto.store(_i32(0), self._state, _IDX)
+        idx = pto.load(self._state, _IDX)
         # Pick the buffer slot with a select tree: the slot index is a runtime
         # value, while buffer accesses here take compile-time-constant offsets.
-        buf0 = scalar.load(self._state, _BUF0)
-        buf1 = scalar.load(self._state, _BUF1)
-        buf2 = scalar.load(self._state, _BUF2)
-        buf3 = scalar.load(self._state, _BUF3)
-        out = scalar.select(
+        buf0 = pto.load(self._state, _BUF0)
+        buf1 = pto.load(self._state, _BUF1)
+        buf2 = pto.load(self._state, _BUF2)
+        buf3 = pto.load(self._state, _BUF3)
+        out = pto.select(
             idx == 0,
             buf0,
-            scalar.select(idx == 1, buf1, scalar.select(idx == 2, buf2, buf3)),
+            pto.select(idx == 1, buf1, pto.select(idx == 2, buf2, buf3)),
         )
-        scalar.store(idx + 1, self._state, _IDX)
+        pto.store(idx + 1, self._state, _IDX)
         return out
 
     def rand(self):
         """Draw one raw uint32 from the lane's stream, advancing the state."""
         # Reinterpret as ui32 at the boundary so the value matches uint32
         # buffers; the bit pattern is unchanged.
-        return scalar.cast(self._rand_i32(), pto.ui32)
+        return pto.cast(self._rand_i32(), pto.ui32)
 
     def rand_uniform(self):
         """Draw a float32 uniformly distributed in [0, 1)."""
-        value = pto.convert(
-            self._rand_i32(),
-            pto.f32,
-            rounding="r",
-            saturation="nosat",
-            signedness="unsigned",
-        )
+        raw = pto.cast(self._rand_i32(), pto.ui32)
+        value = pto.cast(raw, pto.f32, rounding="r", saturation="nosat")
         return value * _RAND_2POW32_INV + _RAND_2POW32_INV_HALF
 
     def rand_normal(self):
@@ -212,19 +207,19 @@ class PhiloxRNG:
                 "sin/cos SoftLib, PTOAS PR #1193); the current ptodsl build "
                 "does not provide them"
             )
-        has_normal = scalar.load(self._state, _HAS_NORMAL)
+        has_normal = pto.load(self._state, _HAS_NORMAL)
         with pto.if_(has_normal != 0) as br:
             with br.then_:
-                scalar.store(_i32(0), self._state, _HAS_NORMAL)
-                br.assign(out=scalar.load(self._normal_cache, 0))
+                pto.store(_i32(0), self._state, _HAS_NORMAL)
+                br.assign(out=pto.load(self._normal_cache, 0))
             with br.else_:
-                u1 = pto.fmax(self.rand_uniform(), _NORMAL_EPS)
+                u1 = pto.max(self.rand_uniform(), _NORMAL_EPS)
                 u2 = self.rand_uniform()
                 r = pto.sqrt(pto.log(u1) * -2.0)
                 v = u2 * _TWO_PI
                 z0 = r * pto.sin(v)
                 z1 = r * pto.cos(v)
-                scalar.store(z1, self._normal_cache, 0)
-                scalar.store(_i32(1), self._state, _HAS_NORMAL)
+                pto.store(z1, self._normal_cache, 0)
+                pto.store(_i32(1), self._state, _HAS_NORMAL)
                 br.assign(out=z0)
         return br.out

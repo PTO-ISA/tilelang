@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ptodsl import pto, scalar
+from ptodsl import pto
 from ptoas.mlir.dialects import arith
 from ptoas.mlir.ir import IntegerType
 
@@ -76,16 +76,16 @@ def pto_read_gm_bypass_dcache(ptr, offset, logical_dtype):
     if pto.const_expr(adaptation in ("bitcast", "integer_cast")):
         payload_ptr = pto.castptr(ptr, pto.ptr(payload_dtype, "gm"))
 
-    # bypass_l1=True selects PTOAS pto.ld_dev rather than the normal scalar
-    # load path, preserving the Ascend ReadGmByPassDCache semantics.
-    value = pto.load_scalar(payload_ptr, offset, bypass_l1=True)
+    # PTOAS pto.ld_dev is the explicit GM dcache-bypass load path, preserving
+    # the Ascend ReadGmByPassDCache semantics.
+    value = pto.ld_dev(payload_ptr, offset)
     if pto.const_expr(adaptation == "bool"):
         return value != 0
     if pto.const_expr(adaptation == "bitcast"):
         return _scalar_bitcast(value, logical_dtype)
     if pto.const_expr(adaptation == "integer_cast"):
-        # This is a same-width signedness adaptation, not a numeric conversion.
-        return scalar.cast(value, logical_dtype)
+        # PTOAS treats same-width integer casts as signedness adaptation.
+        return pto.cast(value, logical_dtype)
     return value
 
 
@@ -98,12 +98,12 @@ def pto_write_gm_bypass_dcache(ptr, offset, value, logical_dtype):
     if pto.const_expr(adaptation == "bitcast"):
         value = _scalar_bitcast(value, payload_dtype)
     elif pto.const_expr(adaptation == "integer_cast"):
-        # Normalize signed/unsigned annotations without changing the payload
-        # bits before issuing the physical integer store.
-        value = scalar.cast(value, payload_dtype)
+        # Normalize signed/unsigned annotations before the physical store.
+        value = pto.cast(value, payload_dtype)
     elif pto.const_expr(adaptation == "bool"):
         value = _logical_bool_to_i8(value)
 
-    # bypass_l1=True selects PTOAS pto.st_dev; the wrapper has already adapted
-    # logical values to the physical integer payload width above.
-    pto.store_scalar(payload_ptr, offset, value, bypass_l1=True)
+    # PTOAS pto.st_dev is the explicit GM dcache-bypass store path; the wrapper
+    # has already adapted logical values to the physical integer payload width
+    # above.
+    pto.st_dev(payload_ptr, offset, value)

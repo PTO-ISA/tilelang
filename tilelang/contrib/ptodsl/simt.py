@@ -56,7 +56,18 @@ def _redux_integer_compat(op, value):
 
 
 def _redux_add(value):
-    return _redux_integer_compat(pto.redux_add, value)
+    # redux_add is sign-agnostic: PTOAS dropped its optional signedness kwarg
+    # when the unified scalar/SIMT surface landed (ReduxAddIOp/ReduxAddFOp
+    # dispatch by value type), and the kwarg was optional even on the older
+    # vmi 0.1.8 surface. Call it without keyword arguments so both surfaces
+    # keep working.
+    raw_value = unwrap_surface_value(value)
+    if not IntegerType.isinstance(raw_value.type):
+        return pto.redux_add(value)
+    signless_value = wrap_surface_value(_strip_integer_signedness(raw_value))
+    result = pto.redux_add(signless_value)
+    return wrap_surface_value(_restore_integer_signedness(
+        unwrap_surface_value(result), raw_value.type))
 
 
 def _redux_max(value):
