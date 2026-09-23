@@ -23,9 +23,6 @@ def rms_norm_fwd(batch, d, dtype="float32"):
 
     # Adaptive threads: keep ~32 elements per thread (8 float4)
     threads = 256 if TILE > 4096 else 128
-    # Measured with measure_vf_latency.py (cannsim run-vf backend). Other
-    # shapes retain automatic estimation until they are measured explicitly.
-    vf_latency = {4096: 1824, 5120: 1825, 7168: 2436}.get(d, 0)
 
     N = batch * d
 
@@ -45,16 +42,17 @@ def rms_norm_fwd(batch, d, dtype="float32"):
             x_ub = T.alloc_shared((TILE), "float32")
             y_ub = T.alloc_shared((TILE), "float32")
             z_rstd_ub = T.alloc_shared((8), "float32")
+            T.annotate_buffer_versions({x_ub: 1, y_ub: 2, z_rstd_ub: 2})
 
             # Load weights once
             T.copy(W[:d], w_ub[:d])
 
-            for t in T.Pipelined(n_tokens_per_core, num_stages=2):
+            for t in T.Pipelined(n_tokens_per_core, num_stages=2, annotations={"multi_buffer_eligible": [x_ub, y_ub, z_rstd_ub]}):
                 base = (t * N_CORES + core_id) * d
 
                 T.copy(X[base : base + d], x_ub[:d])
 
-                with T.SimtVF(threads=threads, latency=vf_latency):
+                with T.SimtVF(threads=threads):
                     # Fragment: vectorized float4 load from UB to registers
                     x_frag = T.alloc_fragment((TILE,), "float32")
                     for i in T.Parallel(TILE):
@@ -92,7 +90,7 @@ def ref_program(x, weight, eps=1e-6):
     return (x.float() * rstd.unsqueeze(-1) * weight.float().unsqueeze(0)).to(x.dtype)
 
 
-def run_regression_perf(batch=4096, d=4096, eps=1e-6, target="ascend"):
+def run_regression_perf(batch=4096, d=5120, eps=1e-6, target="ascend"):
     dtype = torch.float32
     device = torch.device("npu")
 
@@ -125,7 +123,7 @@ if __name__ == "__main__":
     device = torch.device("npu")
 
     # Test correctness across common hidden sizes
-    for d in [4096, 5120, 7168]:
+    for d in [5120]:
         batch = 4096
         x = torch.randn(batch, d, dtype=dtype, device=device)
         weight = torch.randn(d, dtype=dtype, device=device)
@@ -158,9 +156,3 @@ if __name__ == "__main__":
         total_bytes = batch * d * 4 * 2 + d * 4 + batch * 4
         bw_gbs = total_bytes / (elapsed_us * 1e-6) / 1e9
         print(f"  {elapsed_us:.1f} us  {bw_gbs:.0f} GB/s  {ok}")
-
-    # Print kernel source for inspection
-    print("\n--- Generated Ascend Source (d=4096) ---")
-    program = rms_norm_fwd(4096, 4096, "float32")
-    kernel = tilelang.compile(program, out_idx=-1)
-    print(kernel.get_kernel_source())

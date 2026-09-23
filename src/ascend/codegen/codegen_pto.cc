@@ -4826,10 +4826,14 @@ void CodeGenTileLangPTO::VisitStmt_(const BufferStoreNode *op) {
     // T.alloc_var lowers to local.var[0]. Store it as a scalar surface value
     // for GEMM tile mapping, not as a general PTO buffer store.
     CheckPTOLocalVarBuffer(op->buffer.get());
+    // Render the RHS before printing the assignment line: a dynamic
+    // if_then_else value emits its own if/else statements into `stream`, and
+    // inlining that print inside the assignment would splice them after the
+    // "=" (yielding syntactically invalid Python like "v = if cond:").
     if (op->buffer->dtype.lanes() > 1) {
+      std::string value = RemoveOutermostParentheses(PrintExpr_(op->value));
       PrintIndent();
-      stream << LocalVarID(op->buffer->data.get()) << " = "
-             << RemoveOutermostParentheses(PrintExpr_(op->value)) << "\n";
+      stream << LocalVarID(op->buffer->data.get()) << " = " << value << "\n";
       return;
     }
     ICHECK_EQ(op->indices.size(), 1U)
@@ -4837,12 +4841,10 @@ void CodeGenTileLangPTO::VisitStmt_(const BufferStoreNode *op) {
     int64_t index = 0;
     ICHECK(TryGetConstInt(op->indices[0], &index) && index == 0)
         << "PTO local.var store expects index 0";
+    std::string value = PtoLocalVarStoreValue(
+        op->buffer->dtype, RemoveOutermostParentheses(PrintExpr_(op->value)));
     PrintIndent();
-    stream << LocalVarID(op->buffer->data.get()) << " = "
-           << PtoLocalVarStoreValue(
-                  op->buffer->dtype,
-                  RemoveOutermostParentheses(PrintExpr_(op->value)))
-           << "\n";
+    stream << LocalVarID(op->buffer->data.get()) << " = " << value << "\n";
     return;
   }
 

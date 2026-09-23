@@ -287,43 +287,21 @@ def _check(actual, ref, name, rtol=2e-2, atol=2e-2):
     assert ok, f"{name} verification FAILED (max_abs={max_abs:.4e}, max_rel={max_rel:.4e})"
 
 
-def compress_and_update_state_decode(
-    score: torch.Tensor,
-    latent: torch.Tensor,
-    ape: torch.Tensor | None,
-    positions: torch.Tensor | None,
-    state_cache: torch.Tensor,
-    state_block_idx: torch.Tensor,
-    context_lens: torch.Tensor,
-    max_seqlen_q: int,
-    compress_ratio: int | None = None,
-    verify: bool = False,
-    dump_source: bool = False,
-    target: str | None = None,
-) -> torch.Tensor:
-    """
-    Args:
-        score: [total_q, overlap_ratio, dim], fp32
-        latent: [total_q, overlap_ratio, dim], fp32
-        ape: [compress_ratio, overlap_ratio, dim], fp32
-        positions: [total_q], int32
-        state_cache: [num_state_slots, state_cache_size, 2, overlap_ratio, dim], fp32
-        state_block_idx: [total_q], int32
-        context_lens: [total_q], int32
+def _compile_compress_kernels(
+    dim: int,
+    compress_ratio: int,
+    overlap_ratio: int,
+    has_ape: bool,
+    target: str | None,
+):
+    """Compile both stage kernels once so callers can reuse the pair.
 
-    Returns:
-        kv_compressed: [total_q, dim], bf16
+    The jit path (``target is None``) caches kernels in the decorator, but the
+    explicit compile path does not — compiling per call re-runs the full
+    frontend/backend pipeline every time, which is ruinous under benchmark
+    loops. Callers that invoke the kernels repeatedly must compile once and
+    pass the pair through ``kernels=``.
     """
-    total_q, overlap_ratio, dim = score.shape
-    if ape is not None:
-        has_ape = True
-        compress_ratio = ape.shape[0]
-    else:
-        has_ape = False
-        assert compress_ratio is not None
-    assert state_cache.shape[1] >= compress_ratio * overlap_ratio + max_seqlen_q - 1
-    kv_compressed = torch.empty(total_q, dim, dtype=torch.bfloat16, device=score.device)
-
     get_kernel = _compress_and_update_state_decode_tl_ascend
 
     store_config = dict(
@@ -354,6 +332,51 @@ def compress_and_update_state_decode(
             target=target,
             compile_flags=get_kernel.compile_flags,
         )
+    return store_kernel, compute_kernel
+
+
+def compress_and_update_state_decode(
+    score: torch.Tensor,
+    latent: torch.Tensor,
+    ape: torch.Tensor | None,
+    positions: torch.Tensor | None,
+    state_cache: torch.Tensor,
+    state_block_idx: torch.Tensor,
+    context_lens: torch.Tensor,
+    max_seqlen_q: int,
+    compress_ratio: int | None = None,
+    verify: bool = False,
+    dump_source: bool = False,
+    target: str | None = None,
+    kernels: tuple | None = None,
+) -> torch.Tensor:
+    """
+    Args:
+        score: [total_q, overlap_ratio, dim], fp32
+        latent: [total_q, overlap_ratio, dim], fp32
+        ape: [compress_ratio, overlap_ratio, dim], fp32
+        positions: [total_q], int32
+        state_cache: [num_state_slots, state_cache_size, 2, overlap_ratio, dim], fp32
+        state_block_idx: [total_q], int32
+        context_lens: [total_q], int32
+
+    Returns:
+        kv_compressed: [total_q, dim], bf16
+    """
+    total_q, overlap_ratio, dim = score.shape
+    if ape is not None:
+        has_ape = True
+        compress_ratio = ape.shape[0]
+    else:
+        has_ape = False
+        assert compress_ratio is not None
+    assert state_cache.shape[1] >= compress_ratio * overlap_ratio + max_seqlen_q - 1
+    kv_compressed = torch.empty(total_q, dim, dtype=torch.bfloat16, device=score.device)
+
+    if kernels is not None:
+        store_kernel, compute_kernel = kernels
+    else:
+        store_kernel, compute_kernel = _compile_compress_kernels(dim, compress_ratio, overlap_ratio, has_ape, target)
     # print(store_kernel.get_kernel_source())
     if dump_source:
         print(compute_kernel.get_kernel_source())
@@ -490,7 +513,12 @@ def run_regression_perf(
     max_seqlen_q = inputs[7]
     total_bytes = inputs[8]
 
-    # Warmup / compile both stage kernels (no verify in the perf path).
+    has_ape = ape is not None
+    # Compile both stage kernels once and reuse the pair for warmup + every
+    # benchmark iteration (the explicit PTO compile path has no jit cache).
+    kernels = _compile_compress_kernels(dim, compress_ratio, overlap_ratio, has_ape, target)
+
+    # Warmup (no verify in the perf path).
     compress_and_update_state_decode(
         score,
         latent,
@@ -502,6 +530,7 @@ def run_regression_perf(
         max_seqlen_q,
         verify=False,
         target=target,
+        kernels=kernels,
     )
     torch.npu.synchronize()
 
@@ -517,6 +546,7 @@ def run_regression_perf(
             max_seqlen_q,
             verify=False,
             target=target,
+            kernels=kernels,
         )
 
     latency_ms = do_bench(run_kernel, backend="msprof", _n_warmup=20, _n_repeat=20)

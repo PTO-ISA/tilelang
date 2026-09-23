@@ -177,12 +177,22 @@ def ref_program(x, weight, eps=1e-6):
     return (x.float() * rstd.unsqueeze(-1) * weight.float().unsqueeze(0)).to(x.dtype)
 
 
+# Benchmark variants: how the weight reaches the persistent fragment.
+_VARIANTS = {
+    "ub": ("UB to persistent fragment", rms_norm_persistent_fwd),
+    "gm": ("GM to persistent fragment", rms_norm_persistent_gm_to_fragment_fwd),
+}
+
+
 def run_regression_perf(
-    kernel_builder=rms_norm_persistent_fwd,
+    variant="ub",
     batch=4096,
     d=4096,
     eps=1e-6,
 ):
+    if variant not in _VARIANTS:
+        raise ValueError(f"unknown variant {variant!r}; expected one of {sorted(_VARIANTS)}")
+    variant_name, kernel_builder = _VARIANTS[variant]
     dtype = torch.float32
     device = torch.device("npu")
 
@@ -230,14 +240,10 @@ if __name__ == "__main__":
     dtype = torch.float32
     device = torch.device("npu")
 
-    all_variants = {
-        "ub": ("UB to persistent fragment", rms_norm_persistent_fwd),
-        "gm": ("GM to persistent fragment", rms_norm_persistent_gm_to_fragment_fwd),
-    }
     variant_names = ("ub", "gm") if args.variant == "both" else (args.variant,)
 
     for variant_key in variant_names:
-        variant_name, kernel_builder = all_variants[variant_key]
+        variant_name, kernel_builder = _VARIANTS[variant_key]
         print(f"\n=== {variant_name} ===")
 
         batch = 4096
