@@ -49,9 +49,9 @@ def ref_program(a):
     return torch.stack([a + float(j + 1) for j in range(INNER)])
 
 
-def run_regression_perf():
+def run_regression_perf(target="ascend"):
     device = torch.device("npu")
-    kernel = tilelang.compile(crosslevel_multibuffer(), out_idx=-1)
+    kernel = tilelang.compile(crosslevel_multibuffer(), target=target, out_idx=-1)
     a = torch.randn(N, dtype=torch.float32, device=device)
     kernel(a)
     torch.npu.synchronize()

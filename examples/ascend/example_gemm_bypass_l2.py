@@ -47,12 +47,12 @@ def ref_program(x, w):
     return x.float() @ w.float().T
 
 
-def run_regression_perf(M=256, N=7168, K=2048):
+def run_regression_perf(M=256, N=7168, K=2048, target="ascend"):
     import torch
 
     device = torch.device("npu")
     program = gemm(M, N, K)
-    kernel = tilelang.compile(program, out_idx=-1)
+    kernel = tilelang.compile(program, target=target, out_idx=-1)
     x = torch.randn(M, K, dtype=torch.bfloat16, device=device)
     w = torch.randn(N, K, dtype=torch.bfloat16, device=device)
     kernel(x, w)

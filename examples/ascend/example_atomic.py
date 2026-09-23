@@ -51,11 +51,11 @@ def atomic_min_gm_float(N, num_blocks=8, threads=256):
     return main
 
 
-def run_regression_perf(num_blocks=64, threads=2048):
+def run_regression_perf(num_blocks=64, threads=2048, target="ascend"):
     import torch
 
     device = torch.device("npu")
-    bench_kernel = tilelang.compile(atomic_add_gm_float(1, num_blocks, threads))
+    bench_kernel = tilelang.compile(atomic_add_gm_float(1, num_blocks, threads), target=target)
     counter = torch.zeros(1, dtype=torch.float32, device=device)
 
     def run():

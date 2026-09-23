@@ -179,6 +179,7 @@ def run_regression_perf(
     N_DIM=512,
     split_k=8,
     deterministic=False,
+    target="ascend",
 ):
     """Compile and benchmark one Split-K configuration, returning milliseconds."""
     import torch
@@ -186,6 +187,7 @@ def run_regression_perf(
     device = torch.device("npu")
     kernel = tilelang.compile(
         gemm_splitk(M_DIM, K_DIM, N_DIM, split_k, deterministic=deterministic),
+        target=target,
         out_idx=-1,
     )
     x = torch.randn(M_DIM, K_DIM, dtype=torch.bfloat16, device=device)

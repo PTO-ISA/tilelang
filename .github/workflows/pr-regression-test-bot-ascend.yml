@@ -65,9 +65,10 @@ jobs:
           - "3.12"
       fail-fast: false
     concurrency:
-      # Only authorized regression jobs should cancel an older run for the same PR and matrix lane.
+      # Shared with pr-regression-pto so the two suites never use the single NPU
+      # card in parallel; they queue against this group instead.
       group: "${{ github.workflow }}-${{ github.event.issue.number }}-${{ matrix.runner.name }}-${{ matrix.python-version }}"
-      cancel-in-progress: true
+      cancel-in-progress: false
     timeout-minutes: 120
     steps:
       - name: Checkout repository
@@ -205,39 +206,266 @@ jobs:
           BASELINE_URL: ${{ steps.pr-base.outputs.url }}
           BASELINE_BRANCH: ${{ steps.pr-base.outputs.branch }}
           CURRENT_LABEL: refs/pull/${{ github.event.issue.number }}/merge
+          # Rebuild both refs with the same examples and driver, and expose the report
+          # in a temporary directory outside the checkout through result_md.
+          WORK_DIR: ${{ runner.temp }}/perf_regression_ascend
         run: |
           # Pin the first parent of this PR merge, even if the base branch advances
           # while the job is running. The full checkout already contains this commit.
           BASELINE_SHA="$(git rev-parse --verify HEAD^1)"
           export BASELINE_SHA
-          # Rebuild both refs with the same examples and driver, and expose the report
-          # in a temporary directory outside the checkout through result_md.
           bash ./maint/scripts/run_perf_regression_ascend.sh
 
-      - name: Post test results as PR comment
+      - name: Upload results artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-regression-ascend
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/perf_regression_ascend/*.json
+            ${{ runner.temp }}/perf_regression_ascend/*.md
+            ${{ runner.temp }}/perf_regression_ascend/*.log
+            ${{ runner.temp }}/perf_regression_ascend/*.txt
+
+  pr-regression-pto:
+    name: PTO performance regression test between PR and its base
+    needs: [permissions-check]
+    runs-on: ${{ matrix.runner.tags }}
+    strategy:
+      matrix:
+        runner:
+          - tags: [self-hosted, ascend]
+            name: self-hosted-ascend
+            toolkit: Ascend
+        python-version:
+          - "3.12"
+      fail-fast: false
+    concurrency:
+      # Same group as pr-regression: the two suites queue for the single NPU card
+      # (cancel-in-progress must stay false so a queued suite is not cancelled).
+      group: "${{ github.workflow }}-${{ github.event.issue.number }}-${{ matrix.runner.name }}-${{ matrix.python-version }}"
+      cancel-in-progress: false
+    timeout-minutes: 180
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          ref: refs/pull/${{ github.event.issue.number }}/merge
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Set environment (self-hosted runners)
+        if: startsWith(matrix.runner.name, 'self-hosted')
+        run: |
+          # Hide sensitive data in logs for self-hosted runners
+          if [[ -n "${{ secrets.SECRET_PATH_PREFIXES }}" ]]; then
+            echo "::add-mask::${{ secrets.SECRET_PATH_PREFIXES }}"
+            # Colon separated list of secrets to mask
+            for secret in $(echo "${{ secrets.SECRET_PATH_PREFIXES }}" | tr ':' '\n'); do
+              echo "::add-mask::${secret}"
+            done
+          fi
+
+          # Use runner tool_cache as cache root for self-hosted runners to avoid internet connection
+          # issues and to share cache between jobs.
+          export XDG_CACHE_HOME="${{ runner.tool_cache }}/.ci-cache-${{ github.workflow }}"
+          echo "XDG_CACHE_HOME=${XDG_CACHE_HOME}" | tee -a "${GITHUB_ENV}"
+          echo "PIP_CACHE_DIR=${XDG_CACHE_HOME}/pip" | tee -a "${GITHUB_ENV}"
+          echo "UV_CACHE_DIR=${XDG_CACHE_HOME}/uv" | tee -a "${GITHUB_ENV}"
+          echo "PRE_COMMIT_HOME=${XDG_CACHE_HOME}/pip/.pre-commit" | tee -a "${GITHUB_ENV}"
+
+          # PTO toolchain comes from the self-contained `ptoas` wheel installed in the
+          # "Setup venv" step (auditwheel-repaired: bundles the LLVM/MLIR shared libs
+          # with $ORIGIN RPATH, ptodsl, mlir dialects, and the ptoas CLI console
+          # script). No PYTHONPATH / PATH / LD_LIBRARY_PATH wiring to a build tree.
+
+          # CANN runtime env for torch_npu autoload (libascendcl.so, liburma.so.0, ...).
+          # The runner daemon does not inherit the container-injected CANN environment,
+          # so torch_npu fails to load at `import torch` without this.
+          CANN_SET_ENV="$(ls -d /usr/local/Ascend/cann-*/set_env.sh 2>/dev/null | sort | tail -1)"
+          if [[ -n "${CANN_SET_ENV}" ]]; then
+            # shellcheck disable=SC1090
+            source "${CANN_SET_ENV}"
+          fi
+          # driver / urma library paths injected by the container but absent from set_env.sh
+          export LD_LIBRARY_PATH="/usr/local/Ascend/lib64:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/driver_libs:${LD_LIBRARY_PATH}"
+
+          # Propagate the assembled CANN environment to subsequent steps.
+          # (PTO/LLVM libs are self-contained inside the installed `ptoas` wheel.)
+          {
+            echo "ASCEND_TOOLKIT_HOME=${ASCEND_TOOLKIT_HOME}"
+            echo "ASCEND_HOME_PATH=${ASCEND_HOME_PATH}"
+            echo "ASCEND_OPP_PATH=${ASCEND_OPP_PATH}"
+            echo "ASCEND_AICPU_PATH=${ASCEND_AICPU_PATH}"
+            echo "TOOLCHAIN_HOME=${TOOLCHAIN_HOME}"
+            echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}"
+          } | tee -a "${GITHUB_ENV}"
+
+      - name: Setup Python and uv with caching
+        id: setup-uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          activate-environment: true
+          # Do not use cache for self-hosted runners, as it will download/upload caches which is slow.
+          enable-cache: ${{ !startsWith(matrix.runner.name, 'self-hosted') }}
+          prune-cache: ${{ !startsWith(matrix.runner.name, 'self-hosted') }}
+          cache-local-path: ${{ env.UV_CACHE_DIR }}
+          ignore-nothing-to-cache: true
+          cache-suffix: uv-${{ runner.os }}-${{ runner.arch }}-${{ matrix.python-version }}-${{ matrix.runner.name }}-${{ matrix.runner.toolkit }}
+          cache-dependency-glob: |
+            pyproject.toml
+            requirements*.txt
+
+      - name: Setup venv
+        id: setup-venv
+        run: |
+          set -o pipefail
+
+          export PYTHONPATH=""
+          export PIP_USER=0
+
+          uv pip install --upgrade pip setuptools wheel
+          uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
+          uv pip install -v -r requirements-test.txt
+          uv pip install /nfs-hg/prod/deepseek/permanent/shared/caohuanqi/pytorch/dist/torch_npu-2.10.0.post1+git4be33e9-cp312-cp312-linux_aarch64.whl
+          # Self-contained PTO toolchain from the official hw-native-sys/PTOAS
+          # vmi-v0.1.8 release (ptodsl + MLIR dialects + ptoas CLI), same wheel
+          # and arch-pinned SHA as the main ci.yml PTO jobs.
+          case "${RUNNER_ARCH}" in
+            ARM64)
+              PTOAS_ARCH=aarch64
+              PTOAS_SHA256=88f726c88109a707a0fb54b91f854db9987823168aeac0c5fe5a81de0ae54c6c
+              ;;
+            X64)
+              PTOAS_ARCH=x86_64
+              PTOAS_SHA256=6363b908fe61fd63fd5b15baad594fa98054874cfe82b95e28c96c6a4c1f368d
+              ;;
+            *)
+              echo "Unsupported runner architecture: ${RUNNER_ARCH}" >&2
+              exit 1
+              ;;
+          esac
+          PTOAS_CACHE_DIR="${XDG_CACHE_HOME}/ptoas"
+          PTOAS_FILENAME="ptoas_vmi-0.1.8-cp312-cp312-manylinux_2_34_${PTOAS_ARCH}.whl"
+          PTOAS_WHEEL="${PTOAS_CACHE_DIR}/${PTOAS_FILENAME}"
+          mkdir -p "${PTOAS_CACHE_DIR}"
+          if ! [[ -f "${PTOAS_WHEEL}" ]] || \
+             ! printf '%s  %s\n' "${PTOAS_SHA256}" "${PTOAS_WHEEL}" | sha256sum --check --status -; then
+            PTOAS_DOWNLOAD="$(mktemp "${PTOAS_WHEEL}.tmp.XXXXXX")"
+            trap 'rm -f "${PTOAS_DOWNLOAD}"' EXIT
+            curl --fail --location --retry 3 \
+              --output "${PTOAS_DOWNLOAD}" \
+              "https://github.com/hw-native-sys/PTOAS/releases/download/vmi-v0.1.8/${PTOAS_FILENAME}"
+            printf '%s  %s\n' "${PTOAS_SHA256}" "${PTOAS_DOWNLOAD}" | sha256sum --check -
+            mv "${PTOAS_DOWNLOAD}" "${PTOAS_WHEEL}"
+            trap - EXIT
+          fi
+          uv pip install "${PTOAS_WHEEL}"
+
+      - name: Verify PTO toolchain
+        run: |
+          set -e
+          echo "command -v ptoas: $(command -v ptoas)"
+          ptoas --version
+          python -c 'import ptodsl; print("ptodsl:", ptodsl.__file__)'
+          python -c 'import ptoas; print("ptoas:", ptoas.__file__)'
+          # The legacy /opt install must not resolve before the release wheel.
+          if [[ "$(command -v ptoas)" == "/opt/ptoas-bin-aarch64/bin/ptoas" ]]; then
+            echo "::error::stale /opt/ptoas-bin-aarch64/bin/ptoas resolves before the release wheel" >&2
+            exit 1
+          fi
+
+      - name: Clear uv cache for self-hosted runners (if setup failed)
+        if: >-
+          ${{
+            failure() &&
+            startsWith(matrix.runner.name, 'self-hosted') &&
+            (steps.setup-uv.conclusion == 'failure' || steps.setup-venv.conclusion == 'failure')
+          }}
+        run: |
+          echo "Clearing uv cache at ${UV_CACHE_DIR} due to failure."
+          uv cache clean
+
+      - name: Run PTO performance regression test
+        env:
+          CURRENT_LABEL: refs/pull/${{ github.event.issue.number }}/merge
+          # The script keeps snapshots and results outside the checkout, so the
+          # artifact upload reads from this directory as well.
+          WORK_DIR: ${{ runner.temp }}/perf_regression_pto
+        run: |
+          # Same baseline pinning as the Ascend job (first parent of the PR merge),
+          # but the suite compiles for PTO (PERF_TARGET=pto). Both jobs queue for
+          # the same NPU card through the shared concurrency group.
+          BASELINE_SHA="$(git rev-parse --verify HEAD^1)"
+          export BASELINE_SHA
+          PERF_TARGET=pto bash ./maint/scripts/run_perf_regression_ascend.sh
+
+      - name: Upload results artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-regression-pto
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/perf_regression_pto/*.json
+            ${{ runner.temp }}/perf_regression_pto/*.md
+            ${{ runner.temp }}/perf_regression_pto/*.log
+            ${{ runner.temp }}/perf_regression_pto/*.txt
+
+  pr-regression-report:
+    name: Post combined performance results
+    needs: [pr-regression, pr-regression-pto]
+    # Run after both suites regardless of their outcome, but only when they were
+    # actually started (skipped means the permission gate rejected the trigger).
+    if: ${{ always() && needs.pr-regression.result != 'skipped' && needs.pr-regression-pto.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Ascend results
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: perf-regression-ascend
+          path: perf-regression-ascend
+
+      - name: Download PTO results
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: perf-regression-pto
+          path: perf-regression-pto
+
+      - name: Post test results as a single PR comment
         if: ${{ !cancelled() }}
         uses: actions/github-script@v9
-        env:
-          PERF_RESULT_MD: ${{ steps.perf-regression.outputs.result_md }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
-            const path = process.env.PERF_RESULT_MD;
-            const md = path && fs.existsSync(path)
-              ? fs.readFileSync(path, 'utf8')
-              : '_No results produced (the run failed before generating a report)._';
+
+            function readResult(dir) {
+              const path = `${dir}/regression_result.md`;
+              return fs.existsSync(path)
+                ? fs.readFileSync(path, 'utf8').trim()
+                : '_No results produced (the run failed before generating a report)._';
+            }
 
             const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
 
             const body =
-              'Ascend Performance Regression Test Report\n' +
-              '=========================================\n\n' +
+              'Performance Regression Test Report\n' +
+              '==================================\n\n' +
               `Triggered by: @${context.payload.comment.user.login}\n` +
               `Workflow run: ${runUrl}\n\n` +
               'Results (speedup = baseline / current, >1.0 means the PR is faster)\n' +
               '-----------------------------------------------------------------\n\n' +
-              md + '\n';
+              'Ascend Performance Regression\n' +
+              '------------------------------\n\n' +
+              readResult('perf-regression-ascend') + '\n\n' +
+              'PTO Performance Regression\n' +
+              '---------------------------\n\n' +
+              readResult('perf-regression-pto') + '\n';
 
             await github.rest.issues.createComment({
               owner: context.repo.owner,

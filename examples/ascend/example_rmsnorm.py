@@ -92,7 +92,7 @@ def ref_program(x, weight, eps=1e-6):
     return (x.float() * rstd.unsqueeze(-1) * weight.float().unsqueeze(0)).to(x.dtype)
 
 
-def run_regression_perf(batch=4096, d=4096, eps=1e-6):
+def run_regression_perf(batch=4096, d=4096, eps=1e-6, target="ascend"):
     dtype = torch.float32
     device = torch.device("npu")
 
@@ -100,7 +100,7 @@ def run_regression_perf(batch=4096, d=4096, eps=1e-6):
     weight = torch.randn(d, dtype=dtype, device=device)
 
     program = rms_norm_fwd(batch, d, str(dtype)[len("torch.") :])
-    kernel = tilelang.compile(program, out_idx=[1, 3])
+    kernel = tilelang.compile(program, target=target, out_idx=[1, 3])
 
     x_flat = x.view(-1).contiguous()
 

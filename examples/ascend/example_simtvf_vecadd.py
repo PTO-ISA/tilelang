@@ -54,12 +54,12 @@ def ref_program(a, b):
 NUM_REPEATS = 100
 
 
-def run_regression_perf(N=2**30):
+def run_regression_perf(N=2**30, target="ascend"):
     import torch
 
     device = torch.device("npu")
     program = vector_add(N)
-    kernel = tilelang.compile(program, out_idx=-1)
+    kernel = tilelang.compile(program, target=target, out_idx=-1)
     a = torch.randn(N, dtype=torch.float32, device=device)
     b = torch.randn(N, dtype=torch.float32, device=device)
     kernel(a, b)

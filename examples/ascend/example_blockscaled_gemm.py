@@ -301,9 +301,10 @@ def run_compile(
     scale_dtype="uint16",
     scale_packed=True,
     print_source=False,
+    target="ascend",
 ):
     program = gemm(M, K, N, dtype=dtype, scale_dtype=scale_dtype, scale_packed=scale_packed)
-    kernel = tilelang.compile(program, out_idx=-1)
+    kernel = tilelang.compile(program, target=target, out_idx=-1)
     if print_source:
         print(kernel.get_kernel_source())
     return kernel
@@ -318,11 +319,12 @@ def run_regression(
     scale_packed=True,
     print_source=False,
     bench=False,
+    target="ascend",
 ):
     import torch
 
     device = torch.device("npu")
-    kernel = run_compile(M, K, N, dtype, scale_dtype, scale_packed, print_source)
+    kernel = run_compile(M, K, N, dtype, scale_dtype, scale_packed, print_source, target=target)
     x, w, sfx, sfw, sfx_e8m0, sfw_e8m0 = make_inputs(M, K, N, dtype, device, scale_dtype, scale_packed)
     result = kernel(x, w, sfx, sfw)
     torch.npu.synchronize()
@@ -345,8 +347,8 @@ def run_regression(
     return rel_mean_diff
 
 
-def run_regression_perf(M=8192, K=8192, N=8192, dtype=FP8_DTYPE):
-    return run_regression(M, K, N, dtype=dtype, bench=True)
+def run_regression_perf(M=8192, K=8192, N=8192, dtype=FP8_DTYPE, target="ascend"):
+    return run_regression(M, K, N, dtype=dtype, bench=True, target=target)
 
 
 def _parse_args():

@@ -200,10 +200,13 @@ def ref_program(scores: torch.Tensor, num_topk: int) -> torch.Tensor:
 N_ITERS = 20
 
 
-def run_regression_perf(num_experts=256, num_topk=8, num_tokens=4096):
+def run_regression_perf(num_experts=256, num_topk=8, num_tokens=4096, target="ascend"):
+    # The frontend branches on backend ("asc"/"pto"); the PTO branch avoids
+    # T.fill / pad_value, which PTO codegen does not support.
+    backend = "pto" if target == "pto" else "asc"
     device = torch.device("npu")
-    program = topk_gate(num_experts, num_topk)
-    kernel = tilelang.compile(program, out_idx=-1)
+    program = topk_gate(num_experts, num_topk, backend)
+    kernel = tilelang.compile(program, target=target, out_idx=-1)
 
     scores = torch.randn(num_tokens, num_experts, dtype=torch.float32, device=device)
 

@@ -110,13 +110,16 @@ def main(M=8192, N=8192):
     run_regression_perf(M, N)
 
 
-def run_regression_perf(M=8192, N=8192):
-    kernel = per_token_cast_to_fp8(M, N)
+def run_regression_perf(M=8192, N=8192, target="ascend"):
+    # The module-level @tilelang.jit pins its own target; fetch the TIR and compile
+    # explicitly so the perf entry can select the compile target.
+    program = per_token_cast_to_fp8.get_tir(M, N)
+    kernel = tilelang.compile(program, target=target, out_idx=[1, 2])
     x = torch.randn(M, N, device="npu", dtype=torch.float32)
     io_gb = effective_io_gb(M, N)
 
     def run_kernel_only():
-        kernel(x)
+        return kernel(x)
 
     latency_ms = do_bench(run_kernel_only, backend="msprof", _n_warmup=30, _n_repeat=100)
     print_latency_bandwidth("Tile-lang", latency_ms, io_gb)

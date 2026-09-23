@@ -5,6 +5,7 @@
 #   ./maint/scripts/run_perf_regression_ascend.sh
 #
 # Environment variables:
+#   PERF_TARGET     - compile target for the suite: ascend|pto (default: ascend)
 #   BASELINE_URL    - remote URL to fetch the baseline from
 #                     (default: https://github.com/deepseek-ai/tilelang.git)
 #   BASELINE_BRANCH - branch on BASELINE_URL to compare against (default: asc-on-upstream-main)
@@ -20,6 +21,11 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd -P)"
 
+PERF_TARGET="${PERF_TARGET:-ascend}"
+if [[ "${PERF_TARGET}" != "ascend" && "${PERF_TARGET}" != "pto" ]]; then
+    echo "Invalid PERF_TARGET='${PERF_TARGET}' (expected ascend|pto)" >&2
+    exit 1
+fi
 BASELINE_URL="${BASELINE_URL:-https://github.com/deepseek-ai/tilelang.git}"
 BASELINE_BRANCH="${BASELINE_BRANCH:-asc-on-upstream-main}"
 NINJA_JOBS="${NINJA_JOBS:-64}"
@@ -27,7 +33,7 @@ NINJA_JOBS="${NINJA_JOBS:-64}"
 cd "${REPO_ROOT}"
 # Keep snapshots outside the checkout so stash and ref switches cannot remove them.
 if [[ -z "${WORK_DIR:-}" ]]; then
-    WORK_DIR="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/tilelang-perf-regression-ascend.XXXXXX")"
+    WORK_DIR="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/tilelang-perf-regression-${PERF_TARGET}.XXXXXX")"
 fi
 mkdir -p "${WORK_DIR}"
 WORK_DIR="$(cd "${WORK_DIR}" && pwd -P)"
@@ -41,6 +47,7 @@ esac
 OLD_JSON="${WORK_DIR}/old.json"
 NEW_JSON="${WORK_DIR}/new.json"
 RESULT_MD="${WORK_DIR}/regression_result.md"
+ENV_REPORT="${WORK_DIR}/environment.txt"
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
     echo "result_md=${RESULT_MD}" >> "${GITHUB_OUTPUT}"
 fi
@@ -131,14 +138,48 @@ build() {
     ninja -j"${NINJA_JOBS}" -C build
 }
 
-# Run the Ascend regression suite and capture its {name: latency} JSON marker.
+# Run the regression suite and capture its {name: latency} JSON marker.
+# The driver's stdout transcript is kept per side for the artifact.
 run_driver() {
     local out_json="$1"
+    local log_file="$2"
     PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/examples/ascend:$PYTHONPATH" \
         ASCEND_NPU_ARCH=dav-3510 TILELANG_DISABLE_CACHE=1 TL_PERF_REGRESSION_FORMAT=json \
-        python "${REPO_ROOT}/${DRIVER_PATH}" \
-        | tee /dev/stderr | grep "^${MARKER}" | tail -1 | sed "s/^${MARKER}//" > "${out_json}"
+        python "${REPO_ROOT}/${DRIVER_PATH}" --target "${PERF_TARGET}" \
+        | tee "${log_file}" | tee /dev/stderr | grep "^${MARKER}" | tail -1 | sed "s/^${MARKER}//" > "${out_json}"
 }
+
+# Record the toolchain and device once per run; both refs share the venv and device.
+collect_environment() {
+    {
+        echo "=== ${PERF_TARGET} perf regression environment ==="
+        echo "date (UTC): $(date -u '+%Y-%m-%d %H:%M:%S')"
+        echo "target:     ${PERF_TARGET}"
+        echo "baseline:   ${BASELINE:-pending}"
+        echo "current:    ${CURRENT_REF}"
+        echo "python:     $(python --version 2>&1)"
+        echo "tilelang:   ${CURRENT_REF} (worktree)"
+        CANN_VERSION_FILE="$(ls -d /usr/local/Ascend/cann-*/version.info 2>/dev/null | sort | tail -1 || true)"
+        if [[ -n "${CANN_VERSION_FILE}" ]]; then
+            echo "cann:       ${CANN_VERSION_FILE}"
+            head -5 "${CANN_VERSION_FILE}" 2>/dev/null || true
+        else
+            echo "cann:       not found"
+        fi
+        echo "--- npu-smi info ---"
+        npu-smi info 2>/dev/null | head -30 || echo "npu-smi: not available"
+        echo "--- pto toolchain ---"
+        echo "ptoas:      $(command -v ptoas 2>/dev/null || echo not-found)"
+        ptoas --version 2>/dev/null || echo "ptoas --version: failed"
+        python -c 'import ptodsl; print("ptodsl:", ptodsl.__file__)' 2>/dev/null \
+            || echo "ptodsl: not importable"
+        python -c 'import ptoas; print("ptoas package:", ptoas.__file__)' 2>/dev/null \
+            || echo "ptoas package: not importable"
+        echo ""
+    } > "${ENV_REPORT}"
+}
+
+collect_environment
 
 # ---- Baseline ----
 echo ""
@@ -147,7 +188,7 @@ git checkout -f "${BASELINE}"
 git submodule update --init --recursive
 build
 restore_harness   # overlay current-branch harness onto baseline tree
-run_driver "${OLD_JSON}"
+run_driver "${OLD_JSON}" "${WORK_DIR}/driver_baseline.log"
 
 # ---- Current ----
 echo ""
@@ -156,7 +197,7 @@ git checkout -f "${CURRENT_SHA}"
 git submodule update --init --recursive
 build
 restore_harness
-run_driver "${NEW_JSON}"
+run_driver "${NEW_JSON}" "${WORK_DIR}/driver_current.log"
 
 # ---- Compare ----
 echo ""
