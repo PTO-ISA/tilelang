@@ -3305,22 +3305,29 @@ void CodeGenTileLangPTO::VisitExpr_(const CallNode *op,
     DataType dtype = GetAnnotatedPointerDtype(op->args[0], op->args[1].dtype());
     ICHECK(dtype.is_scalar())
         << "PTO atomic operations support scalar values only";
-    ICHECK((dtype.is_float() && (dtype.bits() == 16 || dtype.bits() == 32)) ||
-           ((dtype.is_int() || dtype.is_uint()) && dtype.bits() == 32))
-        << "PTO atomic operations support float16, float32, int32, and "
-           "uint32, got "
+    const bool supported_float =
+        dtype.is_float() && (dtype.bits() == 16 || dtype.bits() == 32);
+    const bool supported_integer =
+        (dtype.is_int() || dtype.is_uint()) &&
+        (dtype.bits() == 32 || dtype.bits() == 64);
+    ICHECK(supported_float || supported_integer)
+        << "PTO atomic operations support float16, float32, int32, uint32, "
+           "int64, and uint64, got "
         << dtype;
 
     const char *pto_atomic_op =
         is_atomic_add ? "atomic_add"
                       : (is_atomic_max ? "atomic_max" : "atomic_min");
-    os << "pto." << pto_atomic_op << "(" << PrintExpr_(op->args[0]) << ", "
-       << PrintExpr_(op->args[1]);
-    if (dtype.is_int() || dtype.is_uint()) {
-      os << ", signedness=\"" << (dtype.is_uint() ? "unsigned" : "signed")
-         << "\"";
+    std::string ptr_expr = RemoveOutermostParentheses(PrintExpr_(op->args[0]));
+    std::string val_expr = PrintExpr_(op->args[1]);
+    if (supported_integer) {
+      // PTO atomic integer values are signless i32/i64. TileLang prints
+      // int32 as pto.si32, which becomes !pto.ptr<si32> and fails verify.
+      const char *signless = dtype.bits() == 64 ? "pto.i64" : "pto.i32";
+      ptr_expr = "pto.castptr(" + ptr_expr + ", pto.ptr(" + signless +
+                 ", \"gm\"))";
     }
-    os << ")";
+    os << "pto." << pto_atomic_op << "(" << ptr_expr << ", " << val_expr << ")";
     return;
   }
 
