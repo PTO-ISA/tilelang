@@ -3307,9 +3307,8 @@ void CodeGenTileLangPTO::VisitExpr_(const CallNode *op,
         << "PTO atomic operations support scalar values only";
     const bool supported_float =
         dtype.is_float() && (dtype.bits() == 16 || dtype.bits() == 32);
-    const bool supported_integer =
-        (dtype.is_int() || dtype.is_uint()) &&
-        (dtype.bits() == 32 || dtype.bits() == 64);
+    const bool supported_integer = (dtype.is_int() || dtype.is_uint()) &&
+                                   (dtype.bits() == 32 || dtype.bits() == 64);
     ICHECK(supported_float || supported_integer)
         << "PTO atomic operations support float16, float32, int32, uint32, "
            "int64, and uint64, got "
@@ -3324,10 +3323,18 @@ void CodeGenTileLangPTO::VisitExpr_(const CallNode *op,
       // PTO atomic integer values are signless i32/i64. TileLang prints
       // int32 as pto.si32, which becomes !pto.ptr<si32> and fails verify.
       const char *signless = dtype.bits() == 64 ? "pto.i64" : "pto.i32";
-      ptr_expr = "pto.castptr(" + ptr_expr + ", pto.ptr(" + signless +
-                 ", \"gm\"))";
+      ptr_expr =
+          "pto.castptr(" + ptr_expr + ", pto.ptr(" + signless + ", \"gm\"))";
     }
-    os << "pto." << pto_atomic_op << "(" << ptr_expr << ", " << val_expr << ")";
+    os << "pto." << pto_atomic_op << "(" << ptr_expr << ", " << val_expr;
+    // PTOAS 0a3e0173 rejects signedness= on atomic_add/sub. Integer
+    // atomic_max/min still require it; take signedness from the TileLang
+    // dtype, not from the recast signless pointer.
+    if (supported_integer && !is_atomic_add) {
+      os << ", signedness=\"" << (dtype.is_uint() ? "unsigned" : "signed")
+         << "\"";
+    }
+    os << ")";
     return;
   }
 
