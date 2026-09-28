@@ -3018,6 +3018,28 @@ IsVmiVcvtToFp4(const std::vector<std::pair<std::string, ObjectRef>> &kwargs) {
   return false;
 }
 
+static std::optional<std::string>
+VmiVcvtTarget(const std::vector<std::pair<std::string, ObjectRef>> &kwargs) {
+  for (const auto &[key, value] : kwargs) {
+    if (key == "to_dtype") {
+      if (const auto *str = value.as<StringImmNode>()) {
+        return str->value;
+      }
+    }
+  }
+  return std::nullopt;
+}
+
+// TileLang models packed FP4 in logical scalar lanes, while PTO VMI models
+// one physical byte as f4e2m1x2. Reverse conversion therefore first produces
+// bf16x2 pair carriers and then reinterprets those carriers as logical BF16
+// lanes. FP32 is the same operation followed by the ordinary BF16 widening
+// conversion. PTO's unified VMI lowering owns the Packed4 P0-P3 expansion.
+static bool IsVmiVcvtFromFp4(const CallNode *op) {
+  return !op->args.empty() && op->args[0].dtype().is_vector() &&
+         op->args[0].dtype().element_of().is_float4_e2m1fn();
+}
+
 void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
                                           std::ostream &os) {
   auto opt_call_op = op->op.as<Op>();
@@ -3049,6 +3071,32 @@ void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
     ICHECK_EQ(source_dtype.lanes() % 2, 0)
         << "Packed FP4 vcvt requires an even BF16 lane count, got "
         << source_dtype.lanes();
+  }
+
+  if (op_name == "tl.vmi.vcvt" && IsVmiVcvtFromFp4(op)) {
+    const auto target = VmiVcvtTarget(kwargs);
+    ICHECK(target.has_value() &&
+           (*target == "bfloat16" || *target == "float32"))
+        << "Packed FP4 source vcvt only supports bfloat16 or float32, got "
+        << (target.has_value() ? *target : "<missing>");
+    const DataType source_dtype = op->args[0].dtype();
+    ICHECK_EQ(source_dtype.lanes() % 2, 0)
+        << "Packed FP4 source vcvt requires an even logical lane count, got "
+        << source_dtype.lanes();
+
+    ICHECK_EQ(op->args.size(), 1U)
+        << "Packed FP4 source vcvt expects exactly one packed FP4 source vector";
+    const std::string source = PrintExpr_(op->args[0]);
+    // Pair-to-scalar BF16 re-view is a register-level vinterpret_cast.
+    // Do not materialize the converted pairs through a UB scratch buffer.
+    const std::string bf16 = "pto.vmi.vinterpret_cast(pto.vmi.vcvt(" + source +
+                             ", to_dtype=pto.vmi.bf16x2), to_dtype=pto.bf16)";
+    if (*target == "bfloat16") {
+      os << bf16;
+    } else {
+      os << "pto.vmi.vcvt(" << bf16 << ", to_dtype=pto.f32)";
+    }
+    return;
   }
 
   os << "pto." << op_name.substr(3) << "(";

@@ -897,7 +897,24 @@ def vcvt(source, to_dtype=None, mask=None, *, rounding=None, saturate=None, pmod
         if saturate is not None:
             raise ValueError("T.vmi.vcvt(...) does not support saturate for bfloat16 to packed FP4 conversion")
     elif str(src_dt) == "float4_e2m1fn":
-        raise TypeError("T.vmi.vcvt(...) does not support packed FP4 source vectors")
+        if str(to_dtype) not in {"bfloat16", "float32"}:
+            raise TypeError(
+                "T.vmi.vcvt(...) supports packed FP4 sources only for float4_e2m1fn to bfloat16 or float32"
+            )
+        if _lanes_of(source) % 2:
+            raise ValueError("T.vmi.vcvt(...) requires an even packed FP4 logical lane count")
+        # Result is vreg(logical, to_dtype). Check that width, not the
+        # physical packed-pair count (logical // 2), which is not a VMI size.
+        _require_vmi_lane_count(
+            _lanes_of(source),
+            context="T.vmi.vcvt(...) packed FP4 source lane count",
+        )
+        if rounding is not None:
+            raise ValueError("T.vmi.vcvt(...) does not support rounding for packed FP4 source conversion")
+        if saturate is not None:
+            raise ValueError("T.vmi.vcvt(...) does not support saturate for packed FP4 source conversion")
+        if pmode is not None:
+            raise ValueError("T.vmi.vcvt(...) does not support pmode for packed FP4 source conversion")
     elif rounding is not None:
         rounding = _normalize_pto_vcvt_rounding(rounding, context="T.vmi.vcvt(..., rounding=...)")
     return _call_vmi(
