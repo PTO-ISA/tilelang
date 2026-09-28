@@ -173,6 +173,8 @@ TVM_DLL const Op &vmi_vci();
 TVM_DLL const Op &vmi_vbrc();
 TVM_DLL const Op &vmi_vintlv();
 TVM_DLL const Op &vmi_vdintlv();
+TVM_DLL const Op &vmi_vunzip();
+TVM_DLL const Op &vmi_vzip();
 TVM_DLL const Op &vmi_pair_get();
 
 // -- Binary arithmetic / bitwise / shifts

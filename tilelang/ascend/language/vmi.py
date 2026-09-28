@@ -1109,10 +1109,106 @@ def vdintlv(lhs, rhs, mask, *, pmode=None, loc=None, ip=None):
     return _wrap_pair(pair)
 
 
+@_scope_guarded
+def vunzip(source, to_dtype=None, *, loc=None, ip=None):
+    """Unzip every element into its low and high half-width halves.
+
+    Returns (low, high) with the source lane count preserved and the element
+    width halved; lane i of each result is the low/high half of source lane i.
+    to_dtype selects the half element type and defaults to the unsigned
+    half-width integer of the source element (uint16 for a 32-bit source).  It is
+    forwarded to the emitted PTO call, where PTODSL derives the half-width result
+    element type from it and re-checks it against the source width, so it must
+    agree with the result dtype this wrapper declares.
+    """
+    context = "T.vmi.vunzip(...)"
+    source_dtype = _dtype_of(source)
+    lanes = int(getattr(source_dtype, "lanes", 1))
+    src_bits = getattr(_element_dtype_of(source), "bits", None)
+    if src_bits is None:
+        raise TypeError(context + " requires a sized source element dtype")
+    if src_bits not in (16, 32):
+        raise ValueError(
+            context + " requires a 16- or 32-bit source element so the half is 8 "
+            "or 16 bits; got " + str(src_bits)
+        )
+    half_bits = int(src_bits) // 2
+    if to_dtype is None:
+        half_elem = _scalar_dtype("uint" + str(half_bits), context=context)
+    else:
+        half_elem = _scalar_dtype(to_dtype, context=context)
+        if getattr(half_elem, "bits", None) != half_bits:
+            raise TypeError(
+                context + " requires the half element width to be exactly half the"
+                " source element width"
+            )
+    pair = _call_vmi(
+        "vunzip",
+        vreg(lanes, half_elem),
+        source,
+        to_dtype=_pto_to_dtype_annotation(half_elem),
+        loc=loc,
+        ip=ip,
+    )
+    return _wrap_pair(pair)
+
+
+@_scope_guarded
+def vzip(low, high, to_dtype=None, *, loc=None, ip=None):
+    """Zip low/high half-width halves back (inverse of vunzip).
+
+    to_dtype selects the wide element type and defaults to the unsigned
+    double-width integer of the half element (uint32 for uint16 halves).  As in
+    vunzip it is forwarded to the emitted PTO call and must agree with the result
+    dtype this wrapper declares.
+    """
+    context = "T.vmi.vzip(...)"
+    lanes = _lanes_of(low)
+    high_lanes = _lanes_of(high)
+    low_elem = _element_dtype_of(low)
+    high_elem = _element_dtype_of(high)
+    if high_lanes != lanes or high_elem != low_elem:
+        raise ValueError(
+            context + " requires low and high to share one lane count and "
+            "element type; got " + str(lanes) + "x" + str(low_elem) + " and "
+            + str(high_lanes) + "x" + str(high_elem)
+        )
+    half_bits = getattr(low_elem, "bits", None)
+    if half_bits is None:
+        raise TypeError(context + " requires a sized half element dtype")
+    if half_bits not in (8, 16):
+        raise ValueError(
+            context + " requires an 8- or 16-bit half element so the wide element "
+            "is 16 or 32 bits; got " + str(half_bits)
+        )
+    wide_bits = int(half_bits) * 2
+    if to_dtype is None:
+        wide_elem = _scalar_dtype("uint" + str(wide_bits), context=context)
+    else:
+        wide_elem = _scalar_dtype(to_dtype, context=context)
+        if getattr(wide_elem, "bits", None) != wide_bits:
+            raise TypeError(
+                context + " requires the wide element width to be exactly twice the"
+                " half element width"
+            )
+    result_dtype = vreg(lanes, wide_elem)
+    return _call_vmi(
+        "vzip",
+        result_dtype,
+        low,
+        high,
+        to_dtype=_pto_to_dtype_annotation(wide_elem),
+        loc=loc,
+        ip=ip,
+    )
+
+
 __all__ = [
     "VmiPair",
     "alloc_local",
     "alloc_var",
+    "vzip",
+    "vunzip",
     "create_mask",
     "inside_vmi",
     "mask",

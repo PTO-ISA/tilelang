@@ -615,6 +615,56 @@ def test_pto_wrappers_reject_invalid_operand_contracts(monkeypatch):
 
 
 @pytest.mark.pto
+def test_pto_vunzip_vzip_mirror_ptodsl_width_rules(monkeypatch):
+    """vunzip/vzip keep PTODSL's half-width contract and forward to_dtype."""
+    monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
+    calls = []
+    monkeypatch.setattr(
+        T.vmi,
+        "_call_vmi",
+        lambda op, result_dtype, *args, **kwargs: calls.append(
+            (op, str(result_dtype), kwargs)
+        )
+        or SimpleNamespace(dtype=str(result_dtype)),
+    )
+    # vunzip yields a (low, high) pair, and _wrap_pair() refuses to run outside
+    # an active IRBuilder, so stub it as test_pto_vload_dintlv_returns_pair does.
+    monkeypatch.setattr(T.vmi, "_wrap_pair", lambda pair: T.vmi.VmiPair(pair))
+
+    # A 32-bit source splits into unsigned 16-bit halves by default, and the
+    # half element type is carried to the emitted PTO call as to_dtype.
+    pair = T.vmi.vunzip(SimpleNamespace(dtype="float32x16"))
+    assert isinstance(pair, T.vmi.VmiPair)
+    assert str(pair.dtype) == "uint16x16"
+    assert calls[-1][0] == "vunzip"
+    assert calls[-1][1] == "uint16x16"
+    assert calls[-1][2]["to_dtype"] == "uint16"
+
+    # An explicit half element type is forwarded unchanged.
+    T.vmi.vunzip(SimpleNamespace(dtype="float32x16"), "bfloat16")
+    assert calls[-1][1] == "bfloat16x16"
+    assert calls[-1][2]["to_dtype"] == "bfloat16"
+
+    wide = T.vmi.vzip(SimpleNamespace(dtype="uint16x16"), SimpleNamespace(dtype="uint16x16"))
+    assert str(wide.dtype) == "uint32x16"
+    assert calls[-1][0] == "vzip"
+    assert calls[-1][1] == "uint32x16"
+    assert calls[-1][2]["to_dtype"] == "uint32"
+
+    # 8 -> 4 bit and 64 -> 32 bit pairs have no VMI element type.
+    with pytest.raises(ValueError, match="16- or 32-bit source element"):
+        T.vmi.vunzip(SimpleNamespace(dtype="int8x16"))
+    with pytest.raises(ValueError, match="8- or 16-bit half element"):
+        T.vmi.vzip(
+            SimpleNamespace(dtype="float32x16"), SimpleNamespace(dtype="float32x16")
+        )
+    with pytest.raises(ValueError, match="share one lane count and element type"):
+        T.vmi.vzip(
+            SimpleNamespace(dtype="uint16x16"), SimpleNamespace(dtype="uint16x8")
+        )
+
+
+@pytest.mark.pto
 def test_pto_gather_rejects_non_ub_buffer():
     with pytest.raises(TypeError, match="requires a UB pointer"):
 
