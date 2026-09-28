@@ -323,6 +323,8 @@ TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vci).set_num_inputs(-1);
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vbrc).set_num_inputs(-1);
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vintlv).set_num_inputs(-1);
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vdintlv).set_num_inputs(-1);
+TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vunzip).set_num_inputs(-1);
+TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vzip).set_num_inputs(-1);
 TIR_DEFINE_TL_VMI_PURE_BUILTIN(pair_get).set_num_inputs(2);
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vadd).set_num_inputs(-1);
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vsub).set_num_inputs(-1);
