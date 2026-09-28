@@ -994,6 +994,26 @@ def test_vmi_fp4_vcvt_validates_pto_specific_options(monkeypatch):
     with pytest.raises(ValueError, match="does not support saturate"):
         T.vmi.vcvt(bf16, "float4_e2m1fn", saturate="SAT")
 
+    fp4 = SimpleNamespace(dtype="float4_e2m1fnx256")
+    assert T.vmi.vcvt(fp4, "bfloat16") == "ok"
+    assert str(calls[-1][1]) == "bfloat16x256"
+    assert T.vmi.vcvt(fp4, "float32") == "ok"
+    assert str(calls[-1][1]) == "float32x256"
+    with pytest.raises(TypeError, match="packed FP4 sources only"):
+        T.vmi.vcvt(fp4, "float16")
+    with pytest.raises(ValueError, match="does not support rounding"):
+        T.vmi.vcvt(fp4, "bfloat16", rounding="R")
+    with pytest.raises(ValueError, match="does not support saturate"):
+        T.vmi.vcvt(fp4, "bfloat16", saturate="SAT")
+    with pytest.raises(ValueError, match="does not support pmode"):
+        T.vmi.vcvt(fp4, "bfloat16", pmode="odd")
+    fp4_64 = SimpleNamespace(dtype="float4_e2m1fnx64")
+    assert T.vmi.vcvt(fp4_64, "bfloat16") == "ok"
+    assert str(calls[-1][1]) == "bfloat16x64"
+    fp4_16 = SimpleNamespace(dtype="float4_e2m1fnx16")
+    with pytest.raises(ValueError, match="requires lanes to be one of"):
+        T.vmi.vcvt(fp4_16, "bfloat16")
+
 
 @pytest.mark.pto
 def test_vmi_gather_rejects_packed_fp4_source(monkeypatch):
@@ -1503,6 +1523,41 @@ def test_vmi_pto_codegen_uses_physical_fp4_storage_units():
     assert ", 128, " in vstore_line
     assert ", 128, " in vload_line
     assert "size=(256 // 2)" in vload_line
+
+
+@pytest.mark.parametrize("target_dtype", ["bfloat16", "float32"])
+@pytest.mark.pto
+def test_vmi_pto_codegen_fp4_source_conversion_is_logical(target_dtype):
+    @T.prim_func
+    def func(
+        A: T.Buffer((256,), "float4_e2m1fn"),
+        B: T.Buffer((256,), target_dtype),
+    ):
+        with T.Kernel(1) as _:
+            a_ub = T.alloc_shared((256,), "float4_e2m1fn")
+            b_ub = T.alloc_shared((256,), target_dtype)
+            with T.SimdVF():
+                logical_fp4 = T.vmi.vload(a_ub[0], size=256)
+                logical_wide = T.vmi.vcvt(logical_fp4, target_dtype)
+                mask = T.vmi.create_mask(256, size=256)
+                T.vmi.vstore(logical_wide, b_ub[0], mask)
+
+    source = _lower_in_target(func, "pto").kernel_source
+    assert source.count("pto.vmi.vload(") == 1
+    logical = (
+        "pto.vmi.vinterpret_cast(pto.vmi.vcvt(logical_fp4, to_dtype=pto.vmi.bf16x2), to_dtype=pto.bf16)"
+    )
+    assert logical in source
+    if target_dtype == "float32":
+        assert f"pto.vmi.vcvt({logical}, to_dtype=pto.f32)" in source
+    assert "size=(256 // 2)" in source
+    # Packed4 layout selection is an implementation detail of PTO lowering.
+    assert "UNPK4_B8" not in source
+    assert "part=P0" not in source
+    assert "part=pto." not in source
+    assert "pto.vmi.vstore(pto.vmi.vcvt(" not in source
+    assert "VST_VLD" not in source
+    assert "pto.mem_bar(" not in source
 
 
 @pytest.mark.pto

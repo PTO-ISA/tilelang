@@ -31,6 +31,10 @@ from .utils import is_ascend_target, is_cpu_target, is_cuda_target, is_hip_targe
 
 logger = logging.getLogger(__name__)
 
+_PTODSL_COMPILE_CHILD_BOOTSTRAP = (
+    Path(__file__).resolve().parents[2] / "contrib" / "ptodsl" / "_compile_child_bootstrap.py"
+)
+
 
 class LibraryGenerator:
     srcpath: str | None = None
@@ -278,9 +282,17 @@ class LibraryGenerator:
             src_path = pathlib.Path(sys.argv[1])
             kernel_names = json.loads(sys.argv[2])
             out_path = pathlib.Path(sys.argv[3])
+            bootstrap_path = pathlib.Path(sys.argv[4])
             module_name = "_tilelang_ptodsl_compile"
 
             try:
+                bootstrap_spec = importlib.util.spec_from_file_location(
+                    "_tl_pto_bootstrap", bootstrap_path
+                )
+                bootstrap = importlib.util.module_from_spec(bootstrap_spec)
+                assert bootstrap_spec.loader is not None
+                bootstrap_spec.loader.exec_module(bootstrap)
+                bootstrap.preload()
                 spec = importlib.util.spec_from_file_location(module_name, src_path)
                 module = importlib.util.module_from_spec(spec)
                 assert spec.loader is not None
@@ -317,8 +329,21 @@ class LibraryGenerator:
         )
 
         python_bin = sys.executable
+        if not _PTODSL_COMPILE_CHILD_BOOTSTRAP.is_file():
+            raise RuntimeError(
+                "PTODSL compile child bootstrap is missing: "
+                f"{_PTODSL_COMPILE_CHILD_BOOTSTRAP}"
+            )
         result = subprocess.run(
-            [python_bin, "-c", script, str(src_path), json.dumps(kernel_names), str(out_path)],
+            [
+                python_bin,
+                "-c",
+                script,
+                str(src_path),
+                json.dumps(kernel_names),
+                str(out_path),
+                str(_PTODSL_COMPILE_CHILD_BOOTSTRAP),
+            ],
             text=True,
             capture_output=True,
         )
