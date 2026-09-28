@@ -766,6 +766,49 @@ def test_pto_loads_derive_element_dtype_from_real_pointer_annotations(monkeypatc
 
 
 @pytest.mark.parametrize(
+    "source_dtype,expected_dtype",
+    [
+        ("uint8", "uint16x16"),
+        ("int8", "int16x16"),
+    ],
+)
+@pytest.mark.pto
+def test_pto_vgather_widens_8bit_sources_for_uint16_offsets(monkeypatch, source_dtype, expected_dtype):
+    monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        T.vmi,
+        "_call_vmi",
+        lambda op, result_dtype, *args, **kwargs: SimpleNamespace(dtype=result_dtype),
+    )
+
+    source = T.ptr(source_dtype, "shared")
+    offsets = SimpleNamespace(dtype="uint16x16")
+    mask = SimpleNamespace(dtype="boolx16")
+
+    gathered = T.vmi.vgather(source, offsets, mask)
+
+    assert str(gathered.dtype) == expected_dtype
+
+
+@pytest.mark.parametrize("offset_dtype", ["int16", "int32", "uint32"])
+@pytest.mark.pto
+def test_pto_vgather_rejects_8bit_sources_without_uint16_offsets(monkeypatch, offset_dtype):
+    monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        T.vmi,
+        "_call_vmi",
+        lambda op, result_dtype, *args, **kwargs: SimpleNamespace(dtype=result_dtype),
+    )
+
+    source = T.ptr("uint8", "shared")
+    offsets = SimpleNamespace(dtype=f"{offset_dtype}x16")
+    mask = SimpleNamespace(dtype="boolx16")
+
+    with pytest.raises(TypeError, match="requires uint16 offsets for 8-bit integer sources"):
+        T.vmi.vgather(source, offsets, mask)
+
+
+@pytest.mark.parametrize(
     "call",
     [
         lambda source, offsets, mask: T.vmi.vload(source, size=16),

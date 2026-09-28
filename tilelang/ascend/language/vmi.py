@@ -357,6 +357,22 @@ def _vector_result_dtype(value, size=None, *, elem_dtype=None):
     return _dtype(f"{elem}x{lanes}")
 
 
+def _vgather_result_element_dtype(source_elem, offsets):
+    """Derive the result element type for the A5 byte-widening gather path."""
+    source_elem = _dtype(source_elem)
+    offsets_elem = _element_dtype_of(offsets)
+    source_name = str(source_elem)
+    offsets_name = str(offsets_elem)
+    if source_name not in {"uint8", "int8"}:
+        return source_elem
+
+    # The A5 b8->b16 gather path requires unsigned 16-bit element offsets and
+    # widens the source to a matching 16-bit result type.
+    if offsets_name != "uint16":
+        raise TypeError("T.vmi.vgather(...) requires uint16 offsets for 8-bit integer sources")
+    return _dtype("uint16" if source_name == "uint8" else "int16")
+
+
 class VmiPair:
     """Lazy pair wrapper for multi-result VMI calls."""
 
@@ -1005,7 +1021,10 @@ def vgather(source, offsets, mask, *, pmode=None, loc=None, ip=None):
     ptr, offset = _resolve_ptr_and_offset(source, access_type="r", extent=_lanes_of(offsets))
     return _call_vmi(
         "vgather",
-        _vector_result_dtype(offsets, elem_dtype=source_elem),
+        _vector_result_dtype(
+            offsets,
+            elem_dtype=_vgather_result_element_dtype(source_elem, offsets),
+        ),
         ptr,
         offset,
         offsets,
