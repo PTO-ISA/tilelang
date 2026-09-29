@@ -1943,11 +1943,9 @@ void CodeGenTileLangPTO::ValidatePTOUBCopyLayout_(
         << " requires a constant UB row stride for potentially multi-burst "
            "copies, got "
         << ub_stride;
-    ICHECK_EQ(stride % 32, 0)
-        << context
-        << " row stride must be 32-byte aligned for potentially multi-burst "
-           "copies, got "
-        << stride << " bytes";
+    ICHECK_GT(stride, 0)
+        << context << " row stride must be positive, got " << stride
+        << " bytes";
   }
 
   int64_t len = 0;
