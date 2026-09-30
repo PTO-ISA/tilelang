@@ -33,7 +33,7 @@ def tilelang_callback_ascend_compile(code, target, pass_config=None):
         options=compile_options,
         linker_options=linker_options,
     )
-    cached_binary = AscendBinaryCache.load(cache_key)
+    cached_binary = AscendBinaryCache.load(cache_key, AscendBinaryCache.binary_format)
     if cached_binary is not None:
         return bytearray(cached_binary)
 
@@ -44,7 +44,7 @@ def tilelang_callback_ascend_compile(code, target, pass_config=None):
         options=options,
         verbose=env.get_default_verbose(),
     )
-    AscendBinaryCache.save(cache_key, aibin)
+    AscendBinaryCache.save(cache_key, AscendBinaryCache.binary_format, aibin)
     return aibin
 
 
