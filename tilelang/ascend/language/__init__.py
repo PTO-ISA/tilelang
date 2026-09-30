@@ -22,7 +22,7 @@ from .annotations import (  # noqa: F401
     annotate_unlimit_memory,
 )
 from .copy_op import copy, dual_copy  # noqa: F401
-from .gemm_op import gemm, gemm_blockscaled  # noqa: F401
+from .gemm_op import gemm, gemm_blockscaled, blockscaled_gemm  # noqa: F401
 
 # T.reduce and its thin wrappers shadow the common surface: inside SimdVF a
 # shared-to-shared reduce is emitted directly on the UB regions (no fragment
@@ -112,6 +112,7 @@ _ASCEND_API_ALL = (
     "assume_conflict",
     "assume_no_conflict",
     "gemm_blockscaled",
+    "blockscaled_gemm",
     "copy",
     "gemm",
     "device_assert",
