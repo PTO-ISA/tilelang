@@ -334,6 +334,14 @@ TVM_DLL const Op &ascend_fill_l1();
  *
  * ascend_load_cbuf_to_ca(dst, src, mStartPosition, kStartPosition,
  * mStep, kStep, srcStride, dstStride, transpose)
+ *
+ * Optionally 16 args when an MX scale-factor companion load is attached; the
+ * extra args drive a following asc_copy_l12l0a_mx:
+ *   [9]  sf_ptr, [10] sf_x_start,
+ *   [11] sf_y_start (y is contiguous fractal direction),
+ *   [12] sf_x_step,
+ *   [13] sf_y_step,
+ *   [14] sf_src_stride, [15] sf_dst_stride.
  */
 TVM_DLL const Op &ascend_load_cbuf_to_ca();
 
@@ -342,6 +350,14 @@ TVM_DLL const Op &ascend_load_cbuf_to_ca();
  *
  * ascend_load_cbuf_to_cb(dst, src, mStartPosition, kStartPosition,
  * mStep, kStep, srcStride, dstStride, transpose)
+ *
+ * Optionally 16 args when an MX scale-factor companion load is attached; the
+ * extra args drive a following asc_copy_l12l0b_mx:
+ *   [9]  sf_ptr, [10] sf_x_start,
+ *   [11] sf_y_start (y is contiguous fractal direction),
+ *   [12] sf_x_step,
+ *   [13] sf_y_step,
+ *   [14] sf_src_stride, [15] sf_dst_stride.
  */
 TVM_DLL const Op &ascend_load_cbuf_to_cb();
 
