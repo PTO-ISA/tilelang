@@ -41,11 +41,6 @@ file(GLOB TILE_LANG_ASCEND_ACTIVE_SRCS
 list(REMOVE_ITEM TILE_LANG_ASCEND_ACTIVE_SRCS ${TILE_LANG_ASCEND_ALWAYS_SRCS})
 list(APPEND TILE_LANG_SRCS ${TILE_LANG_ASCEND_ACTIVE_SRCS})
 
-# PTO codegen reuses the Python codegen even when the CUDA backend is disabled.
-list(APPEND TILE_LANG_SRCS
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/codegen/codegen_py.cc"
-)
-
 if(TILELANG_USE_ASCEND_STUBS)
   # ==========================================================================
   # ascendcl Stub Library (libstub_ascendcl.so)
