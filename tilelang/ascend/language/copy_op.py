@@ -7,9 +7,10 @@ from typing import Any
 
 from tilelang._typing import BufferLikeType
 from tilelang.language.copy_op import (
+    _normalize_copy_regions,
     copy as _common_copy,
 )
-from tilelang.language.utils import _normalize_annotations
+from tilelang.language.utils import _normalize_annotations, get_extent
 from tilelang.utils.language import to_buffer_region
 from tvm import arith, tirx
 
@@ -236,6 +237,7 @@ def copy(  # noqa: A001
     l2_cache_ctrl: int | str | None = None,
     unit_flag_ctrl: int | tirx.PrimExpr | None = None,
     sub_blockid: int | tirx.PrimExpr | None = None,
+    scale: BufferLikeType | None = None,
     pad_value: int | float | tirx.PrimExpr | None = None,
     data_select: bool = False,
     annotations: dict | None = None,
@@ -275,6 +277,10 @@ def copy(  # noqa: A001
             control for the Cube instruction; ``None`` omits the annotation.
         sub_blockid (Optional[Union[int, PrimExpr]], keyword-only): Sub-block id
             that routes the copy to one of the AIV sub-blocks.
+        scale (Optional[BufferLikeType], keyword-only): MX scale-factor source
+            for an L1->L0A/L0B load. Passed as a third region so the backend can
+            emit ``asc_copy_l12l0a_mx`` / ``asc_copy_l12l0b_mx`` alongside the
+            data load.
         pad_value (Optional[Union[int, float, PrimExpr]], keyword-only): Ascend
             GM→UB only. Round the row width up to the next 32B boundary and fill
             the pad lanes with this value. Emits a leading
@@ -351,6 +357,21 @@ def copy(  # noqa: A001
         ann["data_select"] = tirx.IntImm("int32", 1)
     if data_select and "data_select" not in ann:
         ann["data_select"] = tirx.IntImm("int32", 1)
+
+    # Ascend MX scale-factor companion load (L1->L0A/L0B). Pass the scale source
+    # as a third positional region so the backend can derive the scale L1 pointer
+    # and emit asc_copy_l12l0a_mx / asc_copy_l12l0b_mx alongside the data load.
+    if scale is not None:
+        src_region, dst_region = _normalize_copy_regions(src, dst)
+        scale_region = to_buffer_region(scale, access_type="r", extents=get_extent(scale))
+        return tirx.call_intrin(
+            "handle",
+            tirx.op.Op.get("tl.tileop.ascend_copy"),
+            src_region,
+            dst_region,
+            scale_region,
+            annotations=ann if ann else None,
+        )
 
     ret = _common_copy(
         src,
