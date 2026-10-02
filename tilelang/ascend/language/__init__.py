@@ -22,7 +22,7 @@ from .annotations import (  # noqa: F401
     annotate_unlimit_memory,
 )
 from .copy_op import copy, dual_copy  # noqa: F401
-from .gemm_op import gemm, gemm_blockscaled  # noqa: F401
+from .gemm_op import gemm, gemm_blockscaled, blockscaled_gemm  # noqa: F401
 
 # T.reduce and its thin wrappers shadow the common surface: inside SimdVF a
 # shared-to-shared reduce is emitted directly on the UB regions (no fragment
@@ -65,6 +65,7 @@ from .tile_schedule import (  # noqa: F401
 from .frame import Cube, CubeFrame, SimdVF, SimdVFFrame, SimtVF, SimtVFFrame, Vector, VectorFrame  # noqa: F401
 
 from . import simd as simd  # noqa: F401 (exposed as T.simd.*)
+from . import vmi as vmi  # noqa: F401 (exposed as T.vmi.*)
 
 # Ascend owns its debug surface: device_assert lowers through the toolkit's
 # assert() macro, print gates by the NPU execution model (no CUDA-style
@@ -111,6 +112,7 @@ _ASCEND_API_ALL = (
     "assume_conflict",
     "assume_no_conflict",
     "gemm_blockscaled",
+    "blockscaled_gemm",
     "copy",
     "gemm",
     "device_assert",
@@ -120,6 +122,7 @@ _ASCEND_API_ALL = (
     "rng_rand",
     "rng_rand_float",
     "simd",
+    "vmi",
     "unroll",
 )
 

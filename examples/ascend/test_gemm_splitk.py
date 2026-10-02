@@ -1,21 +1,46 @@
-"""Correctness and repeatability of the two split-K reduction modes."""
+"""Correctness tests for the auto-scheduled Ascend Split-K GEMM."""
 
-import pytest
 import torch
 import tilelang
-import tilelang.testing
+import pytest
+
 from example_gemm_splitk import gemm_splitk, ref_program
 
 
-@tilelang.testing.requires_ascend
-@pytest.mark.parametrize("deterministic", [False, True], ids=["atomic", "ordered"])
-def test_gemm_splitk(deterministic):
-    m, k, n, split_k = 512, 4096, 512, 8
-    kernel = tilelang.compile(gemm_splitk(m, k, n, split_k, deterministic), target="ascend", out_idx=-1)
-    x = torch.randn(m, k, dtype=torch.bfloat16)
-    w = torch.randn(n, k, dtype=torch.bfloat16)
-    x_npu, w_npu = x.npu(), w.npu()
-    result = kernel(x_npu, w_npu).cpu()
+def _test_gemm_splitk(deterministic, target):
+    M, K, N, split_k = 512, 8192, 512, 8
+    device = torch.device("npu")
+    torch.manual_seed(42)
+
+    kernel = tilelang.compile(gemm_splitk(M, K, N, split_k, deterministic=deterministic), target=target, out_idx=-1)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    w = torch.randn(N, K, dtype=torch.bfloat16, device=device)
+    result = kernel(x, w)
+    torch.npu.synchronize()
+
     torch.testing.assert_close(result, ref_program(x, w), rtol=1e-2, atol=1e-2)
     if deterministic:
-        torch.testing.assert_close(kernel(x_npu, w_npu).cpu(), result, rtol=0, atol=0)
+        repeated = kernel(x, w)
+        torch.npu.synchronize()
+        assert torch.equal(result, repeated)
+
+
+@pytest.mark.parametrize("target", ["ascend", pytest.param("pto", marks=pytest.mark.pto)])
+def test_gemm_splitk(target):
+    _test_gemm_splitk(deterministic=False, target=target)
+    _test_gemm_splitk(deterministic=False, target=target)
+
+
+@pytest.mark.parametrize("target", ["ascend", pytest.param("pto", marks=pytest.mark.pto)])
+def test_gemm_splitk_deterministic(target):
+    _test_gemm_splitk(deterministic=True, target=target)
+    _test_gemm_splitk(deterministic=True, target=target)
+
+
+if __name__ == "__main__":
+    test_gemm_splitk(target="ascend")
+    test_gemm_splitk_deterministic(target="ascend")
+    print("PASS: test_gemm_splitk (ascend)")
+    test_gemm_splitk(target="pto")
+    test_gemm_splitk_deterministic(target="pto")
+    print("PASS: test_gemm_splitk (pto)")

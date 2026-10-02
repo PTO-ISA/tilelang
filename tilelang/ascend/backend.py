@@ -1,4 +1,4 @@
-"""Ascend backend manifests (plain AscendC and PTO)."""
+"""Ascend backend manifest (AscendC)."""
 
 from __future__ import annotations
 
@@ -25,33 +25,29 @@ def tilelang_callback_ascend_compile(code, target, pass_config=None):
 
     from tilelang.cache.ascend_binary_cache import AscendBinaryCache
 
-    compile_format = AscendBinaryCache.binary_format
     cache_key = AscendBinaryCache.make_key(
         code=code,
         target_kind=target.kind.name,
         target_arch=target_arch,
-        compile_format=compile_format,
+        compile_format=AscendBinaryCache.binary_format,
         options=compile_options,
         linker_options=linker_options,
     )
-    cached_binary = AscendBinaryCache.load(cache_key, compile_format)
+    cached_binary = AscendBinaryCache.load(cache_key, AscendBinaryCache.binary_format)
     if cached_binary is not None:
         return bytearray(cached_binary)
 
     aibin = bisheng.compile_ascend(
         code,
-        target_format=compile_format,
+        target_format="aibin",
         npu_arch=target_arch,
         options=options,
         verbose=env.get_default_verbose(),
     )
-    AscendBinaryCache.save(cache_key, compile_format, aibin)
+    AscendBinaryCache.save(cache_key, AscendBinaryCache.binary_format, aibin)
     return aibin
 
 
-# Plain Ascend and PTO share the "ascend" target kind, so each is its own
-# BackendModule with a mutually exclusive `supports_target` predicate; the
-# resolver then selects exactly one. Both reuse the same lowering pipeline.
 BACKEND = register_backend(
     BackendModule(
         name="ascend",
@@ -65,6 +61,8 @@ BACKEND = register_backend(
     )
 )
 
+# PTO and AscendC share the target kind and lowering pipeline, but select a
+# different device codegen and execution backend.
 PTO_BACKEND = register_backend(
     BackendModule(
         name="pto",

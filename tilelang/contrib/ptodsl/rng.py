@@ -1,138 +1,225 @@
-from __future__ import annotations
+"""Philox4x32-10 RNG helper for TileLang PTO SIMT kernels.
+
+Mirrors the Ascend SIMT reference implementation
+(src/tl_templates/ascend/philox_rng.h and random_kernel_base.h) so PTO and
+AscendC runs share the same Philox counter/consumption rules and the same
+Box-Muller normal transform.
+
+The state layout matches tl::AscendPhiloxState (key/counter/buf/idx plus the
+Box-Muller cache), but every field is a *runtime* per-lane value living in a
+SIMT-local buffer, exactly like the C struct lives in per-lane storage on the
+Ascend target. Draws therefore carry no trace-time Python state and are valid
+in any control flow: straight-line code, device loops (``range`` /
+``pto.for_(...)``, hinted or not), and runtime branches. The "generate a fresh
+block every four draws" decision is a runtime ``pto.if_`` on the device, not a
+Python ``if`` at trace time.
+"""
 
 from ptodsl import pto
 
+# Philox4x32-10 constants, identical to random_kernel_base.h.
+_PHILOX_M4X32_A = 0xD2511F53
+_PHILOX_M4X32_B = 0xCD9E8D57
+_PHILOX_W32_A = 0x9E3779B9
+_PHILOX_W32_B = 0xBB67AE85
+
+# Uniform mapping constants: u = rand() * 2^-32 + 2^-33.
+_RAND_2POW32_INV = 2.3283064e-10
+_RAND_2POW32_INV_HALF = 1.1641532182693481e-10
+
+_TWO_PI = 6.2831854820251465  # 2*pi in float32
+_NORMAL_EPS = 1.0e-7
+
+# Runtime state layout inside the per-lane ui32 buffer (indices are
+# compile-time constants, so accesses stay register-friendly).
+_KEY0 = 0
+_KEY1 = 1
+_CTR0 = 2
+_CTR1 = 3
+_CTR2 = 4
+_CTR3 = 5
+_BUF0 = 6
+_BUF1 = 7
+_BUF2 = 8
+_BUF3 = 9
+_IDX = 10  # 0..4; 4 == exhausted, regenerate on next draw
+_HAS_NORMAL = 11  # 1 when the Box-Muller spare is cached
+_STATE_SLOTS = 12
+
+
+def _i32(value):
+    # Internal Philox state uses plain signless i32 values: pto.mulhi's
+    # verifier rejects ui32 operands (signedness is an op attribute), and the
+    # arithmetic below only relies on wrap-around semantics plus sign-agnostic
+    # equality compares.
+    return pto.const(value & 0xFFFFFFFF, dtype=pto.i32)
+
+
+def _split_i64_bits(value):
+    """Return the low/high i32 words of a Python or runtime 64-bit value."""
+    if isinstance(value, int):
+        return _i32(value), _i32(value >> 32)
+
+    value64 = pto.cast(value, pto.i64)
+    low = pto.cast(value64, pto.i32)
+    high = pto.mulhi(
+        value64,
+        pto.const(1 << 32, dtype=pto.i64),
+        signedness="unsigned",
+    )
+    return low, pto.cast(high, pto.i32)
+
 
 class PhiloxRNG:
-    """Philox 4x32-10 PRNG for PTO SIMT path.
+    """Per-lane Philox4x32-10 state for PTO SIMT kernels.
 
-    Each SIMT thread creates its own instance with a unique (seed, seq) pair.
-    The seed and initial 128-bit counter are immutable. The caller owns a
-    logical draw index and threads it through each method explicitly, so
-    PTODSL can carry the ordinary Python SSA name through runtime control
-    flow. ``rand()`` returns a uint32; ``rand_uniform()`` returns float32 in
-    [0, 1); ``rand_normal()`` uses the same cached Box-Muller construction as
-    the AscendC backend.
+    ``seed``, ``seq``, and ``off`` may be Python integers or runtime integer
+    scalars. ``off`` follows the nonnegative int64 contract of the Ascend
+    reference and is converted to a Philox block offset with ``ceil(off / 4)``.
+
+    All state is stored in per-lane SIMT-local memory at construction time, so
+    the object must be created inside a ``pto.simt`` section (the TileLang PTO
+    codegen emits it inside ``T.SimtVF``).
     """
 
-    _PHILOX_M4X32_A = 0xD2511F53
-    _PHILOX_M4X32_B = 0xCD9E8D57
-    _PHILOX_W32_A = 0x9E3779B9
-    _PHILOX_W32_B = 0xBB67AE85
-    _RAND_2POW32_INV = 2.3283064e-10
-    _RAND_2POW32_INV_HALF = _RAND_2POW32_INV / 2.0
-    _BOX_MULLER_EPS = 1.0e-7
-    _BOX_MULLER_TWO = 2.0
-    _BOX_MULLER_TWO_PI = 6.283185307179586
+    def __init__(self, seed, seq, off=0):
+        if isinstance(seed, int) and not 0 <= seed < (1 << 64):
+            raise ValueError("PhiloxRNG seed must fit in 64 bits")
+        if isinstance(off, int) and not 0 <= off < (1 << 64):
+            raise ValueError("PhiloxRNG off must fit in 64 bits")
+
+        # Internal slots use signless i32 semantics (see _i32); rand()
+        # bitcasts to ui32 only at the boundary.
+        self._state = pto.alloc_buffer((_STATE_SLOTS,), pto.i32)
+        self._normal_cache = pto.alloc_buffer((1,), pto.f32)
+
+        key0, key1 = _split_i64_bits(seed)
+        # Counter starts at zero; SkipLo adds ceil(off/4) to the low 64 bits
+        # and SkipHi places seq in the high 64 bits. Adding to zero counters
+        # cannot carry, so the initial values are direct assignments.
+        block_offset = (off + 3) // 4
+        ctr0, ctr1 = _split_i64_bits(block_offset)
+        ctr2, ctr3 = _split_i64_bits(seq)
+
+        pto.store(key0, self._state, _KEY0)
+        pto.store(key1, self._state, _KEY1)
+        pto.store(ctr0, self._state, _CTR0)
+        pto.store(ctr1, self._state, _CTR1)
+        pto.store(ctr2, self._state, _CTR2)
+        pto.store(ctr3, self._state, _CTR3)
+        # Buffer contents are irrelevant while idx == 4 (forces generation on
+        # the first draw), but keep the state fully initialized anyway.
+        for slot in (_BUF0, _BUF1, _BUF2, _BUF3):
+            pto.store(_i32(0), self._state, slot)
+        pto.store(_i32(4), self._state, _IDX)
+        pto.store(_i32(0), self._state, _HAS_NORMAL)
 
     @staticmethod
-    def _as_ui64(value):
-        return pto.cast(value, pto.ui64)
+    def _mulhi(a, b):
+        return pto.mulhi(a, b, signedness="unsigned")
 
-    @staticmethod
-    def _split_ui64(value):
-        value = pto.cast(value, pto.ui64)
-        low = pto.cast(value, pto.i32)
-        high = pto.cast(
-            value >> pto.const(32, dtype=pto.ui64),
-            pto.i32,
+    def _round(self, c0, c1, c2, c3, k0, k1):
+        mul_a = _i32(_PHILOX_M4X32_A)
+        mul_b = _i32(_PHILOX_M4X32_B)
+        lo0 = mul_a * c0
+        hi0 = self._mulhi(mul_a, c0)
+        lo1 = mul_b * c2
+        hi1 = self._mulhi(mul_b, c2)
+        return hi1 ^ c1 ^ k0, lo1, hi0 ^ c3 ^ k1, lo0
+
+    def _generate(self):
+        # PhiloxRandomSimt: 10 rounds on temporaries; the key is bumped after
+        # every round. State slots are updated only after the block finishes.
+        c0 = pto.load(self._state, _CTR0)
+        c1 = pto.load(self._state, _CTR1)
+        c2 = pto.load(self._state, _CTR2)
+        c3 = pto.load(self._state, _CTR3)
+        k0 = pto.load(self._state, _KEY0)
+        k1 = pto.load(self._state, _KEY1)
+        for _ in range(10):
+            c0, c1, c2, c3 = self._round(c0, c1, c2, c3, k0, k1)
+            k0 = k0 + _i32(_PHILOX_W32_A)
+            k1 = k1 + _i32(_PHILOX_W32_B)
+        pto.store(c0, self._state, _BUF0)
+        pto.store(c1, self._state, _BUF1)
+        pto.store(c2, self._state, _BUF2)
+        pto.store(c3, self._state, _BUF3)
+
+    def _skip_one(self):
+        # 128-bit increment of (ctr0..ctr3) with explicit carry propagation,
+        # matching SkipOne in the Ascend reference. Written branch-free:
+        # counter values are runtime scalars, so data-dependent Python branches
+        # cannot be traced.
+        one = _i32(1)
+        zero = _i32(0)
+        ctr0 = pto.load(self._state, _CTR0) + one
+        pto.store(ctr0, self._state, _CTR0)
+        k1 = pto.select(ctr0 == 0, one, zero)
+        ctr1 = pto.load(self._state, _CTR1) + k1
+        pto.store(ctr1, self._state, _CTR1)
+        k2 = pto.select(ctr1 == 0, k1, zero)
+        ctr2 = pto.load(self._state, _CTR2) + k2
+        pto.store(ctr2, self._state, _CTR2)
+        k3 = pto.select(ctr2 == 0, k2, zero)
+        ctr3 = pto.load(self._state, _CTR3) + k3
+        pto.store(ctr3, self._state, _CTR3)
+
+    def _rand_i32(self):
+        # Regenerate the block when exhausted: a runtime branch on the device,
+        # so the draw works inside device loops and runtime branches alike.
+        idx = pto.load(self._state, _IDX)
+        with pto.if_(idx >= 4) as br, br.then_:
+            self._generate()
+            self._skip_one()
+            pto.store(_i32(0), self._state, _IDX)
+        idx = pto.load(self._state, _IDX)
+        # Pick the buffer slot with a select tree: the slot index is a runtime
+        # value, while buffer accesses here take compile-time-constant offsets.
+        buf0 = pto.load(self._state, _BUF0)
+        buf1 = pto.load(self._state, _BUF1)
+        buf2 = pto.load(self._state, _BUF2)
+        buf3 = pto.load(self._state, _BUF3)
+        out = pto.select(
+            idx == 0,
+            buf0,
+            pto.select(idx == 1, buf1, pto.select(idx == 2, buf2, buf3)),
         )
-        return low, high
+        pto.store(idx + 1, self._state, _IDX)
+        return out
 
-    def __init__(self, seed, seq, off):
-        seed = self._as_ui64(seed)
-        seq = self._as_ui64(seq)
-        off = self._as_ui64(off)
-        self.key0, self.key1 = self._split_ui64(seed)
+    def rand(self):
+        """Draw one raw uint32 from the lane's stream, advancing the state."""
+        # Reinterpret as ui32 at the boundary so the value matches uint32
+        # buffers; the bit pattern is unchanged.
+        return pto.cast(self._rand_i32(), pto.ui32)
 
-        # Offsets count 32-bit draws while Philox advances in 4x32 blocks.
-        # Keep the intra-block lane so non-aligned offsets select the exact
-        # requested draw without overflowing an `(off + 3)` ceil-division.
-        four = pto.const(4, dtype=pto.ui64)
-        self.base_counter_lo = off // four
-        self.base_counter_hi = seq
-        self.base_lane = off % four
+    def rand_uniform(self):
+        """Draw a float32 uniformly distributed in [0, 1)."""
+        raw = pto.cast(self._rand_i32(), pto.ui32)
+        value = pto.cast(raw, pto.f32, rounding="r", saturation="nosat")
+        return value * _RAND_2POW32_INV + _RAND_2POW32_INV_HALF
 
-    def rand(self, draw_index):
-        four = pto.const(4, dtype=pto.ui64)
-        block_delta = draw_index // four
-        lane_offset = self.base_lane + draw_index % four
-        lane_block_delta = lane_offset // four
-        lane = pto.cast(lane_offset % four, pto.i32)
-
-        counter_before_lane = self.base_counter_lo + block_delta
-        carry = pto.cast(counter_before_lane < self.base_counter_lo, pto.ui64)
-        counter_lo = counter_before_lane + lane_block_delta
-        carry = carry + pto.cast(counter_lo < counter_before_lane, pto.ui64)
-        counter_hi = self.base_counter_hi + carry
-        c0, c1 = self._split_ui64(counter_lo)
-        c2, c3 = self._split_ui64(counter_hi)
-        k0 = self.key0
-        k1 = self.key1
-        _m0 = pto.const(self._PHILOX_M4X32_A, dtype=pto.i32)
-        _m1 = pto.const(self._PHILOX_M4X32_B, dtype=pto.i32)
-        _k0 = pto.const(self._PHILOX_W32_A, dtype=pto.i32)
-        _k1 = pto.const(self._PHILOX_W32_B, dtype=pto.i32)
-        for _r in range(10):
-            _lo0 = c0 * _m0
-            _hi0 = pto.mulhi(c0, _m0, signedness="unsigned")
-            _lo1 = c2 * _m1
-            _hi1 = pto.mulhi(c2, _m1, signedness="unsigned")
-            c0 = _hi1 ^ c1 ^ k0
-            c1 = _lo1
-            c2 = _hi0 ^ c3 ^ k1
-            c3 = _lo0
-            k0 = k0 + _k0
-            k1 = k1 + _k1
-
-        one = pto.const(1, dtype=pto.i32)
-        two = pto.const(2, dtype=pto.i32)
-        result = pto.select(lane == one, c1, c0)
-        result = pto.select(lane == two, c2, result)
-        result = pto.select(lane == pto.const(3, dtype=pto.i32), c3, result)
-        return result, draw_index + pto.const(1, dtype=pto.ui64)
-
-    def rand_uniform(self, draw_index):
-        _u, draw_index = self.rand(draw_index)
-        # Philox words are carried as i32 bit patterns. Re-author the value as
-        # unsigned before converting so high-bit words map to positive floats.
-        _u = pto.cast(_u, pto.ui32)
-        _f = pto.cast(
-            _u,
-            pto.f32,
-            rounding="to_nearest_even",
-            saturation="nosat",
-        )
-        result = _f * pto.const(self._RAND_2POW32_INV, dtype=pto.f32) + pto.const(self._RAND_2POW32_INV_HALF, dtype=pto.f32)
-        return result, draw_index
-
-    def rand_normal(self, draw_index, normal_cache, has_normal):
-        """Return one normal draw and the updated cached Box-Muller state."""
-        initial_draw_index = draw_index
-        u1, draw_index = self.rand_uniform(draw_index)
-        u2, draw_index = self.rand_uniform(draw_index)
-
-        eps = pto.const(self._BOX_MULLER_EPS, dtype=pto.f32)
-        u1 = pto.select(u1 < eps, eps, u1)
-        angle = pto.const(self._BOX_MULLER_TWO_PI, dtype=pto.f32) * u2
-        radius = pto.sqrt(pto.const(-self._BOX_MULLER_TWO, dtype=pto.f32) * pto.log(u1))
-        # AscendC calls sincosf(angle, &normal0, &normal1), whose output
-        # pointer order is sine followed by cosine.
-        normal0 = radius * pto.sin(angle)
-        normal1 = radius * pto.cos(angle)
-
-        zero = pto.const(0, dtype=pto.i32)
-        one = pto.const(1, dtype=pto.i32)
-        use_cache = has_normal != zero
-        result = pto.select(use_cache, normal_cache, normal0)
-        # pto.select strips integer signedness; re-author as ui64 so the
-        # loop-carried draw index keeps its type.
-        next_draw_index = self._as_ui64(pto.select(use_cache, initial_draw_index, draw_index))
-        next_normal_cache = pto.select(use_cache, normal_cache, normal1)
-        next_has_normal = pto.select(use_cache, zero, one)
-        return (
-            result,
-            next_draw_index,
-            next_normal_cache,
-            next_has_normal,
-        )
+    def rand_normal(self):
+        """Draw a float32 from N(0, 1) via Box-Muller (two draws cached)."""
+        if not hasattr(pto, "sin") or not hasattr(pto, "cos"):
+            raise RuntimeError(
+                "PhiloxRNG.rand_normal requires pto.sin/pto.cos (A5 SIMT "
+                "sin/cos SoftLib, PTOAS PR #1193); the current ptodsl build "
+                "does not provide them"
+            )
+        has_normal = pto.load(self._state, _HAS_NORMAL)
+        with pto.if_(has_normal != 0) as br:
+            with br.then_:
+                pto.store(_i32(0), self._state, _HAS_NORMAL)
+                br.assign(out=pto.load(self._normal_cache, 0))
+            with br.else_:
+                u1 = pto.max(self.rand_uniform(), _NORMAL_EPS)
+                u2 = self.rand_uniform()
+                r = pto.sqrt(pto.log(u1) * -2.0)
+                v = u2 * _TWO_PI
+                z0 = r * pto.sin(v)
+                z1 = r * pto.cos(v)
+                pto.store(z1, self._normal_cache, 0)
+                pto.store(_i32(1), self._state, _HAS_NORMAL)
+                br.assign(out=z0)
+        return br.out
