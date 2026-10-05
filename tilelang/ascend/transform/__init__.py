@@ -134,6 +134,37 @@ def AscendSimdVFLowerParallel():
     return _ffi_api.AscendSimdVFLowerParallel()  # type: ignore
 
 
+def VerifyParallelToPTO():
+    """Stage-1 identity stub for the PTO Parallel verification contract.
+
+    Gate B only registers the pass so the formal PTO pipeline order
+    (``VerifyParallelToPTO -> LegalizeParallelToPTO -> VectorizeParallelToPTO``)
+    is routing-testable. The stub preserves the input IR and claims no semantic
+    support; the real contract checks land in task 3a.
+    """
+    return _ffi_api.VerifyParallelToPTO()  # type: ignore
+
+
+def LegalizeParallelToPTO():
+    """Stage-1 identity stub for the PTO Parallel legalization stage.
+
+    Gate B only registers the pass for the formal PTO pipeline order; the safe
+    scalar If/Select/Min/Max rewrites land in task 5. The stub preserves the
+    input IR and rejects nothing.
+    """
+    return _ffi_api.LegalizeParallelToPTO()  # type: ignore
+
+
+def VectorizeParallelToPTO():
+    """Stage-1 identity stub for the PTO Parallel vectorization stage.
+
+    Gate B only registers the pass for the formal PTO pipeline order; the real
+    E/P/Q/remaining lowering lands in task 3b and the later stages. The stub
+    preserves the input IR and rejects nothing.
+    """
+    return _ffi_api.VectorizeParallelToPTO()  # type: ignore
+
+
 def AscendThreadSync(storage_scope: str):
     """Insert thread-storage synchronization independently within each SIMT_VF."""
     return _ffi_api.AscendThreadSync(storage_scope)
@@ -245,6 +276,7 @@ __all__ = [
     "NormalizeBufferVersion",
     "NormalizeControlFlowForSchedule",
     "NormalizeConflictHints",
+    "LegalizeParallelToPTO",
     "PrepareMultiBuffer",
     "ResolveCore",
     "RewriteAscendBufferVersionLayout",
@@ -253,4 +285,6 @@ __all__ = [
     "RewriteFp4ToFp4x2",
     "RewriteFlagToBuf",
     "UnrollLoopSkipVF",
+    "VectorizeParallelToPTO",
+    "VerifyParallelToPTO",
 ]
