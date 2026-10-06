@@ -222,6 +222,37 @@ def _k_minmax(E, lanes, dtype="float32"):
     return main
 
 
+def _k_minmax_parallel_and_serial(E, lanes, dtype="float32"):
+    """Keep scalar Min/Max in serial code beside a converting Parallel unit."""
+    P = (E + lanes - 1) // lanes * lanes
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((P,), dtype),
+        B: T.Tensor((P,), dtype),
+        C: T.Tensor((P,), dtype),
+        D: T.Tensor((P,), dtype),
+    ):
+        with T.Kernel(1):
+            a = T.alloc_shared((P,), dtype)
+            b = T.alloc_shared((P,), dtype)
+            c = T.alloc_shared((P,), dtype)
+            d = T.alloc_shared((P,), dtype)
+            T.copy(A, a)
+            T.copy(B, b)
+            with T.SimdVF(lanes=lanes):
+                for j in T.serial(1):
+                    c[0] = T.max(a[0], b[0])
+                    d[0] = T.min(a[0], b[0])
+                for i in T.Parallel(E):
+                    c[i] = T.max(a[i], b[i])
+                    d[i] = T.min(a[i], b[i])
+            T.copy(c, C)
+            T.copy(d, D)
+
+    return main
+
+
 def _k_explicit_padding(E, lanes, dtype="float32"):
     P = (E + lanes - 1) // lanes * lanes
 
@@ -301,6 +332,22 @@ def test_minmax_legalizes_without_residual_max_min_nodes():
     vectorized = stages["vectorize"]
     names = _vmi_call_names(vectorized)
     assert "tl.vmi.vsel" in names, "the rewritten Min/Max must lower to vsel"
+
+
+@pytest.mark.pto
+def test_minmax_outside_parallel_stays_scalar_within_simdvf():
+    E, lanes = 150, 128
+    stages, _ = _lower_capture(_k_minmax_parallel_and_serial(E, lanes))
+
+    legalized = stages["legalize"]
+    # The two serial stores remain ordinary scalar Min/Max expressions while
+    # the two expressions in the T.Parallel unit are rewritten to Select.
+    assert len(_max_min_nodes(legalized)) == 2, (
+        "Min/Max outside T.Parallel must remain unchanged in the same SIMD_VF"
+    )
+    assert len(_selects(legalized)) >= 2, (
+        "Min/Max inside T.Parallel must still be rewritten to Select"
+    )
 
 
 @pytest.mark.pto

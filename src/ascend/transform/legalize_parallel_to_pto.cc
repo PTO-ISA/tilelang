@@ -241,11 +241,10 @@ public:
   }
 
   // Min/Max -> Select so Vectorize only needs cmp + vsel. Rewritten only
-  // inside a converting region: SIMT_VF blocks and hand-written VMI regions
-  // keep their Min/Max code shape (the D8 upstream regression is scoped out
-  // by construction).
+  // inside a T.Parallel unit in a converting region: scalar expressions in
+  // sibling serial code within the same SIMD_VF keep their Min/Max shape.
   PrimExpr VisitExpr_(const MinNode *op) final {
-    if (!in_simd_vf_) {
+    if (!in_parallel_) {
       return StmtExprMutator::VisitExpr_(op);
     }
     PrimExpr a = VisitExpr(op->a);
@@ -253,7 +252,7 @@ public:
     return Select(a < b, a, b);
   }
   PrimExpr VisitExpr_(const MaxNode *op) final {
-    if (!in_simd_vf_) {
+    if (!in_parallel_) {
       return StmtExprMutator::VisitExpr_(op);
     }
     PrimExpr a = VisitExpr(op->a);
