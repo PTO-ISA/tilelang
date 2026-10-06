@@ -140,6 +140,27 @@ std::string PtoSignedIntegerTypeName(DataType t) {
   return "";
 }
 
+// PTODSL infers the result element type of vci/vbrc from the scalar
+// argument. A dynamic TIR integer prints as MLIR `index` (or a signless
+// constant), which disagrees with the signed/unsigned vector element type the
+// surrounding VMI ops use, so the value argument is adapted to a same-width
+// signless scalar and the result is reinterpreted bit-wise (no numeric
+// conversion; bit width, signedness target and lanes are preserved).
+std::string PtoSignlessIntegerTypeName(DataType t) {
+  ICHECK(t.is_scalar() && (t.is_int() || t.is_uint()))
+      << "PTO signless integer scalar type expected, got " << t;
+  return "pto.i" + std::to_string(t.bits());
+}
+
+std::string PtoIntegerVectorInterpretTarget(DataType element) {
+  if (element.is_int()) {
+    return PtoSignedIntegerTypeName(element);
+  }
+  ICHECK(element.is_uint())
+      << "PTO integer element type expected, got " << element;
+  return "pto.ui" + std::to_string(element.bits());
+}
+
 std::string StripPipePrefix(const std::string &name) {
   if (name.rfind("PIPE_", 0) == 0) {
     return name.substr(5);
@@ -3097,6 +3118,29 @@ void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
     return;
   }
 
+  // Adapt integer scalar sources of vci/vbrc at the VMI
+  // value-argument boundary. The generated scalar must be *signless*: PTOAS
+  // materialises per-physical-vector offsets with `arith.constant`, which
+  // requires signless integers, so a typed (signed) constant base fails for
+  // every input wider than one physical vector. A VCI base can be folded to
+  // a constant whenever the loop has a single chunk, so integer VCI always
+  // takes this path; VBRC constants keep the verified typed-literal path.
+  const bool scalar_integer_input =
+      !op->args.empty() && op->args[0].dtype().is_scalar() &&
+      (op->args[0].dtype().is_int() || op->args[0].dtype().is_uint());
+  const bool integer_vector_result =
+      op->dtype.is_vector() &&
+      (op->dtype.element_of().is_int() || op->dtype.element_of().is_uint());
+  const bool integer_source_literal =
+      !op->args.empty() && op->args[0].as<IntImmNode>() != nullptr;
+  const bool bridge_integer_source =
+      (op_name == "tl.vmi.vci" ||
+       (op_name == "tl.vmi.vbrc" && !integer_source_literal)) &&
+      scalar_integer_input && integer_vector_result;
+
+  if (bridge_integer_source) {
+    os << "pto.vmi.vinterpret_cast(";
+  }
   os << "pto." << op_name.substr(3) << "(";
   bool needs_comma = false;
 
@@ -3180,7 +3224,18 @@ void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
       const bool should_wrap_typed_literal =
           (op_name == "tl.vmi.vbrc" || op_name == "tl.vmi.vci") && i == 0 &&
           is_scalar_literal;
-      if (should_wrap_typed_literal) {
+      if (bridge_integer_source && i == 0) {
+        if (integer_source_literal) {
+          // Constant base: same-width signless scalar holding the original
+          // bit pattern (never a Python default type, never forced to i32).
+          os << PtoSignlessIntegerTypeName(arg.dtype()) << "(";
+          print_scalar_literal_value(arg);
+          os << ")";
+        } else {
+          os << "pto.cast(" << PrintExpr_(arg) << ", "
+             << PtoSignlessIntegerTypeName(arg.dtype()) << ")";
+        }
+      } else if (should_wrap_typed_literal) {
         // PTODSL needs typed literal scalars for these VMI sources; preserve
         // the literal dtype instead of assuming every source is f32.
         os << PtoScalarType(arg.dtype()) << "(";
@@ -3220,7 +3275,13 @@ void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
     }
     needs_comma = true;
   }
+  // Close the VMI source first, then feed the reinterpret target: the
+  // wrapper must be `vinterpret_cast(vci(...), to_dtype=...)`.
   os << ")";
+  if (bridge_integer_source) {
+    os << ", to_dtype="
+       << PtoIntegerVectorInterpretTarget(op->dtype.element_of()) << ")";
+  }
 }
 
 void CodeGenTileLangPTO::PrintPtoSelectValue_(const PrimExpr &value,
