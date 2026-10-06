@@ -97,6 +97,14 @@ def _lower_capture(func, *, expect_error=False):
     return captured, error
 
 
+def _legalize_direct(func):
+    """Run Legalize directly so front-end Simplify cannot erase scalar Min/Max."""
+    target = normalize_pto_target("pto")
+    mod = tvm.IRModule.from_expr(func.with_attr("target", target))
+    with target:
+        return ascend_transform.LegalizeParallelToPTO()(mod)
+
+
 def _body_of(mod):
     assert len(mod.functions) == 1, f"expected a single function, got {list(mod.functions)}"
     return next(iter(mod.functions.values())).body
@@ -241,12 +249,12 @@ def _k_minmax_parallel_and_serial(E, lanes, dtype="float32"):
             T.copy(A, a)
             T.copy(B, b)
             with T.SimdVF(lanes=lanes):
-                for j in T.serial(1):
-                    c[0] = T.max(a[0], b[0])
-                    d[0] = T.min(a[0], b[0])
                 for i in T.Parallel(E):
                     c[i] = T.max(a[i], b[i])
                     d[i] = T.min(a[i], b[i])
+                for j in T.serial(1):
+                    c[0] = T.max(a[0], b[0])
+                    d[0] = T.min(a[0], b[0])
             T.copy(c, C)
             T.copy(d, D)
 
@@ -337,9 +345,8 @@ def test_minmax_legalizes_without_residual_max_min_nodes():
 @pytest.mark.pto
 def test_minmax_outside_parallel_stays_scalar_within_simdvf():
     E, lanes = 150, 128
-    stages, _ = _lower_capture(_k_minmax_parallel_and_serial(E, lanes))
+    legalized = _legalize_direct(_k_minmax_parallel_and_serial(E, lanes))
 
-    legalized = stages["legalize"]
     # The two serial stores remain ordinary scalar Min/Max expressions while
     # the two expressions in the T.Parallel unit are rewritten to Select.
     assert len(_max_min_nodes(legalized)) == 2, (
