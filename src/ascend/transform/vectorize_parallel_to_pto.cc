@@ -132,8 +132,10 @@ private:
     // are rejected there, and opaque calls are already excluded
     // from addresses.
     static const std::set<std::string> kDiscardable = {
-        "tl.vmi.vload", "tl.vmi.vbrc", "tl.vmi.vci",    "tl.vmi.vadd",
-        "tl.vmi.vmul",  "tl.vmi.vcvt", "tl.access_ptr",
+        "tl.vmi.vload",  "tl.vmi.vbrc",     "tl.vmi.vci",     "tl.vmi.vadd",
+        "tl.vmi.vmul",   "tl.vmi.vcvt",     "tl.vmi.vcmp",    "tl.vmi.vcmps",
+        "tl.vmi.vsel",   "tl.vmi.mask_and", "tl.vmi.mask_or", "tl.vmi.mask_not",
+        "tl.access_ptr",
     };
     bool discardable = true;
     PostOrderVisit(rhs, [&](const ObjectRef &n) {
@@ -821,9 +823,150 @@ private:
           << cast->value.dtype() << " -> " << cast->dtype;
       return Cast(cast->dtype, value);
     }
+    if (const auto *andn = expr.as<AndNode>()) {
+      return ConvertMaskLogic(andn->a, andn->b, "mask_and", pre);
+    }
+    if (const auto *orn = expr.as<OrNode>()) {
+      return ConvertMaskLogic(orn->a, orn->b, "mask_or", pre);
+    }
+    if (const auto *notn = expr.as<NotNode>()) {
+      PrimExpr a = ConvertExpr(notn->a, pre);
+      DataType mask_ty = DataType::Bool(static_cast<int>(lanes_));
+      ICHECK(a.dtype().lanes() > 1)
+          << "[VectorizeParallelToPTO] mask_not expects a lane mask";
+      return EmitBind("mnot", Call(mask_ty, VmiOp("mask_not"), {a}), pre);
+    }
+    if (const auto *call = expr.as<CallNode>()) {
+      std::string name;
+      if (const auto *op_node = call->op.as<OpNode>()) {
+        name = op_node->name;
+      }
+
+      if (name == "tl.infinity" || name == "tir.infinity") {
+        // Lane-uniform +inf scalar (frontend -T.infinity is Mul(inf, -1)).
+        // Keep the Call; vbrc / Mul / Select consume it like a FloatImm.
+        return GetRef<PrimExpr>(call);
+      }
+      if (name == "tirx.bitwise_and" || name == "tir.bitwise_and" ||
+          name == "tir.And") {
+        ICHECK_EQ(call->args.size(), 2);
+        return ConvertMaskLogic(call->args[0], call->args[1], "mask_and", pre);
+      }
+      if (name == "tirx.bitwise_or" || name == "tir.bitwise_or" ||
+          name == "tir.Or") {
+        ICHECK_EQ(call->args.size(), 2);
+        return ConvertMaskLogic(call->args[0], call->args[1], "mask_or", pre);
+      }
+      if (name == "tirx.bitwise_not" || name == "tir.bitwise_not" ||
+          name == "tir.Not") {
+        ICHECK_EQ(call->args.size(), 1);
+        PrimExpr a = ConvertExpr(call->args[0], pre);
+        DataType mask_ty = DataType::Bool(static_cast<int>(lanes_));
+        return EmitBind("mnot", Call(mask_ty, VmiOp("mask_not"), {a}), pre);
+      }
+    }
+    if (const auto *sel = expr.as<SelectNode>()) {
+
+      PrimExpr cond = ConvertExpr(sel->condition, pre);
+      PrimExpr tval = ConvertExpr(sel->true_value, pre);
+      PrimExpr fval = ConvertExpr(sel->false_value, pre);
+      if (tval.dtype().lanes() == 1) {
+        tval = EmitBind(
+            "brc",
+            Call(VectorDType(tval.dtype(), lanes_), VmiOp("vbrc"), {tval},
+                 {{"size",
+                   IntImm(DataType::Int(32), static_cast<int>(lanes_))}}),
+            pre);
+      }
+      if (fval.dtype().lanes() == 1) {
+        fval = EmitBind(
+            "brc",
+            Call(VectorDType(fval.dtype(), lanes_), VmiOp("vbrc"), {fval},
+                 {{"size",
+                   IntImm(DataType::Int(32), static_cast<int>(lanes_))}}),
+            pre);
+      }
+      ICHECK(cond.dtype().lanes() > 1)
+          << "[VectorizeParallelToPTO] Select condition must be a lane mask "
+             "after conversion (got scalar); Phase 1 expects lane-varying "
+             "predicates from SimdVFLowerControlFlow";
+      return EmitBind(
+          "vsel", Call(tval.dtype(), VmiOp("vsel"), {cond, tval, fval}), pre);
+    }
+    if (const auto *eq = expr.as<EQNode>()) {
+      return ConvertCompare(eq->a, eq->b, "eq", pre);
+    }
+    if (const auto *ne = expr.as<NENode>()) {
+      return ConvertCompare(ne->a, ne->b, "ne", pre);
+    }
+    if (const auto *lt = expr.as<LTNode>()) {
+      return ConvertCompare(lt->a, lt->b, "lt", pre);
+    }
+    if (const auto *le = expr.as<LENode>()) {
+      return ConvertCompare(le->a, le->b, "le", pre);
+    }
+    if (const auto *gt = expr.as<GTNode>()) {
+      return ConvertCompare(gt->a, gt->b, "gt", pre);
+    }
+    if (const auto *ge = expr.as<GENode>()) {
+      return ConvertCompare(ge->a, ge->b, "ge", pre);
+    }
     LOG(FATAL) << "[VectorizeParallelToPTO] internal error: unsupported "
                   "expression passed Verify: "
                << expr->GetTypeKey();
+  }
+
+  PrimExpr ConvertCompare(const PrimExpr &lhs, const PrimExpr &rhs,
+                          const char *cmp, Array<Stmt> *pre) {
+    PrimExpr a = ConvertExpr(lhs, pre);
+    PrimExpr b = ConvertExpr(rhs, pre);
+    bool a_vec = a.dtype().lanes() > 1;
+    bool b_vec = b.dtype().lanes() > 1;
+    DataType mask_ty = DataType::Bool(static_cast<int>(lanes_));
+    if (!a_vec && !b_vec) {
+      // Lane-uniform compare: keep scalar relational (Select of scalars is
+      // rare inside Parallel; Verify still allows it).
+      if (std::string(cmp) == "eq")
+        return a == b;
+      if (std::string(cmp) == "ne")
+        return a != b;
+      if (std::string(cmp) == "lt")
+        return a < b;
+      if (std::string(cmp) == "le")
+        return a <= b;
+      if (std::string(cmp) == "gt")
+        return a > b;
+      if (std::string(cmp) == "ge")
+        return a >= b;
+      LOG(FATAL) << "[VectorizeParallelToPTO] unknown cmp " << cmp;
+    }
+    if (a_vec && !b_vec) {
+      return EmitBind(
+          "vcmps",
+          Call(mask_ty, VmiOp("vcmps"), {a, b, mask_var_, StringImm(cmp)}),
+          pre);
+    }
+    if (!a_vec && b_vec) {
+      a = EmitBind(
+          "brc",
+          Call(VectorDType(a.dtype(), lanes_), VmiOp("vbrc"), {a},
+               {{"size", IntImm(DataType::Int(32), static_cast<int>(lanes_))}}),
+          pre);
+    }
+    return EmitBind(
+        "vcmp", Call(mask_ty, VmiOp("vcmp"), {a, b, mask_var_, StringImm(cmp)}),
+        pre);
+  }
+
+  PrimExpr ConvertMaskLogic(const PrimExpr &lhs, const PrimExpr &rhs,
+                            const char *op_name, Array<Stmt> *pre) {
+    PrimExpr a = ConvertExpr(lhs, pre);
+    PrimExpr b = ConvertExpr(rhs, pre);
+    DataType mask_ty = DataType::Bool(static_cast<int>(lanes_));
+    ICHECK(a.dtype().lanes() > 1 && b.dtype().lanes() > 1)
+        << "[VectorizeParallelToPTO] " << op_name
+        << " expects lane masks (Phase 2)";
+    return EmitBind(op_name, Call(mask_ty, VmiOp(op_name), {a, b}), pre);
   }
 
   PrimExpr ConvertBinary(const PrimExpr &lhs, const PrimExpr &rhs,

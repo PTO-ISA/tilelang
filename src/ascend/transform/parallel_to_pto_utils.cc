@@ -13,6 +13,7 @@
 #include "../../layout/utils.h"
 
 #include <functional>
+#include <set>
 #include <sstream>
 
 namespace tvm {
@@ -594,18 +595,38 @@ public:
     if (const auto *op_node = op->op.as<OpNode>()) {
       name = op_node->name;
     }
+    // Phase 2: TileLang `a & b` / `a | b` on bool preds become
+    // tirx.bitwise_and / tirx.bitwise_or (not And/Or nodes).
+    static const std::set<std::string> kMaskLogic = {
+        "tirx.bitwise_and", "tirx.bitwise_or", "tirx.bitwise_not",
+        "tir.bitwise_and",  "tir.bitwise_or",  "tir.bitwise_not",
+        "tir.And",          "tir.Or",          "tir.Not",
+    };
+    if (kMaskLogic.count(name)) {
+      for (const auto &arg : op->args) {
+        VisitExpr(arg);
+      }
+      return;
+    }
+    // TileKernels topk_gate pad/kill uses -T.infinity(...), which lowers to
+    // Mul(Call(tl.infinity, dtype), -1). Treat infinity as a float constant.
+    if (name == "tl.infinity" || name == "tir.infinity") {
+      return;
+    }
     unsupported = "unsupported Call `" + name +
-                  "` (first version allows only buffer loads, constants, "
-                  "scalars, loop indices, Add, Mul and Cast)";
+                  "` (allows buffer loads, constants, scalars, loop indices, "
+                  "Add, Mul, Cast, Select, comparisons, bitwise_and/or/not, "
+                  "tl.infinity)";
   }
   // The base ExprVisitor overrides VisitExpr_ for every standard node and
   // silently descends, so non-whitelist nodes never reach
   // VisitExprDefault_. Reject them explicitly.
   void MarkUnsupported(const char *kind) {
     if (!unsupported.has_value()) {
-      unsupported = std::string("unsupported expression node `") + kind +
-                    "` (first version allows only buffer loads, constants, "
-                    "scalars, loop indices, Add, Mul and Cast)";
+      unsupported =
+          std::string("unsupported expression node `") + kind +
+          "` (first version allows only buffer loads, constants, "
+          "scalars, loop indices, Add, Mul, Cast, Select and comparisons)";
     }
   }
   void VisitExpr_(const SubNode *) final { MarkUnsupported("Sub"); }
@@ -613,18 +634,22 @@ public:
   void VisitExpr_(const ModNode *) final { MarkUnsupported("Mod"); }
   void VisitExpr_(const FloorDivNode *) final { MarkUnsupported("FloorDiv"); }
   void VisitExpr_(const FloorModNode *) final { MarkUnsupported("FloorMod"); }
-  void VisitExpr_(const MinNode *) final { MarkUnsupported("Min"); }
-  void VisitExpr_(const MaxNode *) final { MarkUnsupported("Max"); }
-  void VisitExpr_(const EQNode *) final { MarkUnsupported("EQ"); }
-  void VisitExpr_(const NENode *) final { MarkUnsupported("NE"); }
-  void VisitExpr_(const LTNode *) final { MarkUnsupported("LT"); }
-  void VisitExpr_(const LENode *) final { MarkUnsupported("LE"); }
-  void VisitExpr_(const GTNode *) final { MarkUnsupported("GT"); }
-  void VisitExpr_(const GENode *) final { MarkUnsupported("GE"); }
-  void VisitExpr_(const AndNode *) final { MarkUnsupported("And"); }
-  void VisitExpr_(const OrNode *) final { MarkUnsupported("Or"); }
-  void VisitExpr_(const NotNode *) final { MarkUnsupported("Not"); }
-  void VisitExpr_(const SelectNode *) final { MarkUnsupported("Select"); }
+  // Stage 4: Min/Max are admitted at the Verify boundary — Verify runs
+  // before LegalizeParallelToPTO, which rewrites them into the Select form
+  // before VectorizeParallelToPTO consumes the unit.
+  void VisitExpr_(const MinNode *op) final { ExprVisitor::VisitExpr_(op); }
+  void VisitExpr_(const MaxNode *op) final { ExprVisitor::VisitExpr_(op); }
+  // Phase 1 control-flow: Select + relational ops (SimdVFLowerControlFlow).
+  void VisitExpr_(const EQNode *op) final { ExprVisitor::VisitExpr_(op); }
+  void VisitExpr_(const NENode *op) final { ExprVisitor::VisitExpr_(op); }
+  void VisitExpr_(const LTNode *op) final { ExprVisitor::VisitExpr_(op); }
+  void VisitExpr_(const LENode *op) final { ExprVisitor::VisitExpr_(op); }
+  void VisitExpr_(const GTNode *op) final { ExprVisitor::VisitExpr_(op); }
+  void VisitExpr_(const GENode *op) final { ExprVisitor::VisitExpr_(op); }
+  void VisitExpr_(const AndNode *op) final { ExprVisitor::VisitExpr_(op); }
+  void VisitExpr_(const OrNode *op) final { ExprVisitor::VisitExpr_(op); }
+  void VisitExpr_(const NotNode *op) final { ExprVisitor::VisitExpr_(op); }
+  void VisitExpr_(const SelectNode *op) final { ExprVisitor::VisitExpr_(op); }
   void VisitExpr_(const RampNode *) final { MarkUnsupported("Ramp"); }
   void VisitExpr_(const BroadcastNode *) final { MarkUnsupported("Broadcast"); }
   void VisitExpr_(const ShuffleNode *) final { MarkUnsupported("Shuffle"); }
@@ -960,45 +985,47 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
     b = &fmod->b;
     known_op = metadata_mode;
   } else if (const auto *minn = expr.as<MinNode>()) {
+    // Stage 4: Min/Max classify like the comparisons in value mode too;
+    // LegalizeParallelToPTO rewrites them into Select before Vectorize.
     a = &minn->a;
     b = &minn->b;
-    known_op = metadata_mode;
+    known_op = true;
   } else if (const auto *maxx = expr.as<MaxNode>()) {
     a = &maxx->a;
     b = &maxx->b;
-    known_op = metadata_mode;
+    known_op = true;
   } else if (const auto *lt = expr.as<LTNode>()) {
     a = &lt->a;
     b = &lt->b;
-    known_op = metadata_mode;
+    known_op = true; // Phase 1: cmp -> vcmp/vcmps
   } else if (const auto *len = expr.as<LENode>()) {
     a = &len->a;
     b = &len->b;
-    known_op = metadata_mode;
+    known_op = true;
   } else if (const auto *gt = expr.as<GTNode>()) {
     a = &gt->a;
     b = &gt->b;
-    known_op = metadata_mode;
+    known_op = true;
   } else if (const auto *ge = expr.as<GENode>()) {
     a = &ge->a;
     b = &ge->b;
-    known_op = metadata_mode;
+    known_op = true;
   } else if (const auto *eq = expr.as<EQNode>()) {
     a = &eq->a;
     b = &eq->b;
-    known_op = metadata_mode;
+    known_op = true;
   } else if (const auto *ne = expr.as<NENode>()) {
     a = &ne->a;
     b = &ne->b;
-    known_op = metadata_mode;
+    known_op = true;
   } else if (const auto *andn = expr.as<AndNode>()) {
     a = &andn->a;
     b = &andn->b;
-    known_op = metadata_mode;
+    known_op = true; // Phase 2
   } else if (const auto *orn = expr.as<OrNode>()) {
     a = &orn->a;
     b = &orn->b;
-    known_op = metadata_mode;
+    known_op = true;
   }
   if (known_op) {
     lhs = AnalyzeLaneUseImpl(*a, ctx, reason, metadata_mode);
@@ -1013,14 +1040,63 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
                ? LaneUse::kUniform
                : LaneUse::kVarying;
   }
-  if (!metadata_mode) {
-    if (const auto *notn = expr.as<NotNode>()) {
-      // Not is a value-mode whitelist reject too; keep symmetric.
+  if (const auto *notn = expr.as<NotNode>()) {
+    return AnalyzeLaneUseImpl(notn->a, ctx, reason, metadata_mode);
+  }
+  if (const auto *call = expr.as<CallNode>()) {
+    std::string name;
+    if (const auto *op_node = call->op.as<OpNode>()) {
+      name = op_node->name;
     }
-  } else {
-    if (const auto *notn = expr.as<NotNode>()) {
-      return AnalyzeLaneUseImpl(notn->a, ctx, reason, metadata_mode);
+    auto is_mask_logic = [&](const std::string &n) {
+      return n == "tirx.bitwise_and" || n == "tirx.bitwise_or" ||
+             n == "tirx.bitwise_not" || n == "tir.bitwise_and" ||
+             n == "tir.bitwise_or" || n == "tir.bitwise_not" ||
+             n == "tir.And" || n == "tir.Or" || n == "tir.Not";
+    };
+    if (is_mask_logic(name)) {
+      if (call->args.empty()) {
+        if (reason)
+          *reason = "empty mask-logic call";
+        return LaneUse::kUnknown;
+      }
+      LaneUse acc =
+          AnalyzeLaneUseImpl(call->args[0], ctx, reason, metadata_mode);
+      if (acc == LaneUse::kUnknown)
+        return LaneUse::kUnknown;
+      for (size_t i = 1; i < call->args.size(); ++i) {
+        LaneUse u =
+            AnalyzeLaneUseImpl(call->args[i], ctx, reason, metadata_mode);
+        if (u == LaneUse::kUnknown)
+          return LaneUse::kUnknown;
+        if (u == LaneUse::kVarying)
+          acc = LaneUse::kVarying;
+      }
+      return acc;
     }
+    // -T.infinity -> Mul(tl.infinity, -1); infinity itself is lane-uniform.
+    if (name == "tl.infinity" || name == "tir.infinity") {
+      return LaneUse::kUniform;
+    }
+  }
+  if (const auto *sel = expr.as<SelectNode>()) {
+    // Phase 1: Select(cond, t, f) -> vsel; lane use is varying if any arm is.
+    LaneUse c = AnalyzeLaneUseImpl(sel->condition, ctx, reason, metadata_mode);
+    LaneUse tv =
+        AnalyzeLaneUseImpl(sel->true_value, ctx, reason, metadata_mode);
+    LaneUse fv =
+        AnalyzeLaneUseImpl(sel->false_value, ctx, reason, metadata_mode);
+    if (c == LaneUse::kUnknown || tv == LaneUse::kUnknown ||
+        fv == LaneUse::kUnknown) {
+      if (reason != nullptr && reason->empty()) {
+        *reason = "unknown operand in Select";
+      }
+      return LaneUse::kUnknown;
+    }
+    return (c == LaneUse::kUniform && tv == LaneUse::kUniform &&
+            fv == LaneUse::kUniform)
+               ? LaneUse::kUniform
+               : LaneUse::kVarying;
   }
   if (const auto *cast = expr.as<CastNode>()) {
     return AnalyzeLaneUseImpl(cast->value, ctx, reason, metadata_mode);
