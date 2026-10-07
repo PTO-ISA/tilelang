@@ -8,7 +8,8 @@ Scope: this file proves routing only.
 * the AscendC SIMD_VF route keeps ``AscendSimdVFLowerParallel`` and never sees
   the three PTO Parallel passes;
 * PTO ``SimtVF`` and hand-written PTO VMI modules without a ``T.Parallel``
-  unit are accepted by the PTO route (the stubs do not reject them);
+  unit enter the same three PTO pass entry points, but are bypassed inside
+  those passes and accepted without conversion;
 * ``PlanPtoSlotStorage`` is neither registered nor called.
 
 The three PTO Parallel passes are identity stubs in stage 1 (Gate B), so this
