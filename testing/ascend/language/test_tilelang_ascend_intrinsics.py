@@ -116,6 +116,16 @@ def test_manual_sync_intrinsic_codegen():
         assert instruction in source
 
 
+def test_ascend_simd_mem_bar_pto_codegen():
+    @T.prim_func
+    def func():
+        with T.Kernel(1) as _, T.SimdVF():
+            T.simd.mem_bar("VST_VLD")
+
+    source = lower(func, target="pto").kernel_source
+    assert "pto.mem_bar(pto.BarrierType.VST_VLD)" in source
+
+
 @pytest.mark.parametrize("dtype", ["int32", "uint32"])
 def test_ascend_simd_vaddc_codegen(dtype):
     @T.prim_func
@@ -188,6 +198,31 @@ def test_ascend_simd_vdiv_precision_override():
     assert precise_default_source.count("simd_inst::vdiv(") == 1
     assert fast_default_source.count("simd_inst::vdiv_0ulp_ftz_true(") == 1
     assert fast_default_source.count("simd_inst::vdiv(") == 2
+
+
+def test_ascend_simd_vdiv_precision_override_pto_rejects_unsupported():
+    @T.prim_func
+    def func(
+        A: T.Buffer((64,), "float32"),
+        B: T.Buffer((64,), "float32"),
+        C: T.Buffer((64,), "float32"),
+    ):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((64,), "float32")
+            b_ub = T.alloc_shared((64,), "float32")
+            c_ub = T.alloc_shared((64,), "float32")
+            T.copy(A, a_ub)
+            T.copy(B, b_ub)
+            with T.SimdVF():
+                mask = T.simd.pset(32)
+                src0 = T.simd.vld(a_ub[0])
+                src1 = T.simd.vld(b_ub[0])
+                result = T.simd.vdiv(src0, src1, mask, precision="exact")
+                T.simd.vsts(c_ub[0], result, mask)
+            T.copy(c_ub, C)
+
+    with pytest.raises(Exception, match="requires a newer PTOAS version"):
+        lower(func, target="pto")
 
 
 def test_ascend_simd_sfu_precision_merging():
@@ -265,6 +300,16 @@ def test_ascend_simd_vsstb_threads_pointer_state():
     source = lower(func, target="ascend").kernel_source
     assert source.count("simd_inst::vsstb(") == 2
     assert source.count("POST_UPDATE") == 2
+
+    pto_source = lower(func, target="pto").kernel_source
+    assert "dst_ptr = None" in pto_source
+    assert pto_source.count("pto.vsstb(") == 2
+    assert "((196609 >> 16) & 65535), (196609 & 65535)" in pto_source
+    assert 'dist="1PT_B32"' in pto_source
+    assert "ONEPT_B32" not in pto_source
+    assert "_tl_coerce_i64(pto.addptr(" not in pto_source
+    assert "_tl_coerce_i64(pto.vsstb(" not in pto_source
+    assert "pto.mem_bar(pto.BarrierType.VST_VLD)" in pto_source
 
 
 @pytest.mark.parametrize("dtype,bits", [("bfloat16", 16), ("float32", 32), ("uint8", 8), ("float8_e4m3", 8)])

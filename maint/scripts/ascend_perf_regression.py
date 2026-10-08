@@ -1,7 +1,8 @@
-"""Ascend perf-regression driver with a supervised persistent worker.
+"""Ascend/PTO perf-regression driver with a supervised persistent worker.
 
 Run via `maint/scripts/run_perf_regression_ascend.sh`, which overlays this driver and
-the Ascend examples onto each tested ref, or invoke this file directly.
+the Ascend examples onto each tested ref, or invoke this file directly with
+``--target {ascend,pto}`` (default: ``ascend``).
 
 Why this file uses a worker
 ---------------------------
@@ -16,6 +17,17 @@ worker reuses imports and the NPU context while it is healthy. Results are retur
 every entry; if the worker crashes or an entry times out, the parent preserves completed
 results, restarts the worker for the next entry, and continues.
 
+Targets
+-------
+Each target has its own entry list of ``(name, path, kwargs)`` tuples: ``--target
+ascend`` runs the original ``_ENTRIES`` (unchanged; entries pass no target argument, so
+examples keep their original auto/default target resolution — the Ascend perf path is
+untouched) and ``--target pto`` runs the separate ``PTO_ENTRIES`` list, which mirrors
+the standard entries compiled for PTO (minus not-yet-covered ones) plus the PTO-only
+persistent-RMSNorm entries. PTO entries carry the compile target inside ``kwargs``
+directly (``target="pto"``; ``backend="pto"`` for the two frontend-branching examples),
+so the driver keeps forwarding ``**kwargs`` verbatim exactly as it always did.
+
 This logic is intentionally kept in an Ascend-only maintenance driver. The shared CUDA
 regression modules remain unchanged; this file emits the JSON-marker contract consumed
 by `run_perf_regression_ascend.sh`.
@@ -23,6 +35,7 @@ by `run_perf_regression_ascend.sh`.
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
 import os
@@ -43,16 +56,18 @@ _MARKER = "__TILELANG_PERF_RESULTS_JSON__="
 _ENV_ENTRY = "TL_PERF_REGRESSION_ENTRY"  # child: run only this single entry
 _ENV_WORKER = "TL_PERF_REGRESSION_WORKER"  # persistent child: read entries from stdin
 _ENV_TIMEOUT = "TL_PERF_REGRESSION_TIMEOUT"  # parent: per-entry timeout (seconds)
+_ENV_TARGET = "TL_PERF_REGRESSION_TARGET"  # child/worker: driver target (ascend|pto)
 _DEFAULT_ENTRY_TIMEOUT = 900.0
 _WORKER_SHUTDOWN_TIMEOUT = 60.0
 _WORKER_TERMINATE_TIMEOUT = 10.0
 
-# (entry name, example path[:function], function kwargs).
-# The default function is run_regression_perf; paths are relative to _EXAMPLES_DIR.
+TARGETS = ("ascend", "pto")
+_DEFAULT_TARGET = "ascend"
+
+# (entry name, example path relative to this file, run_regression_perf kwargs).
 # One row == one worker command and one independently reported result. The path may live
 # in a subfolder (e.g. flash_attention/); the worker puts its directory on sys.path so
 # intra-folder imports (``from core import …``) resolve without dotted-module gymnastics.
-# Benchmark complete examples; language-feature regressions live in testing/ascend.
 _ENTRIES: list[tuple[str, str, dict]] = [
     ("ascend_gemm_bf16", "example_gemm.py", {"dtype": "bfloat16"}),
     ("ascend_gemm_fp32", "example_gemm.py", {"dtype": "float32"}),
@@ -63,52 +78,75 @@ _ENTRIES: list[tuple[str, str, dict]] = [
         "example_gemm_splitk.py",
         {"deterministic": True},
     ),
-    # Four dense shapes cover both dtypes and traversal orders without a sweep.
-    (
-        "ascend_deepgemm_bf16_mnk_4096x4096x4096",
-        "deepgemm/bench_deepgemm.py",
-        {"m": 4096, "n": 4096, "k": 4096, "dtype": "bfloat16", "loop_order": "mnk"},
-    ),
-    (
-        "ascend_deepgemm_bf16_kmn_128x4096x7168",
-        "deepgemm/bench_deepgemm.py",
-        {"m": 128, "n": 4096, "k": 7168, "dtype": "bfloat16", "loop_order": "kmn"},
-    ),
-    (
-        "ascend_deepgemm_fp8_mnk_1024x4096x7168",
-        "deepgemm/bench_deepgemm.py",
-        {"m": 1024, "n": 4096, "k": 7168, "dtype": "float8_e4m3fn", "loop_order": "mnk"},
-    ),
-    (
-        "ascend_deepgemm_fp8_kmn_1025x4096x7168",
-        "deepgemm/bench_deepgemm.py",
-        {"m": 1025, "n": 4096, "k": 7168, "dtype": "float8_e4m3fn", "loop_order": "kmn"},
-    ),
-    # Scale packing, transpose and broadcast share the DeepGEMM benchmark module.
-    (
-        "ascend_deepgemm_sf_fp32_k_32768x7168",
-        "deepgemm/bench_deepgemm.py:run_transform_sf_perf",
-        {"mn": 32768, "k": 7168},
-    ),
-    (
-        "ascend_deepgemm_sf_int16_k_32768x7168",
-        "deepgemm/bench_deepgemm.py:run_transform_sf_perf",
-        {"mn": 32768, "k": 7168, "dtype": "int16"},
-    ),
-    (
-        "ascend_deepgemm_sf_int16_mn_gran128_32768x7168",
-        "deepgemm/bench_deepgemm.py:run_transform_sf_perf",
-        {"mn": 32768, "k": 7168, "dtype": "int16", "major": "mn", "gran_mn": 128},
-    ),
+    ("ascend_gemm_l0", "example_gemm_l0.py", {}),
+    ("ascend_gemm_mix_manual", "example_gemm_mix_manual.py", {}),
+    ("ascend_gemm_mixedkernel", "example_gemm_mixedkernel.py", {}),
+    ("ascend_gemm_bypass_l2", "example_gemm_bypass_l2.py", {}),
+    ("ascend_gemm_various_shapes", "example_gemm_various_shapes.py", {}),
+    ("ascend_blockscaled_gemm", "example_blockscaled_gemm.py", {}),
     ("ascend_mha", "flash_attention/example_mha.py", {}),
     ("ascend_gqa", "flash_attention/example_gqa.py", {}),
-    ("ascend_gqa_bwd", "flash_attention/example_gqa_bwd.py", {}),
     ("ascend_rmsnorm", "example_rmsnorm.py", {}),
-    ("ascend_simtvf_vecadd", "example_vecadd.py", {"mode": "simt"}),
-    ("ascend_simdvf_vecadd_lower", "example_vecadd.py", {"mode": "simd"}),
-    ("ascend_simdvf_per_token_cast_to_fp8", "example_per_token_cast_to_fp8.py", {"mode": "simd"}),
-    ("ascend_simtvf_per_token_cast_to_fp8", "example_per_token_cast_to_fp8.py", {"mode": "simt"}),
+    ("ascend_buffer_version_annotation", "example_buffer_version_annotation.py", {}),
+    ("ascend_atomic_add", "example_atomic.py", {}),
+    ("ascend_simdvf_topk_gate", "example_simdvf_topk_gate.py", {}),
+    ("ascend_simdvf_vecadd", "example_simdvf_vecadd.py", {}),
+    ("ascend_simdvf_vecadd_lower", "example_simdvf_vecadd_lower.py", {}),
+    ("ascend_simtvf_vecadd", "example_simtvf_vecadd.py", {}),
+    ("ascend_simtvf_vecadd_mutex", "example_simtvf_vecadd_mutex.py", {}),
+    ("ascend_simdvf_per_token_cast_to_fp8", "example_simdvf_per_token_cast_to_fp8.py", {}),
+    ("ascend_simtvf_per_token_cast_to_fp8", "example_simtvf_per_token_cast_to_fp8.py", {}),
+    ("ascend_crosslevel_multibuffer", "example_crosslevel_multibuffer.py", {}),
+    ("ascend_compress", "example_compress.py", {}),
 ]
+
+# The PTO suite is a separate list (not derived from _ENTRIES) so Ascend reports never
+# change shape when PTO coverage grows or shrinks. Same tuple shape; the compile target
+# rides inside kwargs (``target="pto"``, or ``backend="pto"`` for the two
+# frontend-branching examples whose perf entry selects their codegen path). It mirrors
+# the standard Ascend entries compiled for PTO, with:
+#   * mha / gqa deferred until their PTO coverage is validated;
+#   * simdvf_vecadd / crosslevel_multibuffer excluded: PTO codegen has no handler
+#     for tl.simd.vmul / tl.simd.vdup yet;
+#   * two PTO-only persistent-RMSNorm entries (weight-init variants ub/gm at d=7168),
+#     whose example compiles for PTO internally and only takes variant/shape kwargs.
+PTO_ENTRIES: list[tuple[str, str, dict]] = [
+    ("pto_gemm_bf16", "example_gemm.py", {"dtype": "bfloat16", "target": "pto"}),
+    ("pto_gemm_fp32", "example_gemm.py", {"dtype": "float32", "target": "pto"}),
+    ("pto_gemm_fp32_hf32", "example_gemm.py", {"dtype": "float32", "hf32": "nearest_even", "target": "pto"}),
+    ("pto_gemm_splitk", "example_gemm_splitk.py", {"target": "pto"}),
+    ("pto_gemm_splitk_deterministic", "example_gemm_splitk.py", {"deterministic": True, "target": "pto"}),
+    ("pto_gemm_l0", "example_gemm_l0.py", {"target": "pto"}),
+    ("pto_gemm_mix_manual", "example_gemm_mix_manual.py", {"target": "pto"}),
+    ("pto_gemm_mixedkernel", "example_gemm_mixedkernel.py", {"target": "pto"}),
+    ("pto_gemm_bypass_l2", "example_gemm_bypass_l2.py", {"target": "pto"}),
+    ("pto_gemm_various_shapes", "example_gemm_various_shapes.py", {"target": "pto"}),
+    ("pto_blockscaled_gemm", "example_blockscaled_gemm.py", {"target": "pto"}),
+    ("pto_rmsnorm", "example_rmsnorm.py", {"target": "pto"}),
+    ("pto_buffer_version_annotation", "example_buffer_version_annotation.py", {"target": "pto"}),
+    ("pto_atomic_add", "example_atomic.py", {"target": "pto"}),
+    ("pto_simdvf_topk_gate", "example_simdvf_topk_gate.py", {"target": "pto"}),
+    ("pto_simdvf_vecadd_lower", "example_simdvf_vecadd_lower.py", {"backend": "pto"}),
+    ("pto_simtvf_vecadd", "example_simtvf_vecadd.py", {"target": "pto"}),
+    ("pto_simtvf_vecadd_mutex", "example_simtvf_vecadd_mutex.py", {"target": "pto"}),
+    ("pto_simdvf_per_token_cast_to_fp8", "example_simdvf_per_token_cast_to_fp8.py", {"backend": "pto"}),
+    ("pto_simtvf_per_token_cast_to_fp8", "example_simtvf_per_token_cast_to_fp8.py", {"target": "pto"}),
+    ("pto_compress", "example_compress.py", {"target": "pto"}),
+    ("pto_rmsnorm_persistent_ub_d7168", "example_rmsnorm_persistent_simtvf.py", {"variant": "ub", "d": 7168}),
+    ("pto_rmsnorm_persistent_gm_d7168", "example_rmsnorm_persistent_simtvf.py", {"variant": "gm", "d": 7168}),
+]
+
+_ALL_ENTRIES: dict[str, tuple[str, str, dict]] = {e[0]: e for e in [*_ENTRIES, *PTO_ENTRIES]}
+
+
+def _current_target() -> str:
+    target = os.environ.get(_ENV_TARGET, _DEFAULT_TARGET).strip().lower()
+    return target if target in TARGETS else _DEFAULT_TARGET
+
+
+def _entries_for(target: str) -> list[tuple[str, str, dict]]:
+    return PTO_ENTRIES if target == "pto" else _ENTRIES
+
 
 _EXAMPLE_MODULES: dict[str, object] = {}
 
@@ -143,14 +181,13 @@ def _run_child(entry_name: str) -> int:
     This supports both the persistent worker and the backwards-compatible direct child
     mode selected with ``TL_PERF_REGRESSION_ENTRY``.
     """
-    spec = next((e for e in _ENTRIES if e[0] == entry_name), None)
+    spec = _ALL_ENTRIES.get(entry_name)
     if spec is None:
         print(f"  ⚠️  unknown perf regression entry: {entry_name}", flush=True)
         print(_MARKER + json.dumps([]), flush=True)
         return 1
 
-    _, entry_path, kwargs = spec
-    rel_path, _, function_name = entry_path.partition(":")
+    _, rel_path, kwargs = spec
     results: list[dict] = []
     try:
         module = _load_example(rel_path)
@@ -159,8 +196,7 @@ def _run_child(entry_name: str) -> int:
         from tilelang.testing import perf_regression as pr
 
         pr._reset_results()
-        benchmark = getattr(module, function_name or "run_regression_perf")
-        tilelang_testing.process_func(benchmark, entry_name, **kwargs)
+        tilelang_testing.process_func(module.run_regression_perf, entry_name, **kwargs)
         results = [{"name": r.name, "latency": r.latency} for r in pr._RESULTS]
     except Exception as e:  # noqa: BLE001 - catchable failures still skip cleanly
         print(f"  ⚠️  {entry_name} failed, skipping: {type(e).__name__}: {e}", flush=True)
@@ -184,6 +220,7 @@ def _start_worker() -> _WorkerProcess:
     worker_env = {
         **os.environ,
         _ENV_WORKER: "1",
+        _ENV_TARGET: _current_target(),
         "PYTHONUNBUFFERED": "1",
         "TL_PERF_REGRESSION_FORMAT": "json",
     }
@@ -295,21 +332,29 @@ def _run_worker() -> int:
 
 def _run_parent() -> int:
     """Parent mode: supervise one persistent worker and merge surviving results."""
+    parser = argparse.ArgumentParser(description="Ascend/PTO performance regression driver")
+    parser.add_argument("--target", choices=TARGETS, default=_DEFAULT_TARGET, help="compile target")
+    args = parser.parse_args()
+    target = args.target
+    os.environ[_ENV_TARGET] = target
+
     try:
         timeout = float(os.environ.get(_ENV_TIMEOUT, _DEFAULT_ENTRY_TIMEOUT))
     except ValueError:
         timeout = _DEFAULT_ENTRY_TIMEOUT
 
-    total = len(_ENTRIES)
+    entries = _entries_for(target)
+
+    total = len(entries)
     merged: list[dict] = []
     worker: _WorkerProcess | None = None
     print(f"\n{'=' * 60}")
     print("  Ascend Performance Regression Suite (persistent worker)")
-    print(f"  {total} entries, {timeout:.0f}s per-entry timeout, restart on failure")
+    print(f"  target={target}  {total} entries, {timeout:.0f}s per-entry timeout, restart on failure")
     print(f"{'=' * 60}")
 
     try:
-        for idx, (entry_name, _path, _kwargs) in enumerate(_ENTRIES, 1):
+        for idx, (entry_name, _path, _kwargs) in enumerate(entries, 1):
             print(f"\n  ├─ [{idx}/{total}] {entry_name}", end="", flush=True)
             start = time.perf_counter()
 

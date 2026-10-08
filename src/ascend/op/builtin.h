@@ -143,6 +143,94 @@ TVM_DLL const Op &simd_mem_bar();
 TVM_DLL const Op &simd_vexpdif();
 TVM_DLL const Op &simd_vabsdif();
 
+// Ascend VMI virtual vector intrinsics (T.vmi.* API).
+// TIR ops registered as tl.vmi.<name>. These mirror PTODSL's public pto.vmi
+// surface.
+//
+// ABI notes:
+// - The TIR positional operands only carry dataflow values such as
+//   ptr/offset/values/mask. Python keyword-only API parameters like size,
+//   to_dtype, dist_mode, group, pmode, and order are lowered as call
+//   annotations instead of extra positional operands.
+// - vload(ptr, offset) with annotations {size, to_dtype?, stride?,
+//   block_stride?, repeat_stride?, dist_mode?, group?}
+// - vstore(values, destination_ptr, offset, mask?) with annotations
+//   {stride?, block_stride?, repeat_stride?, dist_mode?, group?, pmode?}
+// - create_mask(active_lanes) with annotations {size, group?}
+// - vci(base) with annotations {size, order?}
+// - vbrc(value) with annotations {size, group?}
+// - vintlv(lhs, rhs, mask) / vdintlv(lhs, rhs, mask)
+// - pair_get(pair, index) is an internal pure helper for tuple-style unpacking
+//   of multi-result VMI calls.
+
+// -- Load / Store / Predicates
+TVM_DLL const Op &vmi_vload();
+TVM_DLL const Op &vmi_vstore();
+TVM_DLL const Op &vmi_create_mask();
+
+// -- Index / Broadcast / Rearrange
+TVM_DLL const Op &vmi_vci();
+TVM_DLL const Op &vmi_vbrc();
+TVM_DLL const Op &vmi_vintlv();
+TVM_DLL const Op &vmi_vdintlv();
+TVM_DLL const Op &vmi_vunzip();
+TVM_DLL const Op &vmi_vzip();
+TVM_DLL const Op &vmi_pair_get();
+
+// -- Binary arithmetic / bitwise / shifts
+TVM_DLL const Op &vmi_vadd();
+TVM_DLL const Op &vmi_vsub();
+TVM_DLL const Op &vmi_vmul();
+TVM_DLL const Op &vmi_vdiv();
+TVM_DLL const Op &vmi_vmax();
+TVM_DLL const Op &vmi_vmin();
+TVM_DLL const Op &vmi_vand();
+TVM_DLL const Op &vmi_vor();
+TVM_DLL const Op &vmi_vxor();
+TVM_DLL const Op &vmi_vshl();
+TVM_DLL const Op &vmi_vshr();
+
+// -- Unary / math
+TVM_DLL const Op &vmi_vabs();
+TVM_DLL const Op &vmi_vneg();
+TVM_DLL const Op &vmi_vrelu();
+TVM_DLL const Op &vmi_vexp();
+TVM_DLL const Op &vmi_vln();
+TVM_DLL const Op &vmi_vsqrt();
+TVM_DLL const Op &vmi_vnot();
+
+// -- Vector-scalar arithmetic / shifts
+TVM_DLL const Op &vmi_vadds();
+TVM_DLL const Op &vmi_vmuls();
+TVM_DLL const Op &vmi_vmaxs();
+TVM_DLL const Op &vmi_vmins();
+TVM_DLL const Op &vmi_vshls();
+TVM_DLL const Op &vmi_vshrs();
+
+// -- Compare / select / reduce / convert
+TVM_DLL const Op &vmi_vcmp();
+TVM_DLL const Op &vmi_vcmps();
+TVM_DLL const Op &vmi_vsel();
+TVM_DLL const Op &vmi_vselr();
+TVM_DLL const Op &vmi_vcadd();
+TVM_DLL const Op &vmi_vcmax();
+TVM_DLL const Op &vmi_vcmin();
+TVM_DLL const Op &vmi_vcvt();
+TVM_DLL const Op &vmi_vinterpret_cast();
+
+// -- SFU / irregular / histogram
+TVM_DLL const Op &vmi_vexpdif();
+TVM_DLL const Op &vmi_vaxpy();
+TVM_DLL const Op &vmi_vlrelu();
+TVM_DLL const Op &vmi_vprelu();
+TVM_DLL const Op &vmi_vmull();
+TVM_DLL const Op &vmi_vmula();
+TVM_DLL const Op &vmi_vdhist();
+TVM_DLL const Op &vmi_vchist();
+TVM_DLL const Op &vmi_vgather();
+TVM_DLL const Op &vmi_vgatherb();
+TVM_DLL const Op &vmi_vscatter();
+
 /*!
  * \brief Ascend SetFlag intrinsic for pipeline synchronization.
  *
@@ -246,6 +334,14 @@ TVM_DLL const Op &ascend_fill_l1();
  *
  * ascend_load_cbuf_to_ca(dst, src, mStartPosition, kStartPosition,
  * mStep, kStep, srcStride, dstStride, transpose)
+ *
+ * Optionally 16 args when an MX scale-factor companion load is attached; the
+ * extra args drive a following asc_copy_l12l0a_mx:
+ *   [9]  sf_ptr, [10] sf_x_start,
+ *   [11] sf_y_start (y is contiguous fractal direction),
+ *   [12] sf_x_step,
+ *   [13] sf_y_step,
+ *   [14] sf_src_stride, [15] sf_dst_stride.
  */
 TVM_DLL const Op &ascend_load_cbuf_to_ca();
 
@@ -254,6 +350,14 @@ TVM_DLL const Op &ascend_load_cbuf_to_ca();
  *
  * ascend_load_cbuf_to_cb(dst, src, mStartPosition, kStartPosition,
  * mStep, kStep, srcStride, dstStride, transpose)
+ *
+ * Optionally 16 args when an MX scale-factor companion load is attached; the
+ * extra args drive a following asc_copy_l12l0b_mx:
+ *   [9]  sf_ptr, [10] sf_x_start,
+ *   [11] sf_y_start (y is contiguous fractal direction),
+ *   [12] sf_x_step,
+ *   [13] sf_y_step,
+ *   [14] sf_src_stride, [15] sf_dst_stride.
  */
 TVM_DLL const Op &ascend_load_cbuf_to_cb();
 

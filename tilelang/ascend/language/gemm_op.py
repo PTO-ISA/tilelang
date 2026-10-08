@@ -10,7 +10,7 @@ from tilelang.tileop.base import GemmWarpPolicy
 from tilelang.utils.language import prim_expr_equal, retrieve_shape, to_buffer_region
 from tvm import arith, tirx
 
-__all__ = ["gemm", "gemm_blockscaled"]
+__all__ = ["gemm", "gemm_blockscaled", "blockscaled_gemm"]
 
 
 def _legalize_argument(arg):
@@ -163,6 +163,44 @@ def gemm_blockscaled(
         tirx.const(0, dtype="int32"),
         annotations=annotations,
     )
+
+
+
+def blockscaled_gemm(
+    A: BufferLikeType,
+    B: BufferLikeType,
+    C: BufferLikeType,
+    sfa: BufferLikeType | None = None,
+    sfb: BufferLikeType | None = None,
+    transpose_A: bool = False,
+    transpose_B: bool = False,
+    clear_accum: bool = False,
+    unit_flag_ctrl: int | tirx.PrimExpr | None = None,
+) -> tirx.PrimExpr:
+    """Ascend block-scaled MXFP8 GEMM (pto-dev compatible entry).
+
+    Scale buffers are required for L1 A/B inputs; the call is routed through
+    :func:`gemm_blockscaled` so the scale regions ride the dedicated
+    ``tl.tileop.gemm_blockscaled`` protocol. For L0 A/B inputs the scales are
+    expected to have been loaded by the preceding ``T.copy(..., scale=...)``
+    and the dense ``tl.tileop.gemm`` form carries the ``blockscaled``
+    annotation instead.
+    """
+
+    if sfa is not None or sfb is not None:
+        return gemm_blockscaled(
+            A, B, C,
+            SFA=sfa,
+            SFB=sfb,
+            transpose_A=transpose_A,
+            transpose_B=transpose_B,
+            clear_accum=clear_accum,
+            unit_flag_ctrl=unit_flag_ctrl,
+        )
+    ann = {"blockscaled": 1}
+    if unit_flag_ctrl is not None:
+        ann["unit_flag_ctrl"] = unit_flag_ctrl
+    return _dialect_gemm_call(A, B, C, transpose_A, transpose_B, GemmWarpPolicy.Square, clear_accum, ann)
 
 
 def gemm(

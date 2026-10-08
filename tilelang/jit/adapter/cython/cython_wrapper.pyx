@@ -28,7 +28,7 @@ cdef class CythonKernelWrapper:
         object get_current_device
         object get_current_stream      # Raw-stream provider injected by the adapter (None = CUDA default)
 
-    def __cinit__(self, result_idx, params, lib, get_current_device=None, get_current_stream=None):
+    def __cinit__(self, result_idx, params, lib, get_current_device=None, get_current_stream=None, target=None):
         # Initialize wrapper with kernel configuration
         self.result_idx = result_idx
         self.params = params
@@ -42,7 +42,7 @@ cdef class CythonKernelWrapper:
         self.get_current_stream = get_current_stream
         for param in params:
             native_shape = []
-            for dim in param.shape:
+            for dim in param.storage_shape(target=target):
                 if isinstance(dim, tirx.IntImm):
                     native_shape.append(int(dim))
                 elif isinstance(dim, tirx.Var):
