@@ -1,0 +1,25 @@
+tag	status	wall_us	maxabs	note
+sv1d_e256_t32	PASS	0.89	NA	PASS line has no maxabs=
+sv2d_r16_c64_t32_input_keep	PASS	0.92	NA	PASS line has no maxabs=
+sv2d_r32_c64_t32_input_stream	PASS	1.01	NA	PASS line has no maxabs=
+sv2d_r32_c64_t32_fold_scale_keep	PASS	1.01	NA	PASS line has no maxabs=
+sv2d_r32_c64_t32_fold_scale_reload	PASS	1.45	NA	PASS line has no maxabs=
+sv2d_r32_c128_t32_input_stream	PASS	1.34	NA	PASS line has no maxabs=; phase2 known ~1.34
+sv3d_m24_vl64_k16_t32_keep	PASS	3.14	0.000e+00	
+sv3d_m32_vl64_k16_t32_keep	PASS	12.29	0.000e+00	
+sv3d_m32_vl64_k16_t32_split_cm16	PASS	6.88	0.000e+00	
+sv4d_e256_b8_t32_keep_idx	PASS	1.02	NA	PASS line has no maxabs=
+sv4d_e256_b8_t32_remat_idx	PASS	1.02	NA	PASS line has no maxabs=
+sv5d_r64_c128_g16_t32_keep_in_rf	PASS	18.72	2.980e-08	SUMMARY.tsv falsely COMPILE_FAIL rc=135
+sv5d_r64_c128_g16_t32_ub_stream	PASS	13.06	2.980e-08	SUMMARY.tsv falsely COMPILE_FAIL rc=134
+sv6d_r64_c128_g32_t32_keep_in_warp	PASS	38.83	2.980e-08	SUMMARY.tsv falsely COMPILE_FAIL rc=134
+sv6d_r64_c128_g32_t32_reload	PASS	11.66	2.980e-08	SUMMARY.tsv falsely COMPILE_FAIL rc=134
+sv7d_r64_c128_g64_t32_multiwarp_ub	PASS	12.83	2.980e-08	SUMMARY.tsv falsely COMPILE_FAIL rc=139
+sv7d_r64_c128_g64_t32_reload	PASS	11.1	2.980e-08	SUMMARY.tsv falsely COMPILE_FAIL rc=134
+sv7d_r64_c128_g128_t32_multiwarp_ub	PASS	12.59	2.980e-08	SUMMARY.tsv falsely COMPILE_FAIL rc=134
+sv7d_r64_c128_g128_t32_reload	PASS	10.79	2.980e-08	SUMMARY.tsv falsely COMPILE_FAIL rc=134
+sv8d_r64_c128_g16_t32_live	PASS	19.56	1.192e-07	SUMMARY.tsv falsely COMPILE_FAIL rc=139
+sv8d_r64_c128_g16_t32_spill_dist	PASS	20.28	1.192e-07	SUMMARY.tsv falsely COMPILE_FAIL rc=134
+sv9d_e256_k8_t32_keep	PASS	1.09	NA	PASS line has no maxabs=
+sv9d_e256_k8_t32_remat_scores	PASS	1.00	NA	PASS line has no maxabs=
+sv9d_e256_k8_t32_remat_idx	PASS	1.09	NA	PASS line has no maxabs=

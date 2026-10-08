@@ -1,0 +1,48 @@
+==== COMPILE sv5_r64_c128_g16_t32 ====
+COMPILE_OK sv5_r64_c128_g16_t32
+-rw-rw-r-- 1 happybot happybot 2424 Sep 23 17:07 /tmp/st_simtvf_parallel/sources/sv5_r64_c128_g16_t32_lowered.txt
+-rw-rw-r-- 1 happybot happybot 1579 Sep 23 17:07 /tmp/st_simtvf_parallel/sources/sv5_r64_c128_g16_t32_source.txt
+-rw-rw-r-- 1 happybot happybot 2424 Sep 23 17:06 /tmp/st_simtvf_parallel/sources/sv5_r64_c128_g16_t32_tir.txt
+sv5_r64_c128_g16_t32 PASS maxabs=1.1920928955078125e-07 R=64 C=128 G=16 CG=8 us=core_name           duration_time(us)   running_time(us)     core0.veccore0      9.34                9.34                 core_name           duration_time(us)   running_time(us)     core0.veccore0      9.34                9.34                 
+==== COMPILE sv6_r64_c128_g64_t32 ====
+COMPILE_OK sv6_r64_c128_g64_t32
+-rw-rw-r-- 1 happybot happybot 2424 Sep 23 17:08 /tmp/st_simtvf_parallel/sources/sv6_r64_c128_g64_t32_lowered.txt
+-rw-rw-r-- 1 happybot happybot 1574 Sep 23 17:08 /tmp/st_simtvf_parallel/sources/sv6_r64_c128_g64_t32_source.txt
+-rw-rw-r-- 1 happybot happybot 2424 Sep 23 17:08 /tmp/st_simtvf_parallel/sources/sv6_r64_c128_g64_t32_tir.txt
+sv6_r64_c128_g64_t32 PASS maxabs=2.9802322387695312e-08 R=64 C=128 G=64 CG=2 us=core_name           duration_time(us)   running_time(us)     core0.veccore0      14.44               14.44                core_name           duration_time(us)   running_time(us)     core0.veccore0      14.44               14.44                
+==== COMPILE sv6_r64_c128_g128_t32 ====
+COMPILE_OK sv6_r64_c128_g128_t32
+-rw-rw-r-- 1 happybot happybot 2426 Sep 23 17:11 /tmp/st_simtvf_parallel/sources/sv6_r64_c128_g128_t32_lowered.txt
+-rw-rw-r-- 1 happybot happybot 1576 Sep 23 17:11 /tmp/st_simtvf_parallel/sources/sv6_r64_c128_g128_t32_source.txt
+-rw-rw-r-- 1 happybot happybot 2426 Sep 23 17:10 /tmp/st_simtvf_parallel/sources/sv6_r64_c128_g128_t32_tir.txt
+sv6_r64_c128_g128_t32 PASS maxabs=2.9802322387695312e-08 R=64 C=128 G=128 CG=1 us=core_name           duration_time(us)   running_time(us)     core0.veccore0      14.69               14.69                core_name           duration_time(us)   running_time(us)     core0.veccore0      14.69               14.69                
+==== COMPILE sv8_r64_c128_g16_t32_live ====
+COMPILE_OK sv8_r64_c128_g16_t32_live
+-rw-rw-r-- 1 happybot happybot 2772 Sep 23 17:13 /tmp/st_simtvf_parallel/sources/sv8_r64_c128_g16_t32_live_lowered.txt
+-rw-rw-r-- 1 happybot happybot 1815 Sep 23 17:13 /tmp/st_simtvf_parallel/sources/sv8_r64_c128_g16_t32_live_source.txt
+-rw-rw-r-- 1 happybot happybot 2772 Sep 23 17:13 /tmp/st_simtvf_parallel/sources/sv8_r64_c128_g16_t32_live_tir.txt
+sv8_r64_c128_g16_t32_live PASS maxabs=0.0 R=64 C=128 G=16 us=core_name           duration_time(us)   running_time(us)     core0.veccore0      17.04               17.04                core_name           duration_time(us)   running_time(us)     core0.veccore0      17.04               17.04                
+==== COMPILE sv8_r64_c128_g16_t32_spill_dist ====
+COMPILE_OK sv8_r64_c128_g16_t32_spill_dist
+-rw-rw-r-- 1 happybot happybot 3117 Sep 23 17:16 /tmp/st_simtvf_parallel/sources/sv8_r64_c128_g16_t32_spill_dist_lowered.txt
+-rw-rw-r-- 1 happybot happybot 2115 Sep 23 17:16 /tmp/st_simtvf_parallel/sources/sv8_r64_c128_g16_t32_spill_dist_source.txt
+-rw-rw-r-- 1 happybot happybot 3117 Sep 23 17:15 /tmp/st_simtvf_parallel/sources/sv8_r64_c128_g16_t32_spill_dist_tir.txt
+sv8_r64_c128_g16_t32_spill_dist PASS maxabs=0.0 R=64 C=128 G=16 us=core_name           duration_time(us)   running_time(us)     core0.veccore0      18.23               18.23                core_name           duration_time(us)   running_time(us)     core0.veccore0      18.23               18.23                
+---
+-rwxrwxr-x 1 happybot happybot 526904 Sep 22 20:19 /tmp/st_simtvf_parallel/so/sv5_e256_t32_frag.so
+-rwxrwxr-x 1 happybot happybot 527000 Sep 22 20:20 /tmp/st_simtvf_parallel/so/sv5_e256_t32_reload.so
+-rwxrwxr-x 1 happybot happybot 553104 Sep 23 17:07 /tmp/st_simtvf_parallel/so/sv5_r64_c128_g16_t32.so
+-rwxrwxr-x 1 happybot happybot 526360 Sep 23 17:11 /tmp/st_simtvf_parallel/so/sv6_r64_c128_g128_t32.so
+-rwxrwxr-x 1 happybot happybot 552080 Sep 23 14:42 /tmp/st_simtvf_parallel/so/sv6_r64_c128_g16_t32_reload.so
+-rwxrwxr-x 1 happybot happybot 554648 Sep 23 14:39 /tmp/st_simtvf_parallel/so/sv6_r64_c128_g16_t32_remat.so
+-rwxrwxr-x 1 happybot happybot 526952 Sep 23 17:08 /tmp/st_simtvf_parallel/so/sv6_r64_c128_g64_t32.so
+-rwxrwxr-x 1 happybot happybot 527944 Sep 23 14:38 /tmp/st_simtvf_parallel/so/sv8_32x32_t128.so
+-rwxrwxr-x 1 happybot happybot 530600 Sep 23 14:38 /tmp/st_simtvf_parallel/so/sv8_32x32_t32.so
+-rwxrwxr-x 1 happybot happybot 551368 Sep 23 17:13 /tmp/st_simtvf_parallel/so/sv8_r64_c128_g16_t32_live.so
+-rwxrwxr-x 1 happybot happybot 611808 Sep 23 17:16 /tmp/st_simtvf_parallel/so/sv8_r64_c128_g16_t32_spill_dist.so
+---OPSIM---
+====  ====
+====  ====
+====  ====
+====  ====
+====  ====

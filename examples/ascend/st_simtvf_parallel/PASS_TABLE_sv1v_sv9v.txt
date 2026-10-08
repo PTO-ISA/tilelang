@@ -1,0 +1,87 @@
+# NOTE 2026-10-05 (REGRESSION-2): sv3v t64 rows now PASS on opsim (Ascend950PR_9599,
+# target=pto + pr258 overlay). maxabs=0.0 vs numpy gold for all three. The rewrite that
+# unblocked them is in reports/ST_SV3V_FIX.md; t32 sv3v rows stay COMPILE_FAIL (lanes ABI:
+# SimdVF lanes in {64,128,256}).
+# NOTE 2026-09-24: sv4v_*_keep2 COMPILE_FAIL rows are HISTORICAL — keep2 replaced by
+# sv4v_e*_b*_t*_{keep_idx,remat_idx}. Do not invent µs for new tags until opsim.
+TAG                                              PASS         us
+------------------------------------------------------------
+sv1v_e256_t64                                    PASS        0.9
+sv1v_e2048_t64                                   PASS       1.25
+sv3v_m24_vl64_k16_t64_keep                       PASS       4.57
+sv3v_m32_vl64_k16_t64_keep                       PASS       5.81
+sv3v_m32_vl64_k16_t64_split_cm16                 PASS       5.84
+--- compile fails (lanes ABI / PTO layout / VerifyParallel) ---
+COMPILE_FAIL sv1v_e2048_t32 rc=1
+COMPILE_FAIL sv1v_e256_t32 rc=1
+COMPILE_FAIL sv2v_r32_c32_t32_frag_live rc=1
+COMPILE_FAIL sv2v_r32_c32_t32_reload rc=1
+COMPILE_FAIL sv2v_r32_c32_t64_frag_live rc=1
+COMPILE_FAIL sv2v_r32_c32_t64_reload rc=1
+COMPILE_FAIL sv3v_m24_vl64_k16_t32_keep rc=1
+COMPILE_FAIL sv3v_m32_vl64_k16_t32_keep rc=1
+COMPILE_FAIL sv3v_m32_vl64_k16_t32_split_cm16 rc=1
+COMPILE_FAIL sv4v_e256_b16_t32_keep2 rc=1
+COMPILE_FAIL sv4v_e256_b16_t64_keep2 rc=1
+COMPILE_FAIL sv4v_e256_b8_t32_keep2 rc=1
+COMPILE_FAIL sv4v_e256_b8_t64_keep2 rc=1
+COMPILE_FAIL sv5v_r64_c128_g16_t32 rc=1
+COMPILE_FAIL sv5v_r64_c128_g16_t64 rc=1
+COMPILE_FAIL sv6v_r64_c128_g32_t32 rc=1
+COMPILE_FAIL sv6v_r64_c128_g32_t64 rc=1
+COMPILE_FAIL sv7v_r64_c128_g128_t32 rc=1
+COMPILE_FAIL sv7v_r64_c128_g128_t64 rc=1
+COMPILE_FAIL sv7v_r64_c128_g64_t32 rc=1
+COMPILE_FAIL sv7v_r64_c128_g64_t64 rc=1
+COMPILE_FAIL sv8v_r64_c128_g16_t32_live rc=1
+COMPILE_FAIL sv8v_r64_c128_g16_t32_spill_dist rc=1
+COMPILE_FAIL sv8v_r64_c128_g16_t64_live rc=1
+COMPILE_FAIL sv8v_r64_c128_g16_t64_spill_dist rc=1
+COMPILE_FAIL sv9v_e256_k1_t32_keep rc=1
+COMPILE_FAIL sv9v_e256_k1_t64_keep rc=1
+COMPILE_FAIL sv9v_e256_k8_t32_keep rc=1
+COMPILE_FAIL sv9v_e256_k8_t32_remat_idx rc=1
+COMPILE_FAIL sv9v_e256_k8_t32_remat_scores rc=1
+COMPILE_FAIL sv9v_e256_k8_t64_keep rc=1
+COMPILE_FAIL sv9v_e256_k8_t64_remat_idx rc=1
+COMPILE_FAIL sv9v_e256_k8_t64_remat_scores rc=1
+
+# ---- SV4v gather_psum (2026-10-05, REGRESSION-2)
+# PTO lowering blocks BOTH arms at every shape tried (overlay libtilelang, ptoas a5/vpto):
+#   'func.func' op contains an uncovered top-level op segment whose section kind cannot be
+#   inferred uniquely; ambiguous op(s): 'pto.set_flag' ... -> failed to normalize uncovered
+#   PTO tile sections.   No us invented.
+COMPILE_FAIL sv4v_e256_b8_t64_keep_idx rc=1
+COMPILE_FAIL sv4v_e256_b8_t64_remat_idx rc=1
+COMPILE_FAIL sv4v_e1024_b8_t64_keep_idx rc=1
+COMPILE_FAIL sv4v_e1024_b8_t64_remat_idx rc=1
+COMPILE_FAIL sv4v_e2048_b8_t64_keep_idx rc=1
+
+# ---- Case-3 VMI twins rewritten for the RF-capacity ladder, 2026-10-06 ----
+# kernels sv5v/sv6v/sv7v now carry the ladder arms:
+#   sv5v {keep_in_rf | ub_stream}, sv6v {reload | keep_in_warp}, sv7v {reload | multiwarp_ub}
+# Oneshot: oneshot_sv567v_rfladder.sh (PYTHONPATH DEPS before CAMO). Work dir on pto-b10:
+#   /tmp/pr272_sv567_rfladder_20261006 (RESULT.md, VF_THEORY.md).
+# Three ABI walls had to be cleared first (reports/ST_CASE3_VMI.md):
+#   1. lane-continuity: group reduce over t with lanes over n is stride-G -> staged a
+#      TRANSPOSED working set xt[t,n] so every VF access is lane-continuous;
+#   2. the transpose cannot be a strided GM->UB copy (MTE 32B row-stride rule) and the
+#      UB->UB copy crashes the overlay -> scalar transpose OUTSIDE the VF region;
+#   3. Div is not on the Parallel->PTO whitelist -> reciprocal + 1e-6 clamp in a
+#      Kernel-scope serial loop outside SimdVF (CF5V lesson).
+# Before the rewrite all 8 arms were COMPILE_FAIL. Wall us below is dominated by the
+# scalar transpose prologue; the VF-body cycles (vector RVEC pipes) are what the theory
+# model compares against (see reports/ST_VF_THEORY.md).
+TAG                                        PASS         us    note
+------------------------------------------------------------------------------
+sv5v_r64_c128_g16_t64_ub_stream            PASS     109.39    maxabs=0.0; C_meas(RVEC)=11817; scalar-transpose dominates wall
+sv5v_r64_c128_g16_t64_keep_in_rf           COMPILE_FAIL  NA   "The layout for fragment xf can not be inferred correctly"
+sv6v_r64_c128_g32_t64_reload               PASS     101.22    maxabs=0.0; C_meas(RVEC)=11397
+sv6v_r64_c128_g32_t64_keep_in_warp         COMPILE_FAIL  NA   fragment xf layout (same wall as sv5v keep_in_rf)
+sv7v_r64_c128_g128_t64_reload              PASS      95.43    maxabs=0.0; C_meas(RVEC)=12782
+sv7v_r64_c128_g128_t64_multiwarp_ub        PASS      95.44    maxabs=0.0; C_meas(RVEC)=12228; ≈tie with reload
+sv7v_r64_c128_g64_t64_reload               PASS      97.16    maxabs=0.0; C_meas(RVEC)=13457
+sv7v_r64_c128_g64_t64_multiwarp_ub         PASS      97.16    maxabs=0.0; C_meas(RVEC)=13570; tie with reload
+# Harvest: oneshot_sv567v_rfladder.sh DONE 2026-10-06 17:48 HKT on pto-b10;
+# reports/case3_rfladder_20261006/{RESULT.md,VF_THEORY.md,SUMMARY_sv567v_rfladder_raw.txt}.
+# VMI C_meas = RVEC pipe sum (see reports/ST_VF_THEORY.md). No push.

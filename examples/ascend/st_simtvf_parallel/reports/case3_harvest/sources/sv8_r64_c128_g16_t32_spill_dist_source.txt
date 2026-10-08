@@ -1,0 +1,44 @@
+#include <tl_templates/ascend/common.h>
+#include <tl_templates/ascend/debug.h>
+__simt_vf__ __launch_bounds__(32) inline void simt_vf_0(__ubuf__ uint8_t* buf_dyn_shmem) {
+  float sf_inv[16];
+  float m = float(0x0p+0f/*0.000000e+00*/);
+  float s = float(0x0p+0f/*0.000000e+00*/);
+  float s_1 = float(0x0p+0f/*0.000000e+00*/);
+  #pragma unroll
+  for (int32_t i = 0; i < 16; ++i) {
+    m = float(0x0p+0f/*0.000000e+00*/);
+    for (int32_t t = 0; t < 16; ++t) {
+      float vv = ((float)((__ubuf__ half*)buf_dyn_shmem)[(((i * 512) + (((int32_t)threadIdx.x) * 16)) + t)]);
+      m = max(m, max(vv, (vv * float(-0x1p+0f/*-1.000000e+00*/))));
+    }
+    m = max(m, float(0x1.0c6f7a0b5ed8dp-20f/*1.000000e-06*/));
+    sf_inv[i] = (float(0x1p+0f/*1.000000e+00*/) / m);
+  }
+  #pragma unroll
+  for (int32_t i_1 = 0; i_1 < 16; ++i_1) {
+    s = sf_inv[i_1];
+    for (int32_t t_1 = 0; t_1 < 16; ++t_1) {
+      ((__ubuf__ float*)buf_dyn_shmem)[((((i_1 * 512) + (((int32_t)threadIdx.x) * 16)) + t_1) + 8192)] = s;
+    }
+  }
+  asc_syncthreads();
+  #pragma unroll
+  for (int32_t i_2 = 0; i_2 < 256; ++i_2) {
+    s_1 = ((__ubuf__ float*)buf_dyn_shmem)[(((i_2 * 32) + ((int32_t)threadIdx.x)) + 8192)];
+    ((__ubuf__ half*)buf_dyn_shmem)[(((i_2 * 32) + ((int32_t)threadIdx.x)) + 8192)] = ((half)(((float)((__ubuf__ half*)buf_dyn_shmem)[((i_2 * 32) + ((int32_t)threadIdx.x))]) * s_1));
+  }
+}
+
+extern "C" __global__ __vector__ void main_kernel(__gm__ half* Out, __gm__ half* X) {
+  AscendC::InitSocState();
+  __ubuf__ uint8_t *buf_dyn_shmem = (__ubuf__ uint8_t *)0;
+  copy_gm_to_ubuf_align_v2((__ubuf__ uint8_t*)((&(((__ubuf__ half*)buf_dyn_shmem)[0]))), (__gm__ uint8_t*)((&(X[0]))), 0, 1, 16384, 0, 0, 0, 0, 16384, 16384);
+  AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(0);
+  AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(0);
+  asc_vf_call<simt_vf_0>(cce::dim3(32), buf_dyn_shmem);
+  AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(0);
+  AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(0);
+  copy_ubuf_to_gm_align_v2((__gm__ void*)((&(Out[0]))), (__ubuf__ void*)((&(((__ubuf__ half*)buf_dyn_shmem)[8192]))), 0, 1, 16384, 4, 16384, 16384);
+}
+

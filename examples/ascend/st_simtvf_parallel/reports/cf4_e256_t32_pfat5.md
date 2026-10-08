@@ -1,0 +1,7 @@
+# cf4_e256_t32_pfat5
+
+- status: **PASS**
+- wall_us: 1.23
+- 
+- layout: launch_bounds=32; x[] sizes=['8']; tir=cf4_e256_t32_pfat5_tir.txt; src=cf4_e256_t32_pfat5_source.txt; elems_per_thread≈8.00
+- instr: VF_SIMT us=0.42 cyc=758 body_instr=222 IPC_proxy=0.293 | top_opcodes: MOV_XD_IMM:27, SIMT_FSETP:23, SIMT_LDS:18, SIMT_END_DVG:16, MOVK:16, SIMT_MOV:15, MOV_XD_SPR:13, SIMT_STS:8, SIMT_FMUL:8, SIMT_BRANCH:8, SIMT_START_DVG:8, MOV_SPR_XN:6 | pipes: SCALAR:93, RVECEX:51, RVECLP:33, RVECLD:18, RVECST:8, MTE2:6, FLOWCTRL:5, PUSHQ:4

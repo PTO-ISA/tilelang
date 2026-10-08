@@ -1,0 +1,41 @@
+# PTO-DSL Layer D SV1d–SV9d — opsim Ascend950PR_9599 on pto-b10, harvest 2026-10-07 HKT
+# Wall = core0.veccore0 duration_time(us) from each *.log under
+#   /tmp/st_simtvf_parallel/ptodsl_sv1_sv9d/
+# Status = PASS iff log contains `PASS <tag>` (NOT SUMMARY.tsv rc — pipe/sim_dsl
+# often exits non-zero after a real PASS; Case-3 was mis-labeled COMPILE_FAIL).
+# maxabs from PASS line when printed; NA = oneshot omitted maxabs= (still PASS).
+# CF*d left alone. No git push / no PR #272.
+TAG                                        PASS         us    maxabs
+------------------------------------------------------------------------------
+sv1d_e256_t32                              PASS       0.89        NA
+sv2d_r16_c64_t32_input_keep                PASS       0.92        NA
+sv2d_r32_c64_t32_input_stream              PASS       1.01        NA
+sv2d_r32_c64_t32_fold_scale_keep           PASS       1.01        NA
+sv2d_r32_c64_t32_fold_scale_reload         PASS       1.45        NA
+sv2d_r32_c128_t32_input_stream             PASS       1.34        NA
+sv3d_m24_vl64_k16_t32_keep                 PASS       3.14   0.000e+00
+sv3d_m32_vl64_k16_t32_keep                 PASS      12.29   0.000e+00
+sv3d_m32_vl64_k16_t32_split_cm16           PASS       6.88   0.000e+00
+sv4d_e256_b8_t32_keep_idx                  PASS       1.02        NA
+sv4d_e256_b8_t32_remat_idx                 PASS       1.02        NA
+sv5d_r64_c128_g16_t32_keep_in_rf           PASS      18.72   2.980e-08
+sv5d_r64_c128_g16_t32_ub_stream            PASS      13.06   2.980e-08
+sv6d_r64_c128_g32_t32_keep_in_warp         PASS      38.83   2.980e-08
+sv6d_r64_c128_g32_t32_reload               PASS      11.66   2.980e-08
+sv7d_r64_c128_g64_t32_multiwarp_ub         PASS      12.83   2.980e-08
+sv7d_r64_c128_g64_t32_reload               PASS      11.10   2.980e-08
+sv7d_r64_c128_g128_t32_multiwarp_ub        PASS      12.59   2.980e-08
+sv7d_r64_c128_g128_t32_reload              PASS      10.79   2.980e-08
+sv8d_r64_c128_g16_t32_live                 PASS      19.56   1.192e-07
+sv8d_r64_c128_g16_t32_spill_dist           PASS      20.28   1.192e-07
+sv9d_e256_k8_t32_keep                      PASS       1.09        NA
+sv9d_e256_k8_t32_remat_scores              PASS       1.00        NA
+sv9d_e256_k8_t32_remat_idx                 PASS       1.09        NA
+
+# Case-3 winners (lower wall_us):
+#   SV5d G16: ub_stream 13.06 vs keep_in_rf 18.72  (−30.2%)
+#   SV6d G32: reload 11.66 vs keep_in_warp 38.83  (−70.0%)
+#   SV7d G64: reload 11.10 vs multiwarp_ub 12.83  (−13.5%)
+#   SV7d G128: reload 10.79 vs multiwarp_ub 12.59 (−14.3%)
+#   SV8d G16: live 19.56 vs spill_dist 20.28       (−3.5%)
+# Remaining blockers: none for this tag set (24/24 PASS).

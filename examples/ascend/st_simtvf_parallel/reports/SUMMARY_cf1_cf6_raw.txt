@@ -1,0 +1,60 @@
+==== COMPILE cf1_e256_k1_t32_keep ====
+COMPILE_OK cf1_e256_k1_t32_keep
+-rw-rw-r-- 1 happybot happybot 2337 Sep 25 12:00 /tmp/st_simtvf_parallel/sources/cf1_e256_k1_t32_keep_lowered.txt
+-rw-rw-r-- 1 happybot happybot 1961 Sep 25 12:00 /tmp/st_simtvf_parallel/sources/cf1_e256_k1_t32_keep_source.txt
+-rw-rw-r-- 1 happybot happybot 2337 Sep 25 12:00 /tmp/st_simtvf_parallel/sources/cf1_e256_k1_t32_keep_tir.txt
+cf1_e256_k1_t32_keep PASS maxabs=0.0 E=256 K=1 us=core_name           duration_time(us)   running_time(us)     core0.veccore0      1.15                1.15                 core_name           duration_time(us)   running_time(us)     core0.veccore0      1.15                1.15                 
+==== COMPILE cf1_e256_k8_t32_keep ====
+COMPILE_OK cf1_e256_k8_t32_keep
+-rw-rw-r-- 1 happybot happybot 2337 Sep 25 12:03 /tmp/st_simtvf_parallel/sources/cf1_e256_k8_t32_keep_lowered.txt
+-rw-rw-r-- 1 happybot happybot 2024 Sep 25 12:03 /tmp/st_simtvf_parallel/sources/cf1_e256_k8_t32_keep_source.txt
+-rw-rw-r-- 1 happybot happybot 2337 Sep 25 12:02 /tmp/st_simtvf_parallel/sources/cf1_e256_k8_t32_keep_tir.txt
+cf1_e256_k8_t32_keep PASS maxabs=0.0 E=256 K=8 us=core_name           duration_time(us)   running_time(us)     core0.veccore0      0.97                0.97                 core_name           duration_time(us)   running_time(us)     core0.veccore0      0.97                0.97                 
+==== COMPILE cf2_e256_k8_t32_remat ====
+COMPILE_OK cf2_e256_k8_t32_remat
+-rw-rw-r-- 1 happybot happybot 2335 Sep 25 12:05 /tmp/st_simtvf_parallel/sources/cf2_e256_k8_t32_remat_lowered.txt
+-rw-rw-r-- 1 happybot happybot 2266 Sep 25 12:05 /tmp/st_simtvf_parallel/sources/cf2_e256_k8_t32_remat_source.txt
+-rw-rw-r-- 1 happybot happybot 2335 Sep 25 12:04 /tmp/st_simtvf_parallel/sources/cf2_e256_k8_t32_remat_tir.txt
+cf2_e256_k8_t32_remat PASS maxabs=0.0 E=256 K=8 us=core_name           duration_time(us)   running_time(us)     core0.veccore0      1.95                1.95                 core_name           duration_time(us)   running_time(us)     core0.veccore0      1.95                1.95                 
+==== COMPILE cf3_e256_k8_t32_remat_idx ====
+COMPILE_OK cf3_e256_k8_t32_remat_idx
+-rw-rw-r-- 1 happybot happybot 2342 Sep 25 12:08 /tmp/st_simtvf_parallel/sources/cf3_e256_k8_t32_remat_idx_lowered.txt
+-rw-rw-r-- 1 happybot happybot 2082 Sep 25 12:08 /tmp/st_simtvf_parallel/sources/cf3_e256_k8_t32_remat_idx_source.txt
+-rw-rw-r-- 1 happybot happybot 2342 Sep 25 12:07 /tmp/st_simtvf_parallel/sources/cf3_e256_k8_t32_remat_idx_tir.txt
+cf3_e256_k8_t32_remat_idx PASS maxabs=0.0 E=256 K=8 us=core_name           duration_time(us)   running_time(us)     core0.veccore0      1.33                1.33                 core_name           duration_time(us)   running_time(us)     core0.veccore0      1.33                1.33                 
+==== COMPILE cf4_e256_t32_pfat5 ====
+COMPILE_OK cf4_e256_t32_pfat5
+-rw-rw-r-- 1 happybot happybot 3054 Sep 25 12:10 /tmp/st_simtvf_parallel/sources/cf4_e256_t32_pfat5_lowered.txt
+-rw-rw-r-- 1 happybot happybot 2514 Sep 25 12:10 /tmp/st_simtvf_parallel/sources/cf4_e256_t32_pfat5_source.txt
+-rw-rw-r-- 1 happybot happybot 3054 Sep 25 12:09 /tmp/st_simtvf_parallel/sources/cf4_e256_t32_pfat5_tir.txt
+cf4_e256_t32_pfat5 PASS maxabs=0.0 E=256 pfat=5 us=core_name           duration_time(us)   running_time(us)     core0.veccore0      1.23                1.23                 core_name           duration_time(us)   running_time(us)     core0.veccore0      1.23                1.23                 
+==== COMPILE cf4_e256_t32_pfat25 ====
+COMPILE_OK cf4_e256_t32_pfat25
+-rw-rw-r-- 1 happybot happybot 3054 Sep 25 12:11 /tmp/st_simtvf_parallel/sources/cf4_e256_t32_pfat25_lowered.txt
+-rw-rw-r-- 1 happybot happybot 2514 Sep 25 12:11 /tmp/st_simtvf_parallel/sources/cf4_e256_t32_pfat25_source.txt
+-rw-rw-r-- 1 happybot happybot 3054 Sep 25 12:11 /tmp/st_simtvf_parallel/sources/cf4_e256_t32_pfat25_tir.txt
+cf4_e256_t32_pfat25 PASS maxabs=0.0 E=256 pfat=25 us=core_name           duration_time(us)   running_time(us)     core0.veccore0      1.25                1.25                 core_name           duration_time(us)   running_time(us)     core0.veccore0      1.25                1.25                 
+==== COMPILE cf5_e256_t32_pnear5 ====
+COMPILE_OK cf5_e256_t32_pnear5
+-rw-rw-r-- 1 happybot happybot 2542 Sep 25 12:15 /tmp/st_simtvf_parallel/sources/cf5_e256_t32_pnear5_lowered.txt
+-rw-rw-r-- 1 happybot happybot 2295 Sep 25 12:15 /tmp/st_simtvf_parallel/sources/cf5_e256_t32_pnear5_source.txt
+-rw-rw-r-- 1 happybot happybot 2542 Sep 25 12:13 /tmp/st_simtvf_parallel/sources/cf5_e256_t32_pnear5_tir.txt
+cf5_e256_t32_pnear5 PASS maxabs=4.76837158203125e-07 E=256 pnear=5 us=core_name           duration_time(us)   running_time(us)     core0.veccore0      1.18                1.18                 core_name           duration_time(us)   running_time(us)     core0.veccore0      1.18                1.18                 
+==== COMPILE cf5_e256_t32_pnear25 ====
+COMPILE_OK cf5_e256_t32_pnear25
+-rw-rw-r-- 1 happybot happybot 2542 Sep 25 12:18 /tmp/st_simtvf_parallel/sources/cf5_e256_t32_pnear25_lowered.txt
+-rw-rw-r-- 1 happybot happybot 2295 Sep 25 12:18 /tmp/st_simtvf_parallel/sources/cf5_e256_t32_pnear25_source.txt
+-rw-rw-r-- 1 happybot happybot 2542 Sep 25 12:18 /tmp/st_simtvf_parallel/sources/cf5_e256_t32_pnear25_tir.txt
+cf5_e256_t32_pnear25 PASS maxabs=4.76837158203125e-07 E=256 pnear=25 us=core_name           duration_time(us)   running_time(us)     core0.veccore0      1.18                1.18                 core_name           duration_time(us)   running_time(us)     core0.veccore0      1.18                1.18                 
+==== COMPILE cf6_e256_t32_pnear5 ====
+COMPILE_OK cf6_e256_t32_pnear5
+-rw-rw-r-- 1 happybot happybot 2322 Sep 25 12:20 /tmp/st_simtvf_parallel/sources/cf6_e256_t32_pnear5_lowered.txt
+-rw-rw-r-- 1 happybot happybot 2010 Sep 25 12:20 /tmp/st_simtvf_parallel/sources/cf6_e256_t32_pnear5_source.txt
+-rw-rw-r-- 1 happybot happybot 2322 Sep 25 12:20 /tmp/st_simtvf_parallel/sources/cf6_e256_t32_pnear5_tir.txt
+cf6_e256_t32_pnear5 PASS maxabs=3.814697265625e-06 E=256 pnear=5 us=core_name           duration_time(us)   running_time(us)     core0.veccore0      1.37                1.37                 core_name           duration_time(us)   running_time(us)     core0.veccore0      1.37                1.37                 
+==== COMPILE cf6_e256_t32_pnear25 ====
+COMPILE_OK cf6_e256_t32_pnear25
+-rw-rw-r-- 1 happybot happybot 2322 Sep 25 12:22 /tmp/st_simtvf_parallel/sources/cf6_e256_t32_pnear25_lowered.txt
+-rw-rw-r-- 1 happybot happybot 2010 Sep 25 12:22 /tmp/st_simtvf_parallel/sources/cf6_e256_t32_pnear25_source.txt
+-rw-rw-r-- 1 happybot happybot 2322 Sep 25 12:21 /tmp/st_simtvf_parallel/sources/cf6_e256_t32_pnear25_tir.txt
+cf6_e256_t32_pnear25 PASS maxabs=4.76837158203125e-07 E=256 pnear=25 us=core_name           duration_time(us)   running_time(us)     core0.veccore0      1.37                1.37                 core_name           duration_time(us)   running_time(us)     core0.veccore0      1.37                1.37                 

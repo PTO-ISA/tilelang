@@ -1,0 +1,46 @@
+==== COMPILE sv5_r64_c128_g16_t32_keep_in_rf ====
+COMPILE_FAIL sv5_r64_c128_g16_t32_keep_in_rf rc=1
+cython adapter hook skipped: NameError: name 'cy_adapter' is not defined
+Traceback (most recent call last):
+tvm.error.InternalError: Check failed: (StructuralEqual()(it->second.indices, indices)) is false: xf: (i, g, t) and (i, g, t)
+==== COMPILE sv5_r64_c128_g16_t32_ub_stream ====
+COMPILE_OK sv5_r64_c128_g16_t32_ub_stream
+-rw-rw-r-- 1 happybot happybot 2159 Oct  6 15:56 /tmp/pr272_sv567_rfladder_20261006/sources/sv5_r64_c128_g16_t32_ub_stream_lowered.txt
+-rw-rw-r-- 1 happybot happybot 1466 Oct  6 15:56 /tmp/pr272_sv567_rfladder_20261006/sources/sv5_r64_c128_g16_t32_ub_stream_source.txt
+-rw-rw-r-- 1 happybot happybot 2159 Oct  6 15:56 /tmp/pr272_sv567_rfladder_20261006/sources/sv5_r64_c128_g16_t32_ub_stream_tir.txt
+sv5_r64_c128_g16_t32_ub_stream PASS maxabs=1.1920928955078125e-07 R=64 C=128 G=16 CG=8 arm=ub_stream us=core_name           duration_time(us)   running_time(us)     core0.veccore0      4.18                4.18                 core_name           duration_time(us)   running_time(us)     core0.veccore0      4.18                4.18                 
+==== COMPILE sv6_r64_c128_g32_t32_keep_in_warp ====
+COMPILE_FAIL sv6_r64_c128_g32_t32_keep_in_warp rc=1
+cython adapter hook skipped: NameError: name 'cy_adapter' is not defined
+Traceback (most recent call last):
+tvm.error.InternalError: Check failed: (StructuralEqual()(it->second.indices, indices)) is false: xf: (i, g, t) and (i, g, t)
+==== COMPILE sv6_r64_c128_g32_t32_reload ====
+COMPILE_OK sv6_r64_c128_g32_t32_reload
+-rw-rw-r-- 1 happybot happybot 2159 Oct  6 15:57 /tmp/pr272_sv567_rfladder_20261006/sources/sv6_r64_c128_g32_t32_reload_lowered.txt
+-rw-rw-r-- 1 happybot happybot 1466 Oct  6 15:57 /tmp/pr272_sv567_rfladder_20261006/sources/sv6_r64_c128_g32_t32_reload_source.txt
+-rw-rw-r-- 1 happybot happybot 2159 Oct  6 15:57 /tmp/pr272_sv567_rfladder_20261006/sources/sv6_r64_c128_g32_t32_reload_tir.txt
+sv6_r64_c128_g32_t32_reload PASS maxabs=5.960464477539063e-08 R=64 C=128 G=32 CG=4 us=core_name           duration_time(us)   running_time(us)     core0.veccore0      12.58               12.58                core_name           duration_time(us)   running_time(us)     core0.veccore0      12.58               12.58                
+==== COMPILE sv7_r64_c128_g128_t32_multiwarp_ub ====
+COMPILE_OK sv7_r64_c128_g128_t32_multiwarp_ub
+-rw-rw-r-- 1 happybot happybot 2777 Oct  6 15:59 /tmp/pr272_sv567_rfladder_20261006/sources/sv7_r64_c128_g128_t32_multiwarp_ub_lowered.txt
+-rw-rw-r-- 1 happybot happybot 1959 Oct  6 15:59 /tmp/pr272_sv567_rfladder_20261006/sources/sv7_r64_c128_g128_t32_multiwarp_ub_source.txt
+-rw-rw-r-- 1 happybot happybot 2777 Oct  6 15:59 /tmp/pr272_sv567_rfladder_20261006/sources/sv7_r64_c128_g128_t32_multiwarp_ub_tir.txt
+sv7_r64_c128_g128_t32_multiwarp_ub PASS maxabs=2.9802322387695312e-08 R=64 C=128 G=128 CG=1 arm=multiwarp_ub us=core_name           duration_time(us)   running_time(us)     core0.veccore0      15.42               15.42                core_name           duration_time(us)   running_time(us)     core0.veccore0      15.42               15.42                
+==== COMPILE sv7_r64_c128_g128_t32_reload ====
+COMPILE_OK sv7_r64_c128_g128_t32_reload
+-rw-rw-r-- 1 happybot happybot 2161 Oct  6 16:02 /tmp/pr272_sv567_rfladder_20261006/sources/sv7_r64_c128_g128_t32_reload_lowered.txt
+-rw-rw-r-- 1 happybot happybot 1465 Oct  6 16:02 /tmp/pr272_sv567_rfladder_20261006/sources/sv7_r64_c128_g128_t32_reload_source.txt
+-rw-rw-r-- 1 happybot happybot 2161 Oct  6 16:02 /tmp/pr272_sv567_rfladder_20261006/sources/sv7_r64_c128_g128_t32_reload_tir.txt
+sv7_r64_c128_g128_t32_reload PASS maxabs=2.9802322387695312e-08 R=64 C=128 G=128 CG=1 arm=reload us=core_name           duration_time(us)   running_time(us)     core0.veccore0      14.58               14.58                core_name           duration_time(us)   running_time(us)     core0.veccore0      14.58               14.58                
+==== COMPILE sv7_r64_c128_g64_t32_multiwarp_ub ====
+COMPILE_OK sv7_r64_c128_g64_t32_multiwarp_ub
+-rw-rw-r-- 1 happybot happybot 2776 Oct  6 16:04 /tmp/pr272_sv567_rfladder_20261006/sources/sv7_r64_c128_g64_t32_multiwarp_ub_lowered.txt
+-rw-rw-r-- 1 happybot happybot 1958 Oct  6 16:04 /tmp/pr272_sv567_rfladder_20261006/sources/sv7_r64_c128_g64_t32_multiwarp_ub_source.txt
+-rw-rw-r-- 1 happybot happybot 2776 Oct  6 16:04 /tmp/pr272_sv567_rfladder_20261006/sources/sv7_r64_c128_g64_t32_multiwarp_ub_tir.txt
+sv7_r64_c128_g64_t32_multiwarp_ub PASS maxabs=2.9802322387695312e-08 R=64 C=128 G=64 CG=2 arm=multiwarp_ub us=core_name           duration_time(us)   running_time(us)     core0.veccore0      7.32                7.31                 core_name           duration_time(us)   running_time(us)     core0.veccore0      7.32                7.31                 
+==== COMPILE sv7_r64_c128_g64_t32_reload ====
+COMPILE_OK sv7_r64_c128_g64_t32_reload
+-rw-rw-r-- 1 happybot happybot 2159 Oct  6 16:05 /tmp/pr272_sv567_rfladder_20261006/sources/sv7_r64_c128_g64_t32_reload_lowered.txt
+-rw-rw-r-- 1 happybot happybot 1463 Oct  6 16:05 /tmp/pr272_sv567_rfladder_20261006/sources/sv7_r64_c128_g64_t32_reload_source.txt
+-rw-rw-r-- 1 happybot happybot 2159 Oct  6 16:05 /tmp/pr272_sv567_rfladder_20261006/sources/sv7_r64_c128_g64_t32_reload_tir.txt
+sv7_r64_c128_g64_t32_reload PASS maxabs=2.9802322387695312e-08 R=64 C=128 G=64 CG=2 arm=reload us=core_name           duration_time(us)   running_time(us)     core0.veccore0      14.54               14.54                core_name           duration_time(us)   running_time(us)     core0.veccore0      14.54               14.54                

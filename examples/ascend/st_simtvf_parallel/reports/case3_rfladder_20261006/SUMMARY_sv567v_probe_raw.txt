@@ -1,0 +1,11 @@
+==== COMPILE probe_sv6v_t_r64_c128_g32_t64_ubub (SimdVF/pto/overlay) ====
+COMPILE_FAIL probe_sv6v_t_r64_c128_g32_t64_ubub rc=127
+SimdVF FFI OK signature=(latency: 'int' = 0, lanes: 'int' = 128) -> 'SimdVFFrame'
+== compile probe_sv6v_t_r64_c128_g32_t64_ubub target=pto (SimdVF/VMI) flags=['-include', '/mnt/fluxdata/happybot/projects/tilelang-deepseek-pto-vmi-topk/examples/ascend/msprof_res/orig_pto_vmi_simd/bisheng_libstdcxx_clang_fix.h', '-isystem', '/usr/include/c++/12'] ==
+/home/happybot/projects/tilelang-deepseek/.venv-npu/bin/python: symbol lookup error: /home/happybot/projects/tilelang-pto-vmi-deps-stack/build/lib/libtilelang.so: undefined symbol: _ZNK3tvm2tl14ParallelOpNode12GetPredicateENS_4tirx3VarE
+==== COMPILE probe_sv6v_t_r64_c128_g32_t64_scalar (SimdVF/pto/overlay) ====
+COMPILE_OK probe_sv6v_t_r64_c128_g32_t64_scalar
+-rw-rw-r-- 1 happybot happybot 2377 Oct  6 16:24 /tmp/pr272_sv567_rfladder_20261006/sources/probe_sv6v_t_r64_c128_g32_t64_scalar_lowered.txt
+-rw-rw-r-- 1 happybot happybot 4068 Oct  6 16:24 /tmp/pr272_sv567_rfladder_20261006/sources/probe_sv6v_t_r64_c128_g32_t64_scalar_source.txt
+-rw-rw-r-- 1 happybot happybot 2377 Oct  6 16:23 /tmp/pr272_sv567_rfladder_20261006/sources/probe_sv6v_t_r64_c128_g32_t64_scalar_tir.txt
+probe_sv6v_t_r64_c128_g32_t64_scalar  us=

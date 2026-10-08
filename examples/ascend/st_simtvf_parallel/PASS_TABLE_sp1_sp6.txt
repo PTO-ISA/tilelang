@@ -1,0 +1,34 @@
+# PASS TABLE — SP1–SP6 (Ascend950PR_9599 opsim 2026-10-07 ~18:40 HKT)
+#
+# Oneshot: oneshot_sp1_sp6.sh on pto-b10 (edgexpert-59a6)
+# Suite stamp: SP2_ARMS_READY md5=1d7707456f47576a0eb471000d6f1986
+# Contract: reports/ST_SP1_TO_SP6_ACCESS.md
+# e2e µs = core0.veccore0 duration_time from SUMMARY_sp1_sp6_raw.txt
+
+| case | tag | arm | status | e2e µs | notes |
+|------|-----|-----|--------|------:|-------|
+| SP1 | `sp1_t32_k2_h128_g32_t32_keep_pos` | keep_pos | PASS | 12.63 | shared pos_row (frag VRF KEEP gap) |
+| SP1 | `sp1_t32_k2_h128_g32_t32_remat_pos` | remat_pos | PASS | 11.19 | |
+| SP2 | `sp2_t32_k2_h128_g32_t32_sf0_w0_keep_acc` | sf0_w0 + keep_acc | PASS | 9.19 | Acc KEEP; tax off |
+| SP2 | `sp2_t32_k2_h128_g32_t32_sf1_w1_keep_acc` | sf1_w1 + keep_acc | PASS | 14.88 | Acc KEEP; tax on |
+| SP2 | `sp2_t32_k2_h128_g32_t32_sf1_w1_remat_acc` | sf1_w1 + remat_acc | PASS | 22.27 | Acc remat via shared RMW |
+| SP2 | `sp2_t32_k2_h128_g32_t32_sf0_w0_remat_acc` | sf0_w0 + remat_acc | PASS | 12.08 | Acc remat; tax off |
+| SP2 | `sp2_t32_k2_h128_g32_t32_sf1_w1_keep_pos` | sf1_w1 + keep_pos | PASS | 14.79 | legacy Pos keep (Acc KEEP) |
+| SP2 | `sp2_t32_k2_h128_g32_t32_sf1_w1_remat_pos` | sf1_w1 + remat_pos | PASS | 13.35 | legacy Pos remat |
+| SP3 | `sp3_m32_h128_g32_t32_fp32` | fp32 | PASS | 7.45 | fp32 SF sideband |
+| SP3 | `sp3_m32_h128_g32_t32_e8m0` | e8m0 | PASS | 7.45 | A5 bit-reinterpret (`T.reinterpret`); no soft Pow2 LUT |
+| SP4 | `sp4_e64_h128_t32_pad25` | pad25 | PASS | 9.63 | |
+| SP5 | `sp5_n64_h128_g32_qg32_t32_sideband` | sideband | PASS | 30.44 | |
+| SP5 | `sp5_n64_h128_g32_qg32_t32_interleave` | interleave | PASS | 31.92 | |
+| SP6 | `sp6_n32_h128_g32_t32_unpack` | unpack | PASS | 5.35 | soft LUT 4-bit appendix |
+| SP6 | `sp6_n32_h128_g32_t32_unpack_sf` | unpack_sf | PASS | 11.42 | soft LUT + SF |
+
+**SP2 cliffs (this run):** keep_acc sf0→sf1: 9.19→14.88 µs (+tax); keep→remat Acc @sf1: 14.88→22.27 µs; remat Acc @sf0: 12.08 µs.
+**SP3:** e8m0 ≈ fp32 wall (7.45) — bit-reinterpret decode ≈ free at this shape.
+**All 15 tags PASS. No push.**
+
+# --- SP6d SIMD (PTO-DSL) appendix twin 2026-10-08 ---
+| SP6d | `sp6d_n32_h128_g32_t32_unpack_vselr` | unpack+vselr ★ | PASS | 1.22 | VF=393; soft LUT; see PASS_TABLE_sp6d.txt |
+| SP6d | `sp6d_n32_h128_g32_t32_unpack_gather` | unpack+gather | PASS | 1.30 | VF=534 |
+| SP6d | `sp6d_n32_h128_g32_t32_unpack_sf_vselr` | unpack_sf+vselr ★ | PASS | 1.40 | VF=707 |
+| SP6d | `sp6d_n32_h128_g32_t32_unpack_sf_gather` | unpack_sf+gather | PASS | 1.46 | VF=826 |

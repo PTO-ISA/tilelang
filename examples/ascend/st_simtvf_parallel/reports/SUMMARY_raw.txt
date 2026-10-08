@@ -1,0 +1,36 @@
+==== COMPILE sv2_e256_k1_t32 ====
+sv2_e256_k1_t32 PASS got= [144] exp= [144] us=core_name           duration_time(us)   running_time(us)     core0.veccore0      1.17                1.17                 core_name           duration_time(us)   running_time(us)     core0.veccore0      1.17                1.17                 
+==== COMPILE sv2_e256_k8_t32 ====
+sv2_e256_k8_t32 PASS got= [144, 33, 200, 7, 99, 12, 180, 55] exp= [144, 33, 200, 7, 99, 12, 180, 55] us=core_name           duration_time(us)   running_time(us)     core0.veccore0      1.48                1.48                 core_name           duration_time(us)   running_time(us)     core0.veccore0      1.48                1.48                 
+==== COMPILE sv2_e256_k1_t128 ====
+sv2_e256_k1_t128 PASS got= [144] exp= [144] us=core_name           duration_time(us)   running_time(us)     core0.veccore0      1.18                1.18                 core_name           duration_time(us)   running_time(us)     core0.veccore0      1.18                1.18                 
+==== COMPILE sv2_e256_k8_t128 ====
+sv2_e256_k8_t128 PASS got= [144, 33, 200, 7, 99, 12, 180, 55] exp= [144, 33, 200, 7, 99, 12, 180, 55] us=core_name           duration_time(us)   running_time(us)     core0.veccore0      3.03                3.03                 core_name           duration_time(us)   running_time(us)     core0.veccore0      3.03                3.03                 
+==== COMPILE sv3_e256_k1_t32 ====
+sv3_e256_k1_t32 PASS got= [144] exp= [144] us=core_name           duration_time(us)   running_time(us)     core0.veccore0      1.15                1.15                 core_name           duration_time(us)   running_time(us)     core0.veccore0      1.15                1.15                 
+==== COMPILE sv3_e256_k8_t32 ====
+sv3_e256_k8_t32 PASS got= [144, 33, 200, 7, 99, 12, 180, 55] exp= [144, 33, 200, 7, 99, 12, 180, 55] us=core_name           duration_time(us)   running_time(us)     core0.veccore0      2.02                2.02                 core_name           duration_time(us)   running_time(us)     core0.veccore0      2.02                2.02                 
+==== COMPILE sv4_e256_k8_t32 ====
+sv4_e256_k8_t32 PASS got= [144, 33, 200, 7, 99, 12, 180, 55] exp= [144, 33, 200, 7, 99, 12, 180, 55] us=core_name           duration_time(us)   running_time(us)     core0.veccore0      1.48                1.48                 core_name           duration_time(us)   running_time(us)     core0.veccore0      1.48                1.48                 
+==== COMPILE sv4_e256_k8_t128 ====
+sv4_e256_k8_t128 PASS got= [144, 33, 200, 7, 99, 12, 180, 55] exp= [144, 33, 200, 7, 99, 12, 180, 55] us=core_name           duration_time(us)   running_time(us)     core0.veccore0      3.03                3.03                 core_name           duration_time(us)   running_time(us)     core0.veccore0      3.03                3.03                 
+==== COMPILE sv1_e256_t32 ====
+sv1_e256_t32 PASS maxabs=0.0
+==== COMPILE sv1_e2048_t32 ====
+sv1_e2048_t32 PASS maxabs=0.0
+==== COMPILE sv7_n128_t32 ====
+sv7_n128_t32 PASS got=[9.5] exp=[9.5]
+==== COMPILE sv7_n128_t128 ====
+sv7_n128_t128 PASS got=[9.5] exp=[9.5]
+==== COMPILE sv8_32x32_t32 ====
+COMPILE_FAIL sv8_32x32_t32 rc=1
+==== COMPILE sv8_32x32_t128 ====
+COMPILE_FAIL sv8_32x32_t128 rc=1
+==== COMPILE sv5_e256_t32_frag ====
+sv5_e256_t32_frag PASS y_maxabs=2.9802322387695312e-08 z_ok=True
+==== COMPILE sv5_e256_t32_reload ====
+sv5_e256_t32_reload PASS y_maxabs=2.9802322387695312e-08 z_ok=True
+==== COMPILE sv6_r64_c128_g16_t32_remat ====
+COMPILE_FAIL sv6_r64_c128_g16_t32_remat rc=1
+==== COMPILE sv6_r64_c128_g16_t32_reload ====
+COMPILE_FAIL sv6_r64_c128_g16_t32_reload rc=1

@@ -1,0 +1,20 @@
+# PASS TABLE — SP6d SIMD (PTO-DSL) soft e2m1 LUT (Ascend950PR_9599 opsim 2026-10-08 HKT)
+#
+# Kernel: kernels_ptodsl/sp6d_fp4_unpack.py
+# Remote: /tmp/sp6d_20261008/ on pto-b10 · sim_dsl.sh Ascend950PR_9599
+# Contract: reports/ST_SP1_TO_SP6_ACCESS.md §SP6 (appendix; not schedule peer of SP1–SP5)
+# Soft LUT only — NOT HW float4_e2m1x2_t / castFp4toBf16
+# e2e µs = core0.veccore0 duration_time; VF_total = Σ VF/VF_SIMD cycles
+
+| case | tag | arm | lut | status | VF_total | e2e µs | notes |
+|------|-----|-----|-----|--------|--------:|-------:|-------|
+| SP6d | `sp6d_n32_h128_g32_t32_unpack_gather` | unpack | gather | PASS | 534 | 1.30 | vgather Lut[16] |
+| SP6d | `sp6d_n32_h128_g32_t32_unpack_vselr` | unpack | vselr | PASS | 393 | 1.22 | ★ best unpack; vselr VL-padded table |
+| SP6d | `sp6d_n32_h128_g32_t32_unpack_sf_gather` | unpack_sf | gather | PASS | 826 | 1.46 | + Sf size=1+vbrc mul |
+| SP6d | `sp6d_n32_h128_g32_t32_unpack_sf_vselr` | unpack_sf | vselr | PASS | 707 | 1.40 | ★ best unpack_sf |
+
+**vselr notes:** binding `pto.vmi.vselr(source, index)` present; requires index lane count == source/result VL.
+Lut UB padded to VL×f32 (256 B) with live values in lanes 0..15. First try size=16 table → COMPILE_FAIL
+(`index lane count to match result lane count`); VL-padded reload → PASS.
+
+**All 4 tags PASS.**
