@@ -9,9 +9,7 @@ Primary metric: **total VF cycles** (sum of vector-pipe / VF launch cycles on `c
 | [`docs/st-deck-v2.pptx`](docs/st-deck-v2.pptx) | Slide deck |
 | [`SUMMARY.md`](SUMMARY.md) | Sensitivity axes + VF results |
 
-## Case list (21 Simt + 19 SIMD = 40 of 42)
-
-SP4d / SP5d are **not present** (Simt-only for now). Do not invent kernels.
+## Case list (21 Simt + 21 SIMD = 42/42)
 
 ### SV1–SV9 — vector / RF
 
@@ -45,8 +43,8 @@ SP4d / SP5d are **not present** (Simt-only for now). Do not invent kernels.
 | SP1 | Pos KEEP vs remat (dual co-scatter) | `kernels/sp1_dual_scatter_vsf.py` | `kernels_ptodsl/sp1d_dual_scatter_keep_pos.py` |
 | SP2 | Acc KEEP/remat × sf0_w0/sf1_w1 tax | `kernels/sp2_dual_gather_wreduce.py` | `kernels_ptodsl/sp2d_dual_gather_wreduce.py` |
 | SP3 | fp32 SF vs A5 bit-reinterpret e8m0 | `kernels/sp3_sf_pack_ue8m0.py` | `kernels_ptodsl/sp3d_sf_pack_e8m0.py` |
-| SP4 | Pad gather early-skip vs mask | `kernels/sp4_pad_gather.py` | *(Simt-only — no SP4d)* |
-| SP5 | Sideband vs interleave gather | `kernels/sp5_sideband_vs_interleave.py` | *(Simt-only — no SP5d)* |
+| SP4 | Pad gather early-skip vs mask | `kernels/sp4_pad_gather.py` | `kernels_ptodsl/sp4d_pad_gather.py` |
+| SP5 | Sideband vs interleave gather | `kernels/sp5_sideband_vs_interleave.py` | `kernels_ptodsl/sp5d_sideband_vs_interleave.py` |
 | SP6 | Soft 4-bit e2m1 LUT unpack (± SF) | `kernels/sp6_fp4_unpack.py` | `kernels_ptodsl/sp6d_fp4_unpack.py` |
 
 ## How to run (pto-b10)
@@ -73,7 +71,7 @@ bash oneshot_cf1_cf6.sh              # Simt CF1–CF6
 bash oneshot_sp1_sp6.sh              # Simt SP1–SP6
 bash oneshot_ptodsl_sv1_sv9d.sh      # SIMD SV1d–SV9d
 bash oneshot_ptodsl_cf1d_cf6d.sh     # SIMD CF1d–CF6d
-bash oneshot_ptodsl_sp1d_sp6d.sh     # SIMD SP1d/SP2d/SP3d/SP6d
+bash oneshot_ptodsl_sp1d_sp6d.sh     # SIMD SP1d–SP6d (includes SP4d/SP5d)
 ```
 
 Harness / opsim helpers: `common_asc_harness.py`, `common_pto_harness.py`, `run_opsim_generic.py`, `run_opsim_topk.py` (SV9).  

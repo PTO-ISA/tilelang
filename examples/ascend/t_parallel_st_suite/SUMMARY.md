@@ -90,9 +90,9 @@ Figures below are **not re-validated** on PTO-ISA/`pto-dev` tip opsim. Live re-r
 | SP2 | T32 K2 H128 G32 | sf0_w0+remat_acc | 18,944 | sf0_w0+keep_acc | 837 | 22.63 | 12.08 | 2.02 |
 | SP3 | M32 H128 G32 fp32 | fp32 | 11,158 | fp32 | 349 | 31.97 | 7.45 | 1.44 |
 | SP3 | M32 H128 G32 e8m0 | e8m0 | 11,171 | e8m0 | 311 | 35.92 | 7.45 | 1.39 |
-| SP4 | E64 H128 pad25 | pad25 | 13,968 | *(no SP4d)* | — | — | 9.63 | — |
-| SP5 | N64 H128 G32 QG32 | sideband ★ | 52,001 | *(no SP5d)* | — | — | 30.44 | — |
-| SP5 | N64 H128 G32 QG32 | interleave | 54,655 | *(no SP5d)* | — | — | 31.92 | — |
+| SP4 | E64 H128 pad25 | pad25 | 13,968 | mask | TODO | — | 9.63 | — |
+| SP5 | N64 H128 G32 QG32 | sideband ★ | 52,001 | sideband | TODO | — | 30.44 | — |
+| SP5 | N64 H128 G32 QG32 | interleave | 54,655 | interleave | TODO | — | 31.92 | — |
 | SP6 | N32 H128 G32 | unpack ★ | 7,813 | unpack+vselr ★ | 393 | 19.88 | 5.35 | 1.22 |
 | SP6 | N32 H128 G32 | unpack_sf | 18,727 | unpack_sf+vselr ★ | 707 | 26.49 | 11.42 | 1.40 |
 
@@ -104,8 +104,8 @@ Figures below are **not re-validated** on PTO-ISA/`pto-dev` tip opsim. Live re-r
 - **SP1:** Pos KEEP vs remat under dual live (V,Sf) co-scatter. Simt remat_pos wins VF; SIMD keep_pos is vscatter path (higher VF here).
 - **SP2:** Acc KEEP/remat × sf0_w0/sf1_w1 compute tax. Simt Acc remat cliffs hard; SIMD collapses Acc remat.
 - **SP3:** fp32 SF load vs A5 bit-reinterpret e8m0 compose (no soft Pow2 LUT; no native e8m0 vcvt on A5).
-- **SP4:** pad gather predication — **Simt-only** (no SP4d yet).
-- **SP5:** sideband (2 indexed loads) vs interleave (1 slot then split) — **Simt-only** (no SP5d yet).
+- **SP4:** pad gather predication. Simt early-skips `Expert[p]<0`; SIMD (SP4d) walks every row and zeros holes with a full-lane `vsel` mask. Twin landed; VF TODO (no opsim on this change).
+- **SP5:** sideband gathers `V[slot]` and `Sf[slot]` as two tensors; interleave gathers one `Pack[slot]` then splits the scale tail. Same gold `Out[q,j]=V[slot,j]*Sf[slot,j//G]`. Twins landed; VF TODO (no opsim on this change).
 - **SP6:** soft 4-bit e2m1 LUT unpack (± SF); SIMD ★ = **vselr** (needs VL-padded table).
 
 ---
@@ -115,7 +115,7 @@ Figures below are **not re-validated** on PTO-ISA/`pto-dev` tip opsim. Live re-r
 | Layer | Count | Notes |
 |-------|------:|-------|
 | Simt kernels | 21 | SV1–9, CF1–6, SP1–6 |
-| SIMD (PTO-DSL) kernels | 19 | SV1d–9d, CF1d–6d, SP1d/2d/3d/6d |
-| Intended product | 42 | 21×2; **SP4d/SP5d missing** → 40 runnable cases |
+| SIMD (PTO-DSL) kernels | 21 | SV1d–9d, CF1d–6d, SP1d–6d |
+| Intended product | 42 | 21 Simt + 21 SIMD; SP4d/SP5d landed (VF TODO) |
 
 Deck: [`docs/st-deck-v2.pptx`](docs/st-deck-v2.pptx).

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PTO-DSL — SP1d / SP2d / SP3d / SP6d (no SP4d/SP5d yet).
+# PTO-DSL — SP1d / SP2d / SP3d / SP4d / SP5d / SP6d.
 # Run on pto-b10 login node (Ascend950PR_9599 opsim).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -73,6 +73,13 @@ run_one "sp2d_t32_k2_h128_g32_t32_sf1_w1_remat_acc" "kernels_ptodsl/sp2d_dual_ga
 # SP3d fp32 / e8m0
 run_one "sp3d_m32_h128_g32_t32_fp32" "kernels_ptodsl/sp3d_sf_pack_e8m0.py" --arm fp32 --tag sp3d_m32_h128_g32_t32_fp32
 run_one "sp3d_m32_h128_g32_t32_e8m0" "kernels_ptodsl/sp3d_sf_pack_e8m0.py" --arm e8m0 --tag sp3d_m32_h128_g32_t32_e8m0
+
+# SP4d full-lane mask (pad holes via vsel; no early exit)
+run_one "sp4d_e64_h128_t32_pad25" "kernels_ptodsl/sp4d_pad_gather.py" 64 128 32 25
+
+# SP5d sideband (two gathers) vs interleave (one Pack slot, then split)
+run_one "sp5d_n64_h128_g32_qg32_t32_sideband" "kernels_ptodsl/sp5d_sideband_vs_interleave.py" 64 128 32 32 32 sideband
+run_one "sp5d_n64_h128_g32_qg32_t32_interleave" "kernels_ptodsl/sp5d_sideband_vs_interleave.py" 64 128 32 32 32 interleave
 
 # SP6d soft LUT (gather + vselr) × unpack / unpack_sf
 run_one "sp6d_n32_h128_g32_t32_unpack_gather"    "kernels_ptodsl/sp6d_fp4_unpack.py" 32 128 32 32 unpack gather

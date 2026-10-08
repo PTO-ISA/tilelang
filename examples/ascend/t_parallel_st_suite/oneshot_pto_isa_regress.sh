@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Full primary-scope regress on PTO-ISA/tilelang pto-dev checkout.
-# Simt SV/CF/SP + SIMD (PTO-DSL) SV/CF/SP (SP4d/SP5d absent).
+# Simt SV/CF/SP + SIMD (PTO-DSL) SV/CF/SP (21 + 21, including SP4d/SP5d).
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 DST=$(cd "$HERE/../../.." && pwd)
