@@ -1,92 +1,84 @@
-# SimtVF Parallel ST suite (SV1–SV9 contiguous)
+# SimtVF Parallel ST suite (SV / CF / SP)
 
-Sensitivity STs for SimtVF + `T.Parallel` + fragment RF.  
-**Canonical design (purpose + GPU/NPU):** [`reports/ST_LIST_DESIGN.md`](reports/ST_LIST_DESIGN.md).  
-**Case-3 quant umbrella:** [`reports/ST_CASE3_DESIGN.md`](reports/ST_CASE3_DESIGN.md).
+Sensitivity STs comparing **Simt `T.Parallel`** vs **SIMD (PTO-DSL)** on Ascend950PR (opsim).
 
-## Contract
-- `target=ascend` + `execution_backend=cython` (**not** pto) for SimtVF
-- deps-native `libtilelang.so` (not overlay)
-- VMI twins: `target=pto` + overlay — never mix libs
-- env: `.venv-npu` + `cann_91b3` + `TORCH_DEVICE_BACKEND_AUTOLOAD=0`
+Primary metric: **total VF cycles** (sum of vector-pipe / VF launch cycles on `core0.veccore0`). Wall µs is secondary. Compare each Simt arm to the **best SIMD (PTO-DSL) schedule** at the same shape — label it “SIMD (PTO-DSL)”, not “*d twin”.
 
-## Active kernels (SV1–SV9)
-| ST | Kernel | Notes |
-|----|--------|-------|
-| SV1 | `kernels/sv1_stream_eltwise.py` | stream eltwise |
-| SV2 | `kernels/sv2_eltwise_bcast_rf.py` | live RF / reload (ex-SV1B) |
-| SV3 | `kernels/sv3_gemv_partial_keep.py` | GEMV Acc KEEP/split (ex-SV2G) |
-| SV4 | `kernels/sv4_index_gather_psum.py` | gather + psum (`keep_idx` / `remat_idx`); VMI twin `sv4v_*` |
-| SV5 | `kernels/sv5_reduce_small_eltwise.py` | Case-3 small-G |
-| SV6 | `kernels/sv6_reduce_mid_eltwise.py` | Case-3 mid-G (**NEW**) |
-| SV7 | `kernels/sv7_reduce_large_eltwise.py` | Case-3 large-G (ex-SV6) |
-| SV8 | `kernels/sv8_case3_bcast.py` | quant e2e live / spill_dist |
-| SV9 | `kernels/sv9_topk_e2e.py` | topk e2e keep / remat_scores / remat_idx |
-| VMI | `sv5v` / `sv6v` / `sv7v` / `sv8v` | Case-3 twins |
+| Deck | Summary |
+|------|---------|
+| [`docs/st-deck-v2.pptx`](docs/st-deck-v2.pptx) | Slide deck |
+| [`SUMMARY.md`](SUMMARY.md) | Sensitivity axes + VF results |
 
-## Removed
-Legacy micros in `kernels/_removed_legacy/` (old topk SV2/3/4, old SV5/6, old SV7 1D, old SV8 32×32).  
-Two finals: **SV8 quant e2e** + **SV9 topk e2e**.
+## Case list (21 Simt + 19 SIMD = 40 of 42)
 
-## Reports
-- [`reports/ST_LIST_DESIGN.md`](reports/ST_LIST_DESIGN.md) — SV1–SV9 purpose + GPU/NPU
-- [`reports/ST_SV1_AND_SV2.md`](reports/ST_SV1_AND_SV2.md)
-- [`reports/ST_SV3_GEMV.md`](reports/ST_SV3_GEMV.md)
-- [`reports/ST_SV4_INDEX_GATHER_PSUM.md`](reports/ST_SV4_INDEX_GATHER_PSUM.md) (keep2 redirect: `ST_SV4_INDEX_KEEP2.md`)
-- [`reports/ST_CASE3_DESIGN.md`](reports/ST_CASE3_DESIGN.md) + SV5/SV6/SV7/SV8 + VMI
-- [`reports/ST_SV9_TOPK_E2E.md`](reports/ST_SV9_TOPK_E2E.md)
-- [`reports/RESULTS.md`](reports/RESULTS.md)
+SP4d / SP5d are **not present** (Simt-only for now). Do not invent kernels.
 
-## Run (all Simt SV1–SV9)
-```bash
-bash oneshot_sv1_sv9.sh
-# laptop relay:
-powershell -File .\\run_via_laptop_sv1_sv9.ps1
-```
+### SV1–SV9 — vector / RF
 
-Per-family: `oneshot_sv2.sh`, `oneshot_sv3.sh`, `oneshot_sv4.sh`, `oneshot_sv5_sv6_sv7_sv8.sh`, `oneshot_sv9.sh`.
+| ST | Sensitivity (one line) | Simt | SIMD (PTO-DSL) |
+|----|------------------------|------|----------------|
+| SV1 | Stream eltwise baseline | `kernels/sv1_stream_eltwise.py` | `kernels_ptodsl/sv1d_stream_eltwise.py` |
+| SV2 | Input KEEP / STREAM (+ fold-scale reload foil) | `kernels/sv2_eltwise_bcast_rf.py` | `kernels_ptodsl/sv2d_eltwise_bcast_rf.py` |
+| SV3 | GEMV Acc KEEP vs split_cm16 | `kernels/sv3_gemv_partial_keep.py` | `kernels_ptodsl/sv3d_gemv_partial_keep.py` |
+| SV4 | Index gather + psum: keep_idx vs remat_idx | `kernels/sv4_index_gather_psum.py` | `kernels_ptodsl/sv4d_index_gather_psum.py` |
+| SV5 | Case-3 small-G: keep_in_rf vs ub_stream | `kernels/sv5_reduce_small_eltwise.py` | `kernels_ptodsl/sv5d_reduce_small.py` |
+| SV6 | Case-3 mid-G: keep_in_warp vs reload | `kernels/sv6_reduce_mid_eltwise.py` | `kernels_ptodsl/sv6d_reduce_mid.py` |
+| SV7 | Case-3 large-G: multiwarp_ub vs reload | `kernels/sv7_reduce_large_eltwise.py` | `kernels_ptodsl/sv7d_reduce_large.py` |
+| SV8 | Quant e2e: live vs spill_dist | `kernels/sv8_case3_bcast.py` | `kernels_ptodsl/sv8d_case3_bcast.py` |
+| SV9 | TopK e2e: keep / remat_scores / remat_idx | `kernels/sv9_topk_e2e.py` | `kernels_ptodsl/sv9d_topk_e2e.py` |
 
+### CF1–CF6 — control flow
 
-## Phase 1 — PTO-DSL twins (layer D)
+| ST | Sensitivity (one line) | Simt | SIMD (PTO-DSL) |
+|----|------------------------|------|----------------|
+| CF1 | Parallel if vs scalar thresh; scores KEEP | `kernels/cf1_pred_thresh_keep.py` | `kernels_ptodsl/cf1d_pred_thresh_keep.py` |
+| CF2 | Remat scores + shared-kill publish | `kernels/cf2_remat_thresh_kill_shared.py` | `kernels_ptodsl/cf2d_remat_thresh_kill_shared.py` |
+| CF3 | Index remat inside CF predicate | `kernels/cf3_remat_idx.py` | `kernels_ptodsl/cf3d_remat_idx.py` |
+| CF4 | Nested if (pfat skew) | `kernels/cf4_nested_if.py` | `kernels_ptodsl/cf4d_nested_if.py` |
+| CF5 | Div + near-0 ULP branch | `kernels/cf5_div_ulp_branch.py` | `kernels_ptodsl/cf5d_div_ulp_branch.py` |
+| CF6 | Newton recip + near-0 branch | `kernels/cf6_newton_branch.py` | `kernels_ptodsl/cf6d_newton_branch.py` |
 
-Explicit `@pto.jit(mode=explicit, backend=vpto)` twins of Simt SV1 / CF1 / SP1(`keep_pos`):
+### SP1–SP6 — sparse / packing
 
-| Twin | Kernel | Primary tag |
-|------|--------|-------------|
-| SV1d | `kernels_ptodsl/sv1d_stream_eltwise.py` | `sv1d_e256_t32` |
-| CF1d | `kernels_ptodsl/cf1d_pred_thresh_keep.py` | `cf1d_e256_k8_t32_keep` |
-| SP1d | `kernels_ptodsl/sp1d_dual_scatter_keep_pos.py` | `sp1d_t32_k2_h128_g32_t32_keep_pos` |
+| ST | Sensitivity (one line) | Simt | SIMD (PTO-DSL) |
+|----|------------------------|------|----------------|
+| SP1 | Pos KEEP vs remat (dual co-scatter) | `kernels/sp1_dual_scatter_vsf.py` | `kernels_ptodsl/sp1d_dual_scatter_keep_pos.py` |
+| SP2 | Acc KEEP/remat × sf0_w0/sf1_w1 tax | `kernels/sp2_dual_gather_wreduce.py` | `kernels_ptodsl/sp2d_dual_gather_wreduce.py` |
+| SP3 | fp32 SF vs A5 bit-reinterpret e8m0 | `kernels/sp3_sf_pack_ue8m0.py` | `kernels_ptodsl/sp3d_sf_pack_e8m0.py` |
+| SP4 | Pad gather early-skip vs mask | `kernels/sp4_pad_gather.py` | *(Simt-only — no SP4d)* |
+| SP5 | Sideband vs interleave gather | `kernels/sp5_sideband_vs_interleave.py` | *(Simt-only — no SP5d)* |
+| SP6 | Soft 4-bit e2m1 LUT unpack (± SF) | `kernels/sp6_fp4_unpack.py` | `kernels_ptodsl/sp6d_fp4_unpack.py` |
 
-Plan / compare: [`reports/ST_PTODSL_PLAN.md`](reports/ST_PTODSL_PLAN.md), [`reports/ST_PTODSL_PHASE1_COMPARE.md`](reports/ST_PTODSL_PHASE1_COMPARE.md).
+## How to run (pto-b10)
+
+Checkout root = this TileLang tree (PTO-ISA `pto-dev` + suite). Prefer building `libtilelang.so` in-tree and pointing `TILELANG_DEPS` at the checkout.
 
 ```bash
-bash oneshot_ptodsl_phase1.sh
-# laptop relay:
-powershell -File .\run_via_laptop_ptodsl_phase1.ps1
+# Env (typical pto-b10 paths)
+export ASCEND_HOME_PATH=/mnt/fluxdata/Ascend/cann_91b3/cann-9.1.0-beta.3
+source "$ASCEND_HOME_PATH/set_env.sh"
+export TORCH_DEVICE_BACKEND_AUTOLOAD=0
+PY=/home/happybot/projects/tilelang-deepseek/.venv-npu/bin/python
+export TILELANG_DEPS="$(cd ../../.. && pwd)"   # this checkout
+SOC=Ascend950PR_9599
+
+cd examples/ascend/st_simtvf_parallel
+
+# Full primary regress (Simt + SIMD)
+bash oneshot_pto_isa_regress.sh
+
+# Or family-by-family:
+bash oneshot_sv1_sv9.sh              # Simt SV1–SV9
+bash oneshot_cf1_cf6.sh              # Simt CF1–CF6
+bash oneshot_sp1_sp6.sh              # Simt SP1–SP6
+bash oneshot_ptodsl_sv1_sv9d.sh      # SIMD SV1d–SV9d
+bash oneshot_ptodsl_cf1d_cf6d.sh     # SIMD CF1d–CF6d
+bash oneshot_ptodsl_sp1d_sp6d.sh     # SIMD SP1d/SP2d/SP3d/SP6d
 ```
 
-Requires working `ptodsl` + `ptoas.mlir` (see compare MD blocker notes). Prefer same env as `~/projects/pto-vmi` DSL cases (`PTOAS-vmi` + `.venv-npu` + `cann_91b3`).
+Harness / opsim helpers: `common_asc_harness.py`, `common_pto_harness.py`, `run_opsim_generic.py`, `run_opsim_topk.py` (SV9).  
+Harvest: `harvest_report.py`, `harvest_pass_table.sh`, `harvest_simt_vmi_compare.py`.
 
+### Known blocker on this tip
 
-## SP1–SP6 (single-axis redesign 2026-10-07)
-
-Contract: [`reports/ST_SP1_TO_SP6_ACCESS.md`](reports/ST_SP1_TO_SP6_ACCESS.md) · PASS: [`PASS_TABLE_sp1_sp6.txt`](PASS_TABLE_sp1_sp6.txt)
-
-| ST | Sensitivity | Kernel |
-|----|-------------|--------|
-| SP1 | Pos KEEP vs remat (dual co-scatter) | `kernels/sp1_dual_scatter_vsf.py` |
-| SP2 | Acc KEEP/remat **+** sf0_w0/sf1_w1 tax (one case) | `kernels/sp2_dual_gather_wreduce.py` |
-| SP3 | fp32 vs **A5 bit-reinterpret e8m0** (soft LUT retired; no native e8m0 vcvt on A5) | `kernels/sp3_sf_pack_ue8m0.py` |
-| SP3d | VMI bit-shift compose twin (full source; UNRUN) | `kernels_ptodsl/sp3d_sf_pack_e8m0.py` |
-| SP4 | pad early-skip vs mask | `kernels/sp4_pad_gather.py` |
-| SP5 | sideband vs interleave | `kernels/sp5_sideband_vs_interleave.py` |
-| SP6 | soft LUT 4-bit e2m1 dequant (appendix) | `kernels/sp6_fp4_unpack.py` |
-
-```bash
-bash oneshot_sp1_sp6.sh
-# laptop relay:
-powershell -File .\run_via_laptop_sp1_sp6.ps1
-```
-
-SP3/SP3d `e8m0` = **A5 bit-reinterpret UNRUN** (`vload ui8→vcvt ui32→vshls(23)→vinterpret_cast f32→brc+vmul`). No soft Pow2 LUT. No native e8m0 vcvt on A5 (A6 may). Cube MX out of scope.
-
+PTO-ISA `pto-dev` tip may emit CANN MicroAPI DMA symbols (`asc_copy_gm2ub_align`, L2 cache mode, pack helpers) missing from `cann_91b3` / `cann_92b1` on pto-b10. Live opsim can fail until a matching toolkit is available. VF numbers in [`SUMMARY.md`](SUMMARY.md) are from Wenbo tip `3828bbcf` / prior opsim (2026-10-07–08), not re-validated on this tip.

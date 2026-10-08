@@ -1,1 +1,0 @@
-ok=True maxabs=0.0 R=64 C=128 G=16
