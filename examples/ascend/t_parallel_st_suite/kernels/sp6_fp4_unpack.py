@@ -28,6 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from common_asc_harness import boot, compile_prim, set_out  # noqa: E402
+from vf_mode import vf_region  # noqa: E402
 
 # Soft e2m1 LUT (nibble 0..15) — matches TileKernels unpack_from_e2m1fn_x2.
 # This is intentionally software; HW FP4 = separate future ST.
@@ -61,7 +62,7 @@ def build_sp6(N: int, H: int, G: int, threads: int, arm: str):
                 T.copy(V_i8, v_ub)
                 T.copy(Sf, sf_ub)
                 T.copy(Lut, lut_ub)
-                with T.SimtVF(threads=threads):
+                with vf_region(threads):
                     for n, b in T.Parallel(N, Hbytes):
                         byte = T.Cast("int32", v_ub[n, b])
                         lo = byte & 0x0F
@@ -89,7 +90,7 @@ def build_sp6(N: int, H: int, G: int, threads: int, arm: str):
             out_ub = T.alloc_shared((N, H), "float32")
             T.copy(V_i8, v_ub)
             T.copy(Lut, lut_ub)
-            with T.SimtVF(threads=threads):
+            with vf_region(threads):
                 for n, b in T.Parallel(N, Hbytes):
                     byte = T.Cast("int32", v_ub[n, b])
                     lo = byte & 0x0F

@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from common_asc_harness import NEG, boot, compile_prim, set_out  # noqa: E402
+from vf_mode import vf_region  # noqa: E402
 
 
 def build_cf2(E: int, K: int, threads: int):
@@ -30,7 +31,7 @@ def build_cf2(E: int, K: int, threads: int):
             out_ub = T.alloc_shared((E,), "float32")
             T.copy(A, s)
             T.copy(Thresh, thr_ub)
-            with T.SimtVF(threads=threads):
+            with vf_region(threads):
                 scores = T.alloc_fragment((E,), "float32")
                 for k in T.serial(K):
                     thr = thr_ub[k]

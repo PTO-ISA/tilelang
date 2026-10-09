@@ -27,6 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from common_asc_harness import boot, compile_prim, set_out  # noqa: E402
+from vf_mode import vf_region  # noqa: E402
 
 
 def build_sv8(R: int, C: int, G: int, threads: int, arm: str):
@@ -47,7 +48,7 @@ def build_sv8(R: int, C: int, G: int, threads: int, arm: str):
                 # layout-transform spill: expand reduced [R,CG] → full [R,C]
                 scale_ub = T.alloc_shared((R, C), "float32")
                 T.copy(X, x_ub)
-                with T.SimtVF(threads=threads):
+                with vf_region(threads):
                     sf_inv = T.alloc_fragment((R, CG), "float32")
                     for i, g in T.Parallel(R, CG):
                         m = T.alloc_var("float32", init=0.0)
@@ -83,7 +84,7 @@ def build_sv8(R: int, C: int, G: int, threads: int, arm: str):
             x_ub = T.alloc_shared((R, C), "float16")
             out_ub = T.alloc_shared((R, C), "float16")
             T.copy(X, x_ub)
-            with T.SimtVF(threads=threads):
+            with vf_region(threads):
                 sf_inv = T.alloc_fragment((R, CG), "float32")
                 for i, g in T.Parallel(R, CG):
                     m = T.alloc_var("float32", init=0.0)

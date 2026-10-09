@@ -32,6 +32,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from common_asc_harness import boot, compile_prim, set_out  # noqa: E402
+from vf_mode import vf_region  # noqa: E402
 
 
 def build_sv3(M: int, VL: int, K: int, threads: int, arm: str, CM: int = 16):
@@ -52,7 +53,7 @@ def build_sv3(M: int, VL: int, K: int, threads: int, arm: str, CM: int = 16):
                 out_ub = T.alloc_shared((M, VL), "float32")
                 T.copy(A, a_ub)
                 T.copy(X, x_ub)
-                with T.SimtVF(threads=threads):
+                with vf_region(threads):
                     # Partial-sum tile fits in CM×VL (folded RF); reused per chunk.
                     # Flush to shared once per chunk → expected MTE bar ≈ O(NC), not O(K).
                     acc_c = T.alloc_fragment((CM, VL), "float32")
@@ -93,7 +94,7 @@ def build_sv3(M: int, VL: int, K: int, threads: int, arm: str, CM: int = 16):
             out_ub = T.alloc_shared((M, VL), "float32")
             T.copy(A, a_ub)
             T.copy(X, x_ub)
-            with T.SimtVF(threads=threads):
+            with vf_region(threads):
                 acc = T.alloc_fragment((M, VL), "float32")
                 for i, j in T.Parallel(M, VL):
                     acc[i, j] = T.float32(0.0)

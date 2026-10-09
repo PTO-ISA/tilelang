@@ -34,6 +34,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from common_asc_harness import boot, compile_prim, set_out  # noqa: E402
+from vf_mode import vf_region  # noqa: E402
 
 ARMS = ("multiwarp_ub", "reload")
 NW = 4  # chunks of 32 → "warps" worth of group width
@@ -57,7 +58,7 @@ def build_sv7(R: int, C: int, G: int, threads: int, arm: str = "multiwarp_ub"):
                 y_ub = T.alloc_shared((R, CG), "float32")
                 part_ub = T.alloc_shared((R, CG, NW), "float32")
                 T.copy(X, x_ub)
-                with T.SimtVF(threads=threads):
+                with vf_region(threads):
                     # per-chunk ("per-warp") partials → UB
                     for i, g in T.Parallel(R, CG):
                         for w in T.serial(NW):
@@ -87,7 +88,7 @@ def build_sv7(R: int, C: int, G: int, threads: int, arm: str = "multiwarp_ub"):
             x_ub = T.alloc_shared((R, C), "float16")
             y_ub = T.alloc_shared((R, CG), "float32")
             T.copy(X, x_ub)
-            with T.SimtVF(threads=threads):
+            with vf_region(threads):
                 for i, g in T.Parallel(R, CG):
                     m = T.alloc_var("float32", init=0.0)
                     for t in T.serial(G):

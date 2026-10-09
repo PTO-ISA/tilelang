@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from common_asc_harness import NEG, INT_MAX, boot, compile_prim, set_out  # noqa: E402
+from vf_mode import vf_region  # noqa: E402
 
 
 def build_sv9(num_experts: int, num_topk: int, threads: int, arm: str):
@@ -45,7 +46,7 @@ def build_sv9(num_experts: int, num_topk: int, threads: int, arm: str):
                 s = T.alloc_shared((num_experts,), "float32")
                 idx_ub = T.alloc_shared((num_topk,), "int32")
                 T.copy(A, s)
-                with T.SimtVF(threads=threads):
+                with vf_region(threads):
                     scores = T.alloc_fragment((num_experts,), "float32")
                     idxs = T.alloc_fragment((num_experts,), "int32")
                     idx_cand = T.alloc_fragment((num_experts,), "int32")
@@ -84,7 +85,7 @@ def build_sv9(num_experts: int, num_topk: int, threads: int, arm: str):
                 s = T.alloc_shared((num_experts,), "float32")
                 idx_ub = T.alloc_shared((num_topk,), "int32")
                 T.copy(A, s)
-                with T.SimtVF(threads=threads):
+                with vf_region(threads):
                     scores = T.alloc_fragment((num_experts,), "float32")
                     # NO idxs KeepLive fragment — remat index at use
                     idx_cand = T.alloc_fragment((num_experts,), "int32")
@@ -119,7 +120,7 @@ def build_sv9(num_experts: int, num_topk: int, threads: int, arm: str):
             s = T.alloc_shared((num_experts,), "float32")
             idx_ub = T.alloc_shared((num_topk,), "int32")
             T.copy(A, s)
-            with T.SimtVF(threads=threads):
+            with vf_region(threads):
                 scores = T.alloc_fragment((num_experts,), "float32")
                 idxs = T.alloc_fragment((num_experts,), "int32")
                 idx_cand = T.alloc_fragment((num_experts,), "int32")

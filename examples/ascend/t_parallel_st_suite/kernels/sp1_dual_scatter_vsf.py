@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from common_asc_harness import boot, compile_prim, set_out  # noqa: E402
+from vf_mode import vf_region  # noqa: E402
 
 
 def build_sp1(T_: int, K: int, H: int, G: int, threads: int, arm: str, Eexp: int | None = None):
@@ -57,7 +58,7 @@ def build_sp1(T_: int, K: int, H: int, G: int, threads: int, arm: str, Eexp: int
                 T.copy(Sf, sf_ub)
                 T.copy(Pos, pos_ub)
                 T.copy(Expert, exp_ub)
-                with T.SimtVF(threads=threads):
+                with vf_region(threads):
                     v_frag = T.alloc_fragment((H,), "float32")
                     sf_frag = T.alloc_fragment((Hs,), "float32")
                     for p, j in T.Parallel(Eexp, H):
@@ -105,7 +106,7 @@ def build_sp1(T_: int, K: int, H: int, G: int, threads: int, arm: str, Eexp: int
             T.copy(Sf, sf_ub)
             T.copy(Pos, pos_ub)
             T.copy(Expert, exp_ub)
-            with T.SimtVF(threads=threads):
+            with vf_region(threads):
                 v_frag = T.alloc_fragment((H,), "float32")
                 sf_frag = T.alloc_fragment((Hs,), "float32")
                 for p, j in T.Parallel(Eexp, H):

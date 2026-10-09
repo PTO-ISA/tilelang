@@ -45,6 +45,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from common_asc_harness import boot, compile_prim, set_out  # noqa: E402
+from vf_mode import vf_region  # noqa: E402
 
 # Soft Pow2 LUT path REMOVED. Do not reintroduce.
 
@@ -71,7 +72,7 @@ def build_sp3(M: int, H: int, G: int, threads: int, arm: str):
                 out_ub = T.alloc_shared((M, H), "float32")
                 T.copy(V, v_ub)
                 T.copy(Sf_u8, sf_ub)
-                with T.SimtVF(threads=threads):
+                with vf_region(threads):
                     for m, g in T.Parallel(M, Hs):
                         e = T.Cast("uint32", sf_ub[m, g])
                         bits = e << 23
@@ -96,7 +97,7 @@ def build_sp3(M: int, H: int, G: int, threads: int, arm: str):
             out_ub = T.alloc_shared((M, H), "float32")
             T.copy(V, v_ub)
             T.copy(Sf, sf_ub)
-            with T.SimtVF(threads=threads):
+            with vf_region(threads):
                 for m, g in T.Parallel(M, Hs):
                     s = sf_ub[m, g]
                     for tt in T.serial(G):

@@ -35,6 +35,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from common_asc_harness import boot, compile_prim, set_out  # noqa: E402
+from vf_mode import vf_region  # noqa: E402
 
 ARMS = ("keep_in_warp", "reload")
 
@@ -55,7 +56,7 @@ def build_sv6(R: int, C: int, G: int, threads: int, arm: str = "keep_in_warp"):
                 x_ub = T.alloc_shared((R, C), "float16")
                 y_ub = T.alloc_shared((R, CG), "float32")
                 T.copy(X, x_ub)
-                with T.SimtVF(threads=threads):
+                with vf_region(threads):
                     xf = T.alloc_fragment((R, CG, G), "float32")
                     # preload group into warp-local RF (separate Parallel loop:
                     # one ParallelOp records only ONE index pattern per buffer)
@@ -85,7 +86,7 @@ def build_sv6(R: int, C: int, G: int, threads: int, arm: str = "keep_in_warp"):
             x_ub = T.alloc_shared((R, C), "float16")
             y_ub = T.alloc_shared((R, CG), "float32")
             T.copy(X, x_ub)
-            with T.SimtVF(threads=threads):
+            with vf_region(threads):
                 for i, g in T.Parallel(R, CG):
                     m = T.alloc_var("float32", init=0.0)
                     for t in T.serial(G):

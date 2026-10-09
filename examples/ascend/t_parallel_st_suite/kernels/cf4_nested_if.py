@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from common_asc_harness import boot, compile_prim, set_out  # noqa: E402
+from vf_mode import vf_region  # noqa: E402
 
 
 def build_cf4(E: int, threads: int):
@@ -37,7 +38,7 @@ def build_cf4(E: int, threads: int):
             T.copy(Scale, sc_ub)
             T.copy(Lo, lo_ub)
             T.copy(Hi, hi_ub)
-            with T.SimtVF(threads=threads):
+            with vf_region(threads):
                 x = T.alloc_fragment((E,), "float32")
                 y = T.alloc_fragment((E,), "float32")
                 for i in T.Parallel(E):

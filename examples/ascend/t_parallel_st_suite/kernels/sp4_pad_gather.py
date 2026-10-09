@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from common_asc_harness import boot, compile_prim, set_out  # noqa: E402
+from vf_mode import vf_region  # noqa: E402
 
 
 def build_sp4(Eexp: int, H: int, threads: int):
@@ -43,7 +44,7 @@ def build_sp4(Eexp: int, H: int, threads: int):
             out_ub = T.alloc_shared((Eexp, H), "float32")
             T.copy(Buf, buf_ub)
             T.copy(Expert, exp_ub)
-            with T.SimtVF(threads=threads):
+            with vf_region(threads):
                 for p, j in T.Parallel(Eexp, H):
                     if exp_ub[p] >= 0:
                         out_ub[p, j] = buf_ub[p, j]

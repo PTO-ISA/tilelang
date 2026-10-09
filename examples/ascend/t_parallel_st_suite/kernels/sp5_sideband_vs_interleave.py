@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from common_asc_harness import boot, compile_prim, set_out  # noqa: E402
+from vf_mode import vf_region  # noqa: E402
 
 
 def build_sp5(N: int, H: int, G: int, Qg: int, threads: int, arm: str):
@@ -45,7 +46,7 @@ def build_sp5(N: int, H: int, G: int, Qg: int, threads: int, arm: str):
                 out_ub = T.alloc_shared((Qg, H), "float32")
                 T.copy(Pack, pack_ub)
                 T.copy(Idx, idx_ub)
-                with T.SimtVF(threads=threads):
+                with vf_region(threads):
                     for q in T.serial(Qg):
                         slot = idx_ub[q]
                         # one indexed load stream; split v + sf from Pack[slot]
@@ -74,7 +75,7 @@ def build_sp5(N: int, H: int, G: int, Qg: int, threads: int, arm: str):
             T.copy(V, v_ub)
             T.copy(Sf, sf_ub)
             T.copy(Idx, idx_ub)
-            with T.SimtVF(threads=threads):
+            with vf_region(threads):
                 for q in T.serial(Qg):
                     slot = idx_ub[q]
                     for g in T.Parallel(Hs):

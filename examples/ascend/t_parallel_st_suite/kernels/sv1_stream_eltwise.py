@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from common_asc_harness import boot, compile_prim, set_out  # noqa: E402
+from vf_mode import vf_region  # noqa: E402
 
 
 def build_sv1(E: int, threads: int):
@@ -26,7 +27,7 @@ def build_sv1(E: int, threads: int):
             c_ub = T.alloc_shared((E,), "float32")
             T.copy(A, a_ub)
             T.copy(B, b_ub)
-            with T.SimtVF(threads=threads):
+            with vf_region(threads):
                 t1 = T.alloc_fragment((E,), "float32")
                 t2 = T.alloc_fragment((E,), "float32")
                 t3 = T.alloc_fragment((E,), "float32")

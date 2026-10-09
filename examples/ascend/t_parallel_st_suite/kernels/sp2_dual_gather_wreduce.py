@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from common_asc_harness import boot, compile_prim, set_out  # noqa: E402
+from vf_mode import vf_region  # noqa: E402
 
 _SCHED = ("keep_acc", "remat_acc", "keep_pos", "remat_pos")
 
@@ -74,7 +75,7 @@ def build_sp2(
             T.copy(Sf, sf_ub)
             T.copy(W, w_ub)
             T.copy(Pos, pos_ub)
-            with T.SimtVF(threads=threads):
+            with vf_region(threads):
                 acc = T.alloc_fragment((H,), "float32")
                 if with_sf:
                     for p, g in T.Parallel(Eexp, Hs):

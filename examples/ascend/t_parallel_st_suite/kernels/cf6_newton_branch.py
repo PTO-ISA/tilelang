@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from common_asc_harness import boot, compile_prim, set_out  # noqa: E402
+from vf_mode import vf_region  # noqa: E402
 
 EPS = 1e-4
 N_FAST = 3
@@ -30,7 +31,7 @@ def build_cf6(E: int, threads: int, eps: float = EPS, n_fast: int = N_FAST):
             x_ub = T.alloc_shared((E,), "float32")
             y_ub = T.alloc_shared((E,), "float32")
             T.copy(X, x_ub)
-            with T.SimtVF(threads=threads):
+            with vf_region(threads):
                 x = T.alloc_fragment((E,), "float32")
                 y = T.alloc_fragment((E,), "float32")
                 for i in T.Parallel(E):

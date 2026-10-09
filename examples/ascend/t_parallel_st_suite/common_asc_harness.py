@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Shared ASC SimtVF harness: npu stub + int2→make_int2 patch + cython compile/export.
+"""Shared ASC Simt-family harness: npu stub + int2→make_int2 patch + cython compile/export.
 
-Extracted from simd_vs_simt_ab_oneshot/run_simd_vs_simt_perf.py (prior green AB).
-Prefer deps-stack libtilelang.so; target=ascend + execution_backend=cython (NOT pto).
+``ST_VF_MODE=simt|simd`` (see ``vf_mode.py``) picks ``T.SimtVF`` or ``T.SimdVF``
+for kernels that call ``vf_region``. Compile stays target=ascend + cython (not pto).
 """
 from __future__ import annotations
 
@@ -17,6 +17,8 @@ import types
 from pathlib import Path
 
 import numpy as np
+
+from vf_mode import announce_vf_mode
 
 os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
 os.environ.setdefault("TILELANG_DISABLE_CACHE", "1")
@@ -291,6 +293,7 @@ def compile_prim(prim, tag: str, target: str = "ascend"):
     """Compile prim_func with ASC cython backend; export .so under OUT/so/{tag}.so."""
     import tilelang
 
+    announce_vf_mode()
     if target == "pto":
         raise RuntimeError(
             "REFUSING target=pto for SimtVF (deps may call SimdVFLowerControlFlow missing). Use ascend."
@@ -495,6 +498,7 @@ def patch_simtvf_ffi() -> None:
 
 
 def boot() -> None:
+    announce_vf_mode()
     set_out(OUT)
     stub_torch_npu()
     patch_simtvf_ffi()

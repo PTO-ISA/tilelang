@@ -36,6 +36,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from common_asc_harness import boot, compile_prim, set_out  # noqa: E402
+from vf_mode import vf_region  # noqa: E402
 
 EPS = 1e-6
 _STREAM_ARMS = ("input_stream", "frag_live", "fold_frag_keep")
@@ -62,7 +63,7 @@ def build_sv2(R: int, C: int, threads: int, arm: str):
                 out_ub = T.alloc_shared((R, C), "float16")
                 scale_s = T.alloc_shared((R, LANES), "float32")
                 T.copy(X, x_ub)
-                with T.SimtVF(threads=threads):
+                with vf_region(threads):
                     scale = T.alloc_fragment((R, LANES), "float32")
                     for i, lane in T.Parallel(R, LANES):
                         m = T.alloc_var("float32", init=EPS)
@@ -94,7 +95,7 @@ def build_sv2(R: int, C: int, threads: int, arm: str):
                 x_ub = T.alloc_shared((R, C), "float16")
                 out_ub = T.alloc_shared((R, C), "float16")
                 T.copy(X, x_ub)
-                with T.SimtVF(threads=threads):
+                with vf_region(threads):
                     x = T.alloc_fragment((R, C), "float32")
                     scale = T.alloc_fragment((R, LANES), "float32")
                     for i, lane in T.Parallel(R, LANES):
@@ -126,7 +127,7 @@ def build_sv2(R: int, C: int, threads: int, arm: str):
             x_ub = T.alloc_shared((R, C), "float16")
             out_ub = T.alloc_shared((R, C), "float16")
             T.copy(X, x_ub)
-            with T.SimtVF(threads=threads):
+            with vf_region(threads):
                 scale = T.alloc_fragment((R, LANES), "float32")
                 for i, lane in T.Parallel(R, LANES):
                     m = T.alloc_var("float32", init=EPS)

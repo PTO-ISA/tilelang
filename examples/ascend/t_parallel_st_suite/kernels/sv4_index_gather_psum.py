@@ -39,6 +39,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from common_asc_harness import boot, compile_prim, set_out  # noqa: E402
+from vf_mode import vf_region  # noqa: E402
 
 ARMS = ("keep_idx", "remat_idx", "remat_idx_calc")
 
@@ -62,7 +63,7 @@ def build_sv4(E: int, B: int, threads: int, arm: str):
                 T.copy(A, a_ub)
                 T.copy(W, w_ub)
                 T.copy(Idx, idx_ub)  # same MTE traffic as the other arms
-                with T.SimtVF(threads=threads):
+                with vf_region(threads):
                     # NO live idxs buffer across B — recompute the VCI each gather
                     acc = T.alloc_fragment((E,), "float32")
                     for i in T.Parallel(E):
@@ -93,7 +94,7 @@ def build_sv4(E: int, B: int, threads: int, arm: str):
                 T.copy(A, a_ub)
                 T.copy(W, w_ub)
                 T.copy(Idx, idx_ub)
-                with T.SimtVF(threads=threads):
+                with vf_region(threads):
                     # NO live idxs buffer across B — remat from shared each gather
                     acc = T.alloc_fragment((E,), "float32")
                     for i in T.Parallel(E):
@@ -124,7 +125,7 @@ def build_sv4(E: int, B: int, threads: int, arm: str):
             T.copy(A, a_ub)
             T.copy(W, w_ub)
             T.copy(Idx, idx_ub)
-            with T.SimtVF(threads=threads):
+            with vf_region(threads):
                 idxs = T.alloc_fragment((E,), "int32")
                 acc = T.alloc_fragment((E,), "float32")
                 for i in T.Parallel(E):
