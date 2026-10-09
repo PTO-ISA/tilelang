@@ -4517,7 +4517,7 @@ CodeGenTileLangPTO::PrintVmiAnnotationValue(const std::string &key,
         return "pto.si32";
       if (name == "si64")
         return "pto.si64";
-      return PtoScalarType(ParsePTODtype(name));
+      return ScalarType(ParsePTODtype(name));
     }
   }
 
@@ -4663,7 +4663,7 @@ void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
       if (should_wrap_typed_literal) {
         // PTODSL needs typed literal scalars for these VMI sources; preserve
         // the literal dtype instead of assuming every source is f32.
-        os << PtoScalarType(arg.dtype()) << "(";
+        os << ScalarType(arg.dtype()) << "(";
         print_scalar_literal_value(arg);
         os << ")";
       } else if (op_name == "tl.vmi.vcvt" && i == 0 && IsVmiVcvtToFp4(kwargs) &&
@@ -6750,7 +6750,7 @@ void CodeGenTileLangPTO::VisitStmt_(const AllocBufferNode *op) {
     local_var_buffers_.insert(buffer_var.get());
     stream << AllocVarID(buffer_var.get()) << " = pto.vmi.vreg("
            << op->buffer->dtype.lanes() << ", "
-           << PtoTypeName(op->buffer->dtype.element_of()) << ")\n";
+           << DataTypeName(op->buffer->dtype.element_of()) << ")\n";
     RegisterHandleType_(buffer_var.get(), op->buffer->dtype);
     return;
   }
