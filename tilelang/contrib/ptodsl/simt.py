@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-import ptodsl._allreduce as _allreduce
+try:  # mainline ptodsl only; the vmi-track releases have no SIMT allreduce
+    import ptodsl._allreduce as _allreduce
+except ImportError:
+    _allreduce = None
 import ptodsl._scalar as _scalar
 from ptodsl import pto
 from ptodsl._scalar import _emit_llvm_byte_pointer
@@ -189,15 +192,16 @@ def _shuffle_bfly(value, offset):
 # PTOAS's redux/shuffle take signless i32 carriers while its allreduce dispatches on signed/unsigned types.
 # Run the si32 strategy on the signless carrier with identity constants typed to match,
 # instead of reinterpreting to si32 and back.
-_allreduce._REDUCER_REDUX.update(
-    {
-        "sum": _redux_add,
-        "max": _redux_max,
-        "min": _redux_min,
-    }
-)
-_allreduce.shuffle_bfly = _shuffle_bfly
-_allreduce._REDUCER_IDENTITY_DTYPE["si32"] = pto.i32
+if _allreduce is not None:
+    _allreduce._REDUCER_REDUX.update(
+        {
+            "sum": _redux_add,
+            "max": _redux_max,
+            "min": _redux_min,
+        }
+    )
+    _allreduce.shuffle_bfly = _shuffle_bfly
+    _allreduce._REDUCER_IDENTITY_DTYPE["si32"] = pto.i32
 
 _scalar_select = _scalar.select
 
@@ -215,11 +219,14 @@ def _scalar_select_compat(cond, true_val, false_val):
 
 _scalar.select = _scalar_select_compat
 
-_simt_allreduce = _allreduce._simt_allreduce
+if _allreduce is not None:
+    _simt_allreduce = _allreduce._simt_allreduce
 
 
 def _simt_allreduce_compat(value, *, threads, scale=1, thread_offset=0, scratch=None, reducer):
     """Dispatch signless i32 through PTOAS's si32 strategy; other dtypes delegate."""
+    if _allreduce is None:
+        raise RuntimeError("SIMT allreduce requires a ptodsl build with ptodsl._allreduce (unavailable on the vmi-track releases)")
     raw_value = unwrap_surface_value(value)
     if not (
         IntegerType.isinstance(raw_value.type)
