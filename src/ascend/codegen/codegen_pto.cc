@@ -1898,8 +1898,13 @@ void CodeGenTileLangPTO::AddFunction(const GlobalVar &gvar,
 
 std::string CodeGenTileLangPTO::Finish() {
   std::ostringstream code;
-  code << "from ptodsl import pto\n";
+  // Import the tilelang compatibility layer first: it loads this build's
+  // native tilelang/tvm libraries before the PTODSL MLIR modules come up.
+  // Loading them in the opposite order trips a static-initializer crash in
+  // the MLIR PassBuilder when both library families are dlopened into the
+  // same process (observed on the Ascend validation runners).
   code << "import tilelang.contrib.ptodsl as tl\n";
+  code << "from ptodsl import pto\n";
   code << "\n";
   code << decl_stream.str();
   code << stream.str();
