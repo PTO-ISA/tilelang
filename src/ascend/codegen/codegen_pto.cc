@@ -4477,7 +4477,7 @@ CodeGenTileLangPTO::PrintVmiAnnotationValue(const std::string &key,
         return "pto.si32";
       if (name == "si64")
         return "pto.si64";
-      return ScalarType(ParsePTODtype(name));
+      return ScalarType(ParseDataType(name));
     }
   }
 
