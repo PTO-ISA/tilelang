@@ -25,10 +25,34 @@ os.environ.setdefault("TILELANG_DISABLE_DATA_RACE_CHECK", "1")
 NEG = np.float32(-3.402823e38).item()
 INT_MAX = np.iinfo(np.int32).max
 
-BISHENG_LIBSTDCXX_FIX = (
-    "/mnt/fluxdata/happybot/projects/tilelang-deepseek-pto-vmi-topk/"
-    "examples/ascend/msprof_res/orig_pto_vmi_simd/bisheng_libstdcxx_clang_fix.h"
-)
+
+def bisheng_libstdcxx_fix() -> str:
+    """Header passed to bisheng as ``-include``.
+
+    ``BISHENG_LIBSTDCXX_FIX`` wins. Otherwise the header is taken from this
+    directory or from ``$TILELANG_DEPS/examples/ascend/msprof_res/orig_pto_vmi_simd/``
+    when that file exists.
+    """
+    explicit = os.environ.get("BISHENG_LIBSTDCXX_FIX", "").strip()
+    if explicit:
+        return explicit
+    here = Path(__file__).resolve().parent
+    candidates = [
+        here / "bisheng_libstdcxx_clang_fix.h",
+        here.parent / "msprof_res" / "orig_pto_vmi_simd" / "bisheng_libstdcxx_clang_fix.h",
+    ]
+    deps = os.environ.get("TILELANG_DEPS", "").strip()
+    if deps:
+        candidates.append(
+            Path(deps) / "examples" / "ascend" / "msprof_res" / "orig_pto_vmi_simd" / "bisheng_libstdcxx_clang_fix.h"
+        )
+    for cand in candidates:
+        if cand.is_file():
+            return str(cand)
+    raise RuntimeError(
+        "Set BISHENG_LIBSTDCXX_FIX to bisheng_libstdcxx_clang_fix.h (passed to bisheng as -include)."
+    )
+
 
 # Default remote OUT; callers may override via set_out()
 OUT = Path(os.environ.get("ST_SIMTVF_OUT", "/tmp/t_parallel_st_suite"))
@@ -281,7 +305,7 @@ def compile_prim(prim, tag: str, target: str = "ascend"):
         "execution_backend": "cython",
         "compile_flags": [
             "-include",
-            BISHENG_LIBSTDCXX_FIX,
+            bisheng_libstdcxx_fix(),
             "-isystem",
             "/usr/include/c++/12",
         ],

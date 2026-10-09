@@ -53,7 +53,8 @@ open(path,'w').write('\n'.join(lines)+'\n')
 print('\n'.join(lines))
 PY
 
-ls -la /home/happybot/projects/tilelang-pto-vmi-deps-stack/build/lib/libtilelang.so /tmp/libtilelang.so.deps_backup_ab
+: "${TILELANG_DEPS:?Set TILELANG_DEPS to the TileLang tree that contains build/lib/libtilelang.so}"
+ls -la "$TILELANG_DEPS/build/lib/libtilelang.so" /tmp/libtilelang.so.deps_backup_ab
 
 # lightweight reports tarball
 tar -czf /tmp/st_simtvf_sv1_sv9_reports.tgz \
@@ -93,6 +94,10 @@ tar -czf /tmp/st_simtvf_sv1_sv9_reports.tgz \
 ls -la /tmp/st_simtvf_sv1_sv9_reports.tgz "$OUT/PASS_TABLE_sv1_sv9.txt"
 # try harvest_report if present
 if [[ -f /tmp/t_parallel_st_suite_suite/harvest_report.py ]]; then
-  /home/happybot/projects/tilelang-deepseek/.venv-npu/bin/python /tmp/t_parallel_st_suite_suite/harvest_report.py > "$OUT/harvest_sv1_sv9_post.log" 2>&1 || true
+  if [[ -z "${PY:-}" && -n "${PYTHON_BIN:-}" ]]; then
+    PY="$PYTHON_BIN"
+  fi
+  : "${PY:?Set PY to the NPU venv interpreter (PYTHON_BIN is also accepted)}"
+  "$PY" /tmp/t_parallel_st_suite_suite/harvest_report.py > "$OUT/harvest_sv1_sv9_post.log" 2>&1 || true
   tail -40 "$OUT/harvest_sv1_sv9_post.log" || true
 fi

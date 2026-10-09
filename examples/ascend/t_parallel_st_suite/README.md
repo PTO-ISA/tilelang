@@ -47,18 +47,49 @@ Primary metric: **total VF cycles** (sum of vector-pipe / VF launch cycles on `c
 | SP5 | Sideband vs interleave gather | `kernels/sp5_sideband_vs_interleave.py` | `kernels_ptodsl/sp5d_sideband_vs_interleave.py` |
 | SP6 | Soft 4-bit e2m1 LUT unpack (± SF) | `kernels/sp6_fp4_unpack.py` | `kernels_ptodsl/sp6d_fp4_unpack.py` |
 
-## How to run (pto-b10)
+## How to run
 
-Checkout root = this TileLang tree (PTO-ISA `pto-dev` + suite). Prefer building `libtilelang.so` in-tree and pointing `TILELANG_DEPS` at the checkout.
+Export the variables below, source the CANN env script, then run an oneshot from this directory. Oneshots exit with an error when a required variable is unset.
+
+`oneshot_pto_isa_regress.sh` sets `TILELANG_DEPS` to this TileLang checkout (the directory that contains `examples/`) and, when `ST_SIMTVF_OUT` is unset, writes under `/tmp/t_parallel_st_suite_pto_isa`.
+
+| Variable | Required for | Meaning |
+|----------|----------------|---------|
+| `PY` | every oneshot | NPU virtualenv interpreter. `PYTHON_BIN` is accepted when `PY` is unset. |
+| `ASCEND_HOME_PATH` | every oneshot | CANN toolkit root. Oneshots run `source "$ASCEND_HOME_PATH/set_env.sh"`. |
+| `TILELANG_DEPS` | Simt SV/CF/SP | Tree whose `build/lib/libtilelang.so` is used. The full regress sets this to the checkout. Also the prefix `run_opsim_topk.py` searches for `build/lib/libtvm_ffi.so`. |
+| `CAMODEL_DEPS` | Simt SV/CF/SP | Camodel prefix. `bin/` is prepended to `PATH` and the prefix is added to `PYTHONPATH`. |
+| `SIM_DSL` | Simt SV/CF/SP | Opsim launcher (`sim_dsl.sh`). When unset, `$PTOAS_ROOT/scripts/sim_dsl.sh` is used if `PTOAS_ROOT` is set. |
+| `PTOAS_ROOT` | PTO-DSL oneshots | PTOAS checkout. `ptodsl/` is added to `PYTHONPATH`. |
+| `PTODSL_DEPS` | PTO-DSL oneshots | PTO-DSL / camodel prefix (`bin/` on `PATH`, prefix on `PYTHONPATH`). |
+| `MLIR_PYTHON_ROOT` | PTO-DSL oneshots | MLIR Python package root, added to `PYTHONPATH`. |
+| `RUN_CF_MB_OPSIM` | Simt opsim | Path to `run_cf_mb_opsim.py`, used when `/tmp/run_cf_mb_opsim.py` is absent and `$TILELANG_DEPS/examples/ascend/run_cf_mb_opsim.py` is absent. |
+| `BISHENG_LIBSTDCXX_FIX` | harness compile | `bisheng_libstdcxx_clang_fix.h`, passed to bisheng as `-include`. When unset, the harness uses that header from this directory or from `$TILELANG_DEPS/examples/ascend/msprof_res/orig_pto_vmi_simd/` when the file is there. |
+| `ST_SIMTVF_OUT` | optional | Output directory. Simt family default: `/tmp/t_parallel_st_suite`. PTO-DSL family default: a subdirectory of that path. |
+| `SOC` | optional | Opsim soc version. `SOC_VERSION` is the same knob. Default `Ascend950PR_9599`. |
+
+`harvest_pass_table.sh` uses `PY` and `TILELANG_DEPS`. PTO-DSL oneshots source `$HOME/projects/env.sh` when that file exists, then source `$ASCEND_HOME_PATH/set_env.sh`.
 
 ```bash
-# Env (typical pto-b10 paths)
-export ASCEND_HOME_PATH=/mnt/fluxdata/Ascend/cann_91b3/cann-9.1.0-beta.3
+export PY=/path/to/.venv-npu/bin/python
+export ASCEND_HOME_PATH=/path/to/cann
 source "$ASCEND_HOME_PATH/set_env.sh"
 export TORCH_DEVICE_BACKEND_AUTOLOAD=0
-PY=/home/happybot/projects/tilelang-deepseek/.venv-npu/bin/python
-export TILELANG_DEPS="$(cd ../../.. && pwd)"   # this checkout
-SOC=Ascend950PR_9599
+
+# Simt SV/CF/SP, including the full regress
+export CAMODEL_DEPS=/path/to/camodel-deps
+export PTOAS_ROOT=/path/to/PTOAS
+export SIM_DSL="$PTOAS_ROOT/scripts/sim_dsl.sh"
+export TILELANG_DEPS="$(cd ../../.. && pwd)"   # in-tree libtilelang.so; the full regress sets this itself
+export BISHENG_LIBSTDCXX_FIX=/path/to/bisheng_libstdcxx_clang_fix.h
+# export RUN_CF_MB_OPSIM=/path/to/run_cf_mb_opsim.py
+
+# SIMD (PTO-DSL) oneshots
+export PTODSL_DEPS=/path/to/ptodsl-deps
+export MLIR_PYTHON_ROOT=/path/to/mlir/python_packages/mlir_core
+
+export ST_SIMTVF_OUT=/tmp/t_parallel_st_suite
+export SOC=Ascend950PR_9599
 
 cd examples/ascend/t_parallel_st_suite
 
@@ -74,7 +105,25 @@ bash oneshot_ptodsl_cf1d_cf6d.sh     # SIMD CF1d–CF6d
 bash oneshot_ptodsl_sp1d_sp6d.sh     # SIMD SP1d–SP6d (includes SP4d/SP5d)
 ```
 
-Harness / opsim helpers: `common_asc_harness.py`, `common_pto_harness.py`, `run_opsim_generic.py`, `run_opsim_topk.py` (SV9).  
+### pto-b10 lab example
+
+Paths for the pto-b10 login node. Another host uses its own CANN install, virtualenv, and dependency prefixes.
+
+```bash
+# pto-b10 example
+export ASCEND_HOME_PATH=/mnt/fluxdata/Ascend/cann_91b3/cann-9.1.0-beta.3
+export PY=/home/happybot/projects/tilelang-deepseek/.venv-npu/bin/python
+export TILELANG_DEPS=/home/happybot/projects/tilelang-pto-vmi-deps-stack
+export CAMODEL_DEPS=/mnt/fluxdata/happybot/projects/tilelang-deepseek-pto-vmi-topk/.camodel_deps_vmi018
+export PTODSL_DEPS="$CAMODEL_DEPS"
+export PTOAS_ROOT=/home/happybot/PTOAS-vmi
+export SIM_DSL="$PTOAS_ROOT/scripts/sim_dsl.sh"
+export MLIR_PYTHON_ROOT=/mnt/fluxdata/happybot/llvm-vpto/build-llvm21/tools/mlir/python_packages/mlir_core
+export BISHENG_LIBSTDCXX_FIX=/mnt/fluxdata/happybot/projects/tilelang-deepseek-pto-vmi-topk/examples/ascend/msprof_res/orig_pto_vmi_simd/bisheng_libstdcxx_clang_fix.h
+export SOC=Ascend950PR_9599
+```
+
+Harness / opsim helpers: `common_asc_harness.py`, `common_pto_harness.py`, `run_opsim_generic.py`, `run_opsim_topk.py` (SV9).
 Harvest: `harvest_report.py`, `harvest_pass_table.sh`, `harvest_simt_vmi_compare.py`.
 
 ### Known blocker on this tip

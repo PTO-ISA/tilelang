@@ -4,6 +4,23 @@
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 DST=$(cd "$HERE/../../.." && pwd)
+
+# Required paths are environment variables. See README.md.
+if [[ -z "${PY:-}" && -n "${PYTHON_BIN:-}" ]]; then
+  PY="$PYTHON_BIN"
+fi
+: "${PY:?Set PY to the NPU venv interpreter (PYTHON_BIN is also accepted)}"
+: "${ASCEND_HOME_PATH:?Set ASCEND_HOME_PATH to the CANN toolkit root (directory containing set_env.sh)}"
+: "${CAMODEL_DEPS:?Set CAMODEL_DEPS to the camodel dependency prefix (its bin/ is prepended to PATH)}"
+if [[ -z "${SIM_DSL:-}" && -n "${PTOAS_ROOT:-}" ]]; then
+  SIM_DSL="$PTOAS_ROOT/scripts/sim_dsl.sh"
+fi
+: "${SIM_DSL:?Set SIM_DSL to sim_dsl.sh, or set PTOAS_ROOT to use \$PTOAS_ROOT/scripts/sim_dsl.sh}"
+: "${PTOAS_ROOT:?Set PTOAS_ROOT to the PTOAS checkout (ptodsl/ and scripts/sim_dsl.sh)}"
+: "${PTODSL_DEPS:?Set PTODSL_DEPS to the PTO-DSL / camodel dependency prefix}"
+: "${MLIR_PYTHON_ROOT:?Set MLIR_PYTHON_ROOT to the MLIR Python package root}"
+export PY SIM_DSL
+
 export TILELANG_DEPS="$DST"
 export ST_SIMTVF_OUT="${ST_SIMTVF_OUT:-/tmp/t_parallel_st_suite_pto_isa}"
 export PYTHONPATH="$HERE:$DST:$DST/build:${PYTHONPATH:-}"
@@ -12,9 +29,8 @@ export TORCH_DEVICE_BACKEND_AUTOLOAD=0
 mkdir -p "$ST_SIMTVF_OUT"
 LOG="$ST_SIMTVF_OUT/oneshot_pto_isa_regress.log"
 exec > >(tee -a "$LOG") 2>&1
-echo "=== PTO-ISA ST regress $(date -Is) DST=$DST OUT=$ST_SIMTVF_OUT ==="
+echo "=== PTO-ISA ST regress $(date -Is) DST=$DST OUT=$ST_SIMTVF_OUT PY=$PY ASCEND_HOME_PATH=$ASCEND_HOME_PATH ==="
 ls -la "$DST/build/lib/libtilelang.so" 2>/dev/null || echo "(no in-tree libtilelang.so yet)"
-PY=/home/happybot/projects/tilelang-deepseek/.venv-npu/bin/python
 "$PY" -c "import tilelang,tilelang.libinfo as li; print(tilelang.__path__); print(li.find_lib_path('tilelang'))" || true
 
 run() {

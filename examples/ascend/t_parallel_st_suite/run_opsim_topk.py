@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import re
 import sys
 from pathlib import Path
@@ -40,9 +41,11 @@ exp = np.array(peaks, np.int32)
 out_h = np.zeros(K, np.int32)
 
 ctypes.CDLL("libruntime.so", mode=ctypes.RTLD_GLOBAL)
-for _cand in (
-    "/home/happybot/projects/tilelang-pto-vmi-deps-stack/build/lib/libtvm_ffi.so",
-):
+_ffi_cands: list[str] = []
+_deps = os.environ.get("TILELANG_DEPS", "").strip()
+if _deps:
+    _ffi_cands.append(str(Path(_deps) / "build" / "lib" / "libtvm_ffi.so"))
+for _cand in _ffi_cands:
     if Path(_cand).is_file():
         try:
             ctypes.CDLL(_cand, mode=ctypes.RTLD_GLOBAL)

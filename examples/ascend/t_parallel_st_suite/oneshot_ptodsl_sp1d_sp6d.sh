@@ -5,23 +5,28 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 OUT="${ST_SIMTVF_OUT:-/tmp/t_parallel_st_suite/ptodsl_sp1d_sp6d}"
 mkdir -p "$OUT"
-PY="${PYTHON_BIN:-$HOME/projects/tilelang-deepseek/.venv-npu/bin/python}"
-ASC="${ASCEND_HOME_PATH:-/mnt/fluxdata/Ascend/cann_91b3/cann-9.1.0-beta.3}"
-PTOAS_ROOT="${PTOAS_ROOT:-$HOME/PTOAS-vmi}"
+# Required paths are environment variables. See README.md.
+if [[ -z "${PY:-}" && -n "${PYTHON_BIN:-}" ]]; then
+  PY="$PYTHON_BIN"
+fi
+: "${PY:?Set PY to the NPU venv interpreter (PYTHON_BIN is also accepted)}"
+: "${ASCEND_HOME_PATH:?Set ASCEND_HOME_PATH to the CANN toolkit root (directory containing set_env.sh)}"
+: "${PTOAS_ROOT:?Set PTOAS_ROOT to the PTOAS checkout (ptodsl/ and scripts/sim_dsl.sh)}"
 SIM_DSL="${SIM_DSL:-$PTOAS_ROOT/scripts/sim_dsl.sh}"
-SOC="${SOC_VERSION:-Ascend950PR_9599}"
+: "${PTODSL_DEPS:?Set PTODSL_DEPS to the PTO-DSL / camodel dependency prefix}"
+: "${MLIR_PYTHON_ROOT:?Set MLIR_PYTHON_ROOT to the MLIR Python package root}"
+SOC="${SOC:-${SOC_VERSION:-Ascend950PR_9599}}"
 
 set +u
 [[ -f "$HOME/projects/env.sh" ]] && source "$HOME/projects/env.sh" || true
-[[ -f "$ASC/set_env.sh" ]] && source "$ASC/set_env.sh" || true
+source "$ASCEND_HOME_PATH/set_env.sh"
 set -u
-export ASCEND_HOME_PATH="$ASC"
+export ASCEND_HOME_PATH
 export TORCH_DEVICE_BACKEND_AUTOLOAD=0
+export PY
 export PYTHON_BIN="$PY"
-DEPS="${PTODSL_DEPS:-/mnt/fluxdata/happybot/projects/tilelang-deepseek-pto-vmi-topk/.camodel_deps_vmi018}"
-MLIR_PY="${MLIR_PYTHON_ROOT:-/mnt/fluxdata/happybot/llvm-vpto/build-llvm21/tools/mlir/python_packages/mlir_core}"
-export PYTHONPATH="${DEPS}:${PTOAS_ROOT}/ptodsl:${MLIR_PY}:${PYTHONPATH:-}"
-export PATH="${DEPS}/bin:${PATH}"
+export PYTHONPATH="${PTODSL_DEPS}:${PTOAS_ROOT}/ptodsl:${MLIR_PYTHON_ROOT}:${PYTHONPATH:-}"
+export PATH="${PTODSL_DEPS}/bin:${PATH}"
 
 echo "[ptodsl-sp1d-sp6d] OUT=$OUT PY=$PY SOC=$SOC ROOT=$ROOT"
 if ! "$PY" -c 'from ptodsl import pto; print("ptodsl OK")'; then

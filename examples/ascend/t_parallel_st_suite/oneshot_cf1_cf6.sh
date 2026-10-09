@@ -2,17 +2,30 @@
 # SimtVF Parallel CF1–CF6 control-flow micros on pto-b10 (Simt only; no VMI twins).
 # Prefer deps-native lib; target=ascend cython NOT pto.
 set -euo pipefail
-OUT=/tmp/t_parallel_st_suite
+OUT="${ST_SIMTVF_OUT:-/tmp/t_parallel_st_suite}"
 LOG=$OUT/oneshot_cf1_cf6.log
 mkdir -p "$OUT/so" "$OUT/logs" "$OUT/sources" "$OUT/reports"
 exec > >(tee -a "$LOG") 2>&1
 echo "=== t_parallel_st_suite CF1–CF6 oneshot $(date -Is) host=$(hostname) user=$(whoami) ==="
 
-DEPS=${TILELANG_DEPS:-/home/happybot/projects/tilelang-pto-vmi-deps-stack}
-ASC=/mnt/fluxdata/Ascend/cann_91b3/cann-9.1.0-beta.3
-CAMO=/mnt/fluxdata/happybot/projects/tilelang-deepseek-pto-vmi-topk/.camodel_deps_vmi018
-PY=/home/happybot/projects/tilelang-deepseek/.venv-npu/bin/python
-SIM=/home/happybot/PTOAS-vmi/scripts/sim_dsl.sh
+# Required paths are environment variables. See README.md.
+if [[ -z "${PY:-}" && -n "${PYTHON_BIN:-}" ]]; then
+  PY="$PYTHON_BIN"
+fi
+: "${PY:?Set PY to the NPU venv interpreter (PYTHON_BIN is also accepted)}"
+: "${ASCEND_HOME_PATH:?Set ASCEND_HOME_PATH to the CANN toolkit root (directory containing set_env.sh)}"
+: "${TILELANG_DEPS:?Set TILELANG_DEPS to the TileLang tree that contains build/lib/libtilelang.so}"
+: "${CAMODEL_DEPS:?Set CAMODEL_DEPS to the camodel dependency prefix (its bin/ is prepended to PATH)}"
+if [[ -z "${SIM_DSL:-}" && -n "${PTOAS_ROOT:-}" ]]; then
+  SIM_DSL="$PTOAS_ROOT/scripts/sim_dsl.sh"
+fi
+: "${SIM_DSL:?Set SIM_DSL to sim_dsl.sh, or set PTOAS_ROOT to use \$PTOAS_ROOT/scripts/sim_dsl.sh}"
+DEPS=$TILELANG_DEPS
+ASC=$ASCEND_HOME_PATH
+CAMO=$CAMODEL_DEPS
+SIM=$SIM_DSL
+SOC="${SOC:-${SOC_VERSION:-Ascend950PR_9599}}"
+export PY SIM_DSL SOC
 BK=/tmp/libtilelang.so.deps_backup_ab
 if [[ ! -f "$BK" ]]; then BK=/tmp/libtilelang.so.deps_backup_st_simtvf; fi
 
@@ -25,12 +38,22 @@ export ST_SIMTVF_OUT=$OUT
 export PYTHONPATH="$SUITE:${PYTHONPATH:-}"
 
 if [[ ! -f /tmp/run_cf_mb_opsim.py ]]; then
+  _opsim_src=""
   for c in \
-    /mnt/fluxdata/happybot/projects/tilelang-deepseek-pto-vmi-topk/examples/ascend/run_cf_mb_opsim.py \
-    /home/happybot/projects/tilelang-deepseek/examples/ascend/run_cf_mb_opsim.py
+    "${RUN_CF_MB_OPSIM:-}" \
+    "$DEPS/examples/ascend/run_cf_mb_opsim.py" \
+    "$HERE/run_cf_mb_opsim.py"
   do
-    [[ -f "$c" ]] && cp -f "$c" /tmp/run_cf_mb_opsim.py && break
+    if [[ -n "$c" && -f "$c" ]]; then
+      _opsim_src="$c"
+      break
+    fi
   done
+  if [[ -z "$_opsim_src" ]]; then
+    echo "error: run_cf_mb_opsim.py not found. Set RUN_CF_MB_OPSIM or place it at \$TILELANG_DEPS/examples/ascend/run_cf_mb_opsim.py" >&2
+    exit 1
+  fi
+  cp -f "$_opsim_src" /tmp/run_cf_mb_opsim.py
 fi
 cp -f "$SUITE"/run_opsim_*.py /tmp/ 2>/dev/null || true
 cp -f "$SUITE"/harvest_report.py /tmp/ 2>/dev/null || true
@@ -49,6 +72,7 @@ export TILELANG_DISABLE_CACHE=1
 export TORCH_DEVICE_BACKEND_AUTOLOAD=0
 export CPLUS_INCLUDE_PATH="/usr/include/c++/12:/usr/include/aarch64-linux-gnu/c++/12${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH}"
 export TILELANG_DISABLE_DATA_RACE_CHECK=1
+echo "PY=$PY ASCEND_HOME_PATH=$ASC TILELANG_DEPS=$DEPS CAMODEL_DEPS=$CAMO SIM_DSL=$SIM SOC=$SOC"
 
 SUMMARY="$OUT/SUMMARY_cf1_cf6_raw.txt"
 : > "$SUMMARY"
@@ -69,7 +93,7 @@ compile_run_generic() {
   echo "COMPILE_OK $TAG" | tee -a "$SUMMARY"
   ls -la "$OUT"/sources/*${TAG}* 2>/dev/null | tee -a "$SUMMARY" || true
   set +e
-  "$SIM" --soc-version Ascend950PR_9599 --output "$OUT/opsim_${TAG}" \
+  "$SIM" --soc-version "$SOC" --output "$OUT/opsim_${TAG}" \
     /tmp/run_opsim_generic.py -- "$TAG" "$OUT" 2>&1 | tee "$OUT/opsim_${TAG}.log"
   set -e
   local PASSLINE US
