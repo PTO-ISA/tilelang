@@ -7285,8 +7285,11 @@ void CodeGenTileLangPTO::VisitExpr_(const BufferLoadNode *op,
     ICHECK(!op->predicate.defined())
         << "PTO VMI local register buffers do not support predicated loads";
     CheckVmiLocalRegisterIndex(op->buffer.get(), op->indices[0]);
-    os << GetVarID(op->buffer->data.get()) << "["
-       << RemoveOutermostParentheses(PrintExpr_(op->indices[0])) << "]";
+    // Reuse the tree's vector-local accessor so register arrays follow the
+    // slot-name model (Name stores stay loop-carriable for PTODSL's AST
+    // liveness analysis, matching scalarized local.fragment buffers).
+    os << GetVectorLocalRef(op->buffer->data.get(), op->indices[0],
+                            "PTO VMI local register buffer load");
     return;
   }
 
@@ -7493,9 +7496,9 @@ void CodeGenTileLangPTO::VisitStmt_(const BufferStoreNode *op) {
         << "PTO VMI local register buffers do not support predicated stores";
     CheckVmiLocalRegisterIndex(op->buffer.get(), op->indices[0]);
     PrintIndent();
-    stream << GetVarID(op->buffer->data.get()) << "["
-           << RemoveOutermostParentheses(PrintExpr_(op->indices[0]))
-           << "] = " << RemoveOutermostParentheses(PrintExpr_(op->value))
+    stream << GetVectorLocalRef(op->buffer->data.get(), op->indices[0],
+                                "PTO VMI local register buffer store")
+           << " = " << RemoveOutermostParentheses(PrintExpr_(op->value))
            << "\n";
     return;
   }

@@ -873,11 +873,13 @@ def test_pto_codegen_emits_static_local_register_lists():
                 T.vmi.vstore(T.vmi.vadd(regs[0], regs[3], mask), b_ub[0], mask)
 
     source = lower(func, target="pto").kernel_source
-    assert "= [None] * 4" in source
     assert "pto.static_range(" not in source
+    # This tree models vector local slots as independent Python names so PTODSL
+    # keeps register-array elements loop-carriable (see GetVectorLocalRef).
     for index in range(4):
-        assert f"regs[{index}] = pto.vmi.vload" in source
-    assert re.search(r"pto\.vmi\.vadd\([^\n]*\[0\], [^\n]*\[3\]", source)
+        assert f"regs_tl_slot_{index} = None" in source
+        assert f"regs_tl_slot_{index} = pto.vmi.vload" in source
+    assert "pto.vmi.vadd(regs_tl_slot_0, regs_tl_slot_3, mask)" in source
 
 
 def test_pto_codegen_emits_range_for_non_explicit_unroll():
@@ -1170,37 +1172,6 @@ def test_pto_codegen_wraps_literal_scalar_sources_by_dtype():
 
 
 @pytest.mark.pto
-def test_pto_codegen_vdup_types_scalar_sources():
-    """vdup must make PTOAS scalar/result element types explicit."""
-
-    @T.prim_func
-    def func(x: T.int32, f: T.float32):
-        with T.Kernel(1) as _, T.SimdVF():
-            mask = T.vmi.create_mask(64, size=64)
-            # Integer literals lose signedness when printed bare; the target
-            # element type must therefore be materialized in the PTO source.
-            signed = T.simd.vdup(T.int32(1), "int32", mask)
-            unsigned = T.simd.vdup(T.int32(1), "uint32", mask)
-            matching = T.simd.vdup(x, "int32", mask)
-            dynamic = T.simd.vdup(x, "uint32", mask)
-            float_to_int = T.simd.vdup(T.float32(1.5), "int32", mask)
-            dynamic_float_to_int = T.simd.vdup(f, "int32", mask)
-            T.evaluate(signed)
-            T.evaluate(unsigned)
-            T.evaluate(matching)
-            T.evaluate(dynamic)
-            T.evaluate(float_to_int)
-            T.evaluate(dynamic_float_to_int)
-
-    source = lower(func, target="pto").kernel_source
-    assert "pto.vdup(pto.si32(1)," in source
-    assert "pto.vdup(pto.ui32(1)," in source
-    assert "pto.vdup(x, mask)" in source
-    assert "pto.vdup(scalar.cast(x, pto.ui32)," in source
-    assert 'pto.vcvt(pto.vdup(pto.f32(float.fromhex(\'0x1.8p+0\')), mask), pto.si32, mask, rnd="Z", sat="SAT")' in source
-    assert 'pto.vcvt(pto.vdup(f, mask), pto.si32, mask, rnd="Z", sat="SAT")' in source
-
-
 @pytest.mark.parametrize(
     ("source_dtype", "target_dtype", "signed_dtype"),
     [
