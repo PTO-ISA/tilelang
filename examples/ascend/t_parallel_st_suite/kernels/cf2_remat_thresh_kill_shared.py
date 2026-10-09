@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from common_asc_harness import NEG, boot, compile_prim, set_out  # noqa: E402
-from vf_mode import vf_region  # noqa: E402
+from vf_mode import compile_target, vf_region  # noqa: E402
 
 
 def build_cf2(E: int, K: int, threads: int):
@@ -56,7 +56,7 @@ def main():
     K = int(sys.argv[2]) if len(sys.argv) > 2 else 8
     threads = int(sys.argv[3]) if len(sys.argv) > 3 else 32
     tag = f"cf2_e{E}_k{K}_t{threads}_remat"
-    so = compile_prim(build_cf2(E, K, threads), tag, target="ascend")
+    so = compile_prim(build_cf2(E, K, threads), tag, target=compile_target())
     if so is None:
         return 1
     print("SO", so)

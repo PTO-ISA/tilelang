@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Shared ASC Simt-family harness: npu stub + int2→make_int2 patch + cython compile/export.
 
-``ST_VF_MODE=simt|simd`` (see ``vf_mode.py``) picks ``T.SimtVF`` or ``T.SimdVF``
-for kernels that call ``vf_region``. Compile stays target=ascend + cython (not pto).
+``ST_VF_MODE`` (see ``vf_mode.py``) picks the VF frame and the compile target.
+Default ``simt-asc`` is ``T.SimtVF`` with ``target=ascend``. ``simt-pto`` and
+``simd-pto`` compile with ``target=pto`` and are not remapped to ascend.
 """
 from __future__ import annotations
 
@@ -18,7 +19,7 @@ from pathlib import Path
 
 import numpy as np
 
-from vf_mode import announce_vf_mode
+from vf_mode import announce_vf_mode, compile_target, resolve_vf_mode
 
 os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
 os.environ.setdefault("TILELANG_DISABLE_CACHE", "1")
@@ -289,15 +290,41 @@ def ensure_asc_compile_env() -> None:
     )
 
 
-def compile_prim(prim, tag: str, target: str = "ascend"):
-    """Compile prim_func with ASC cython backend; export .so under OUT/so/{tag}.so."""
+def _compile_target_for_mode(requested: str | None) -> str:
+    """Resolve ``tilelang.compile(..., target=)`` from ``ST_VF_MODE``.
+
+    Omitting ``target`` uses :func:`compile_target`. A leftover ``target="ascend"``
+    follows a PTO mode. An explicit ``target="pto"`` while the mode compiles
+    for ascend is refused, so that request is not rewritten to ascend. When the
+    mode asks for PTO, a missing PTO backend fails the compile.
+    """
+    mode = resolve_vf_mode()
+    mode_target = compile_target(mode)
+    if requested is None or requested == mode_target:
+        return mode_target
+    if requested == "pto":
+        raise RuntimeError(
+            f"REFUSING target=pto while ST_VF_MODE={mode} selects compile target {mode_target!r}. "
+            "Set ST_VF_MODE=simt-pto or simd-pto to compile target=pto. "
+            "A missing PTO backend fails that compile; it is not remapped to ascend."
+        )
+    print(
+        f"NOTE compile_prim target={requested!r} follows ST_VF_MODE target={mode_target}",
+        flush=True,
+    )
+    return mode_target
+
+
+def compile_prim(prim, tag: str, target: str | None = None):
+    """Compile prim_func with the cython backend; export .so under OUT/so/{tag}.so.
+
+    Pass ``target=compile_target()`` or omit ``target``. PTO modes compile with
+    ``target=pto``.
+    """
     import tilelang
 
     announce_vf_mode()
-    if target == "pto":
-        raise RuntimeError(
-            "REFUSING target=pto for SimtVF (deps may call SimdVFLowerControlFlow missing). Use ascend."
-        )
+    target = _compile_target_for_mode(target)
 
     ensure_asc_compile_env()
     set_out(OUT)

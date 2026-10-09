@@ -6,8 +6,8 @@ Green SimdVF path (simd_vs_simt AB on pto-b10):
 - overlay ``libtilelang.so`` with SimdVFLower* + GetPredicate(PrimExpr)
 - ``T.SimdVF(lanes=…)``; prefer ``alloc_shared`` for VF working set
 
-Do **not** mix with SimtVF:
-- SimtVF stays on ``common_asc_harness`` (target=ascend + cython + deps-native lib).
+Do **not** mix with the Simt-family kernels:
+- Those use ``common_asc_harness``. ``ST_VF_MODE`` selects their frame and target.
 - Overlay GetPredicate(PrimExpr) vs deps GetPredicate(Var) — oneshot must restore BK.
 """
 from __future__ import annotations

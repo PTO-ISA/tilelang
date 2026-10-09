@@ -1,18 +1,24 @@
 #!/usr/bin/env bash
-# Run the Simt-family ST oneshots under ST_VF_MODE=simt and/or simd.
-# Same kernels/T.Parallel source; vf_region picks T.SimtVF or T.SimdVF.
-# kernels_ptodsl/ is not part of this regress.
+# Run the Simt-family ST oneshots under the four ST_VF_MODE frame×target pairs.
+# Same kernels/T.Parallel source; vf_region picks T.SimtVF or T.SimdVF and
+# compile_target picks ascend or pto. kernels_ptodsl/ is not part of this regress.
 #
-# SimdVF may FAIL some cases. The script still prints a PASS/FAIL table
-# and exits non-zero only when an oneshot script itself fails (missing env,
-# etc.), not because a case cell is FAIL.
+#   simt-asc   T.SimtVF  target=ascend   (aliases: simt, simtvf, simt-ascend)
+#   simt-pto   T.SimtVF  target=pto       (alias: simtvf-pto)
+#   simd-asc   T.SimdVF  target=ascend    (aliases: simd, simdvf, simd-ascend)
+#   simd-pto   T.SimdVF  target=pto       (alias: simdvf-pto)
 #
-# Default (ST_VF_MODE and ST_VF_MODES unset): both modes.
-# ST_VF_MODES="simd"           one or more modes (comma or space separated)
-# ST_VF_MODE=simt              single mode when ST_VF_MODES is unset
+# SimdVF and PTO modes may FAIL some cases. The script still prints a PASS/FAIL
+# table and exits non-zero only when an oneshot script itself fails (missing
+# env, etc.), not because a case cell is FAIL. A missing PTO backend is
+# FAIL compile; it is not remapped to ascend.
+#
+# Default (ST_VF_MODE and ST_VF_MODES unset): all four modes.
+# ST_VF_MODES="simd-pto simt-asc"   one or more modes (comma or space separated)
+# ST_VF_MODE=simt-asc               single mode when ST_VF_MODES is unset
 # ST_VF_ONESHOTS="oneshot_sv1_sv9.sh"   subset of family oneshots
-# ST_VF_REGRESS_OUT=/tmp/...   root; each mode writes $root/<mode>/
-# ST_VF_SUMMARIZE_ONLY=1       reprint the table, skip oneshots
+# ST_VF_REGRESS_OUT=/tmp/...        root; each mode writes $root/<mode>/
+# ST_VF_SUMMARIZE_ONLY=1            reprint the table, skip oneshots
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -22,16 +28,20 @@ if [[ -z "${PY:-}" && -n "${PYTHON_BIN:-}" ]]; then
 fi
 TABLE_PY="${PY:-python3}"
 
+# Canonical names come from vf_mode.resolve_vf_mode so shell aliases cannot drift.
 canon_mode() {
-  local raw="${1,,}"
-  case "$raw" in
-    simt|simtvf) printf '%s\n' simt ;;
-    simd|simdvf) printf '%s\n' simd ;;
-    *)
-      echo "error: unknown VF mode '$1' (expected simt|simd or alias simtvf|simdvf)" >&2
-      return 1
-      ;;
-  esac
+  "$TABLE_PY" - "$HERE" "$1" <<'PY'
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from vf_mode import resolve_vf_mode
+
+try:
+    print(resolve_vf_mode(sys.argv[2]))
+except ValueError as exc:
+    print(f"error: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+PY
 }
 
 if [[ -n "${ST_VF_MODES:-}" ]]; then
@@ -41,14 +51,14 @@ if [[ -n "${ST_VF_MODES:-}" ]]; then
 elif [[ -n "${ST_VF_MODE:-}" ]]; then
   RAW_MODES=("$ST_VF_MODE")
 else
-  RAW_MODES=(simt simd)
+  RAW_MODES=(simt-asc simt-pto simd-asc simd-pto)
 fi
 
 declare -A SEEN=()
 MODES=()
 for raw in "${RAW_MODES[@]}"; do
   [[ -z "$raw" ]] && continue
-  mode=$(canon_mode "$raw")
+  mode=$(canon_mode "$raw") || exit 1
   if [[ -n "${SEEN[$mode]:-}" ]]; then
     continue
   fi
@@ -79,7 +89,7 @@ mkdir -p "$BASE"
 LOG="$BASE/oneshot_vf_mode_regress.log"
 exec > >(tee -a "$LOG") 2>&1
 echo "=== VF mode regress $(date -Is) modes=${MODES[*]} oneshots=${ONESHOTS[*]} OUT=$BASE ==="
-echo "SimdVF FAIL cells are recorded. This regress does not require every case to PASS."
+echo "SimdVF and PTO FAIL cells are recorded. This regress does not require every case to PASS."
 
 rc_all=0
 if [[ "${ST_VF_SUMMARIZE_ONLY:-0}" == "1" ]]; then

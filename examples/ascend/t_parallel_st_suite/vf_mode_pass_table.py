@@ -2,7 +2,9 @@
 """PASS/FAIL table for ST_VF_MODE runs (case tag × mode).
 
 Reads oneshot SUMMARY files and, when those are absent, opsim/compile logs.
-Does not launch opsim. SimdVF FAIL cells are expected for some cases.
+Does not launch opsim. SimdVF and PTO FAIL cells are expected for some cases.
+Columns follow the mode directories under the regress root (the four
+``simt-asc`` / ``simt-pto`` / ``simd-asc`` / ``simd-pto`` names when all ran).
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ SUITE = Path(__file__).resolve().parent
 if str(SUITE) not in sys.path:
     sys.path.insert(0, str(SUITE))
 
-from vf_mode import resolve_vf_mode  # noqa: E402
+from vf_mode import CANONICAL_VF_MODES, resolve_vf_mode  # noqa: E402
 
 _COMPILE_FAIL = re.compile(r"^COMPILE_FAIL\s+(\S+)")
 _COMPILE_OK = re.compile(r"^COMPILE_OK\s+(\S+)")
@@ -27,7 +29,7 @@ _TAG_FROM_COMPILE_LOG = re.compile(r"^compile_(.+)\.log$")
 _TAG_FROM_OPSIM_LOG = re.compile(r"^opsim_(.+)\.log$")
 _TAG_FROM_RESULT = re.compile(r"^opsim_(.+)_result\.txt$")
 
-_MODE_ORDER = {"simt": 0, "simd": 1}
+_MODE_ORDER = {name: idx for idx, name in enumerate(CANONICAL_VF_MODES)}
 
 
 def _tag_sort_key(tag: str) -> tuple:
@@ -199,7 +201,7 @@ def mode_dirs_under(root: Path) -> list[tuple[str, Path]]:
             try:
                 label = resolve_vf_mode(None)
             except ValueError:
-                label = "simt"
+                label = "simt-asc"
         return [(label, root)]
     return []
 
@@ -218,7 +220,8 @@ def render_table(columns: list[tuple[str, dict[str, str]]]) -> str:
     lines = [
         "# ST_VF_MODE pass table",
         "# PASS = opsim PASS line. FAIL compile / FAIL opsim / FAIL no-pass-line name the miss.",
-        "# SimdVF may FAIL some ST cases; this table records the current outcome.",
+        "# SimdVF and PTO modes may FAIL some ST cases; this table records the current outcome.",
+        "# A missing PTO backend is FAIL compile. It is not remapped to ascend.",
         "",
     ]
     lines.append("  ".join(cell.ljust(widths[idx]) for idx, cell in enumerate(header)))
@@ -268,7 +271,10 @@ def main(argv: list[str] | None = None) -> int:
         "--root",
         type=Path,
         default=None,
-        help="Regress root containing simt/ and simd/ OUT dirs (default: $ST_VF_REGRESS_OUT or /tmp/t_parallel_st_suite_vf_mode).",
+        help=(
+            "Regress root containing per-mode OUT dirs such as simt-asc/ and simd-pto/ "
+            "(default: $ST_VF_REGRESS_OUT or /tmp/t_parallel_st_suite_vf_mode)."
+        ),
     )
     parser.add_argument(
         "--out",

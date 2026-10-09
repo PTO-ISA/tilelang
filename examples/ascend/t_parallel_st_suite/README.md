@@ -4,7 +4,7 @@ Sensitivity STs comparing **Simt `T.Parallel`** vs **SIMD (PTO-DSL)** on Ascend9
 
 Primary metric: **total VF cycles** (sum of vector-pipe / VF launch cycles on `core0.veccore0`). Wall µs is secondary. Compare each Simt arm to the **best SIMD (PTO-DSL) schedule** at the same shape — label it “SIMD (PTO-DSL)”, not “*d twin”.
 
-`ST_VF_MODE` selects the TileLang frame around that same `T.Parallel` source: `T.SimtVF` (`simt`, the default) or `T.SimdVF` (`simd`). The SIMD (PTO-DSL) numbers in [`SUMMARY.md`](SUMMARY.md) still come from `kernels_ptodsl/`.
+`ST_VF_MODE` selects the TileLang frame and the compile target for that same `T.Parallel` source. The default `simt-asc` is `T.SimtVF` with `target=ascend`. The other three selections are `simt-pto`, `simd-asc`, and `simd-pto`. The SIMD (PTO-DSL) numbers in [`SUMMARY.md`](SUMMARY.md) still come from `kernels_ptodsl/`.
 
 | Deck | Summary |
 |------|---------|
@@ -69,9 +69,9 @@ Export the variables below, source the CANN env script, then run an oneshot from
 | `BISHENG_LIBSTDCXX_FIX` | harness compile | `bisheng_libstdcxx_clang_fix.h`, passed to bisheng as `-include`. When unset, the harness uses that header from this directory or from `$TILELANG_DEPS/examples/ascend/msprof_res/orig_pto_vmi_simd/` when the file is there. |
 | `ST_SIMTVF_OUT` | optional | Output directory. Simt family default: `/tmp/t_parallel_st_suite`. PTO-DSL family default: a subdirectory of that path. |
 | `SOC` | optional | Opsim soc version. `SOC_VERSION` is the same knob. Default `Ascend950PR_9599`. |
-| `ST_VF_MODE` | Simt family kernels | `simt` (default) or `simd`. Aliases: `simtvf`, `simdvf`. `simt` uses `T.SimtVF(threads=…)`. `simd` uses `T.SimdVF()` on the same body. |
-| `ST_VF_MODES` | `oneshot_vf_mode_regress.sh` | Space- or comma-separated modes. When this and `ST_VF_MODE` are unset, the regress runs `simt` and `simd`. `ST_VF_MODES` wins when both are set. |
-| `ST_VF_REGRESS_OUT` | regress | Root for per-mode OUT dirs (`$root/simt`, `$root/simd`). Default `/tmp/t_parallel_st_suite_vf_mode`. |
+| `ST_VF_MODE` | Simt family kernels | One of `simt-asc` (default), `simt-pto`, `simd-asc`, `simd-pto`. See the frame × target table below. |
+| `ST_VF_MODES` | `oneshot_vf_mode_regress.sh` | Space- or comma-separated modes. When this and `ST_VF_MODE` are unset, the regress runs all four: `simt-asc simt-pto simd-asc simd-pto`. `ST_VF_MODES` wins when both are set. |
+| `ST_VF_REGRESS_OUT` | regress | Root for per-mode OUT dirs (`$root/simt-asc`, `$root/simt-pto`, `$root/simd-asc`, `$root/simd-pto`). Default `/tmp/t_parallel_st_suite_vf_mode`. |
 | `ST_VF_ONESHOTS` | regress | Space- or comma-separated oneshot scripts. Default: `oneshot_sv1_sv9.sh`, `oneshot_cf1_cf6.sh`, `oneshot_sp1_sp6.sh`. |
 | `ST_VF_SUMMARIZE_ONLY` | regress | `1` reprints the PASS/FAIL table and skips oneshots. |
 
@@ -97,7 +97,7 @@ export MLIR_PYTHON_ROOT=/path/to/mlir/python_packages/mlir_core
 
 export ST_SIMTVF_OUT=/tmp/t_parallel_st_suite
 export SOC=Ascend950PR_9599
-export ST_VF_MODE=simt   # or simd; unset defaults to simt
+export ST_VF_MODE=simt-asc   # or simt-pto, simd-asc, simd-pto; unset defaults to simt-asc
 
 cd examples/ascend/t_parallel_st_suite
 
@@ -115,30 +115,32 @@ bash oneshot_ptodsl_sp1d_sp6d.sh     # SIMD SP1d–SP6d (includes SP4d/SP5d)
 
 Fill the placeholder exports above (`/path/to/cann`, `/path/to/.venv-npu/bin/python`, and the dependency prefixes). Machine-specific install paths stay in the shell environment.
 
-### TileLang VF frame (`ST_VF_MODE`)
+### TileLang VF frame and compile target (`ST_VF_MODE`)
 
-Kernels under `kernels/` call `vf_region(threads)` (`vf_mode.py`). One `T.Parallel` body runs under either frame:
+Kernels under `kernels/` call `vf_region(threads)` and compile with `compile_target()` (`vf_mode.py`). One `T.Parallel` body runs under one of four frame × target pairs:
 
-| `ST_VF_MODE` | Frame |
-|--------------|--------|
-| `simt` (default), alias `simtvf` | `T.SimtVF(threads=threads)` |
-| `simd`, alias `simdvf` | `T.SimdVF()` |
+| `ST_VF_MODE` | Aliases | Frame | `tilelang.compile` target |
+|--------------|---------|-------|---------------------------|
+| `simt-asc` (default) | `simt`, `simtvf`, `simt-ascend` | `T.SimtVF(threads=threads)` | `ascend` |
+| `simt-pto` | `simtvf-pto` | `T.SimtVF(threads=threads)` | `pto` |
+| `simd-asc` | `simd`, `simdvf`, `simd-ascend` | `T.SimdVF()` | `ascend` |
+| `simd-pto` | `simdvf-pto` | `T.SimdVF()` | `pto` |
 
-The harness prints `ST_VF_MODE=simt` or `ST_VF_MODE=simd` once per kernel process. `kernels_ptodsl/` stays the hand-written PTO-DSL sensitivity arm; `ST_VF_MODE` does not select those files.
+The harness prints one line per kernel process, for example `ST_VF_MODE=simt-asc frame=SimtVF target=ascend`. `kernels_ptodsl/` stays the hand-written PTO-DSL sensitivity arm; `ST_VF_MODE` does not select those files.
 
-SimdVF may fail to compile or fail opsim on some ST cases with the current compiler. The regress table lists PASS and FAIL per case and mode.
+PTO modes compile with `target=pto`. They are not remapped to `ascend`. If the PTO backend is missing or lowering fails, that case is `FAIL compile` in the regress table. SimdVF and PTO modes may fail to compile or fail opsim on some ST cases with the current compiler. The table lists PASS and FAIL per case and mode.
 
 ```bash
 # One mode on the existing Simt-family oneshots
-export ST_VF_MODE=simd
+export ST_VF_MODE=simd-pto
 bash oneshot_sv1_sv9.sh
 
-# Both modes. Writes $ST_VF_REGRESS_OUT/simt and .../simd
+# All four modes. Writes $ST_VF_REGRESS_OUT/<mode>/
 # (default /tmp/t_parallel_st_suite_vf_mode) and prints a tag × mode table.
 bash oneshot_vf_mode_regress.sh
 
 # One mode, or a family subset
-ST_VF_MODES=simt bash oneshot_vf_mode_regress.sh
+ST_VF_MODES=simt-asc bash oneshot_vf_mode_regress.sh
 ST_VF_ONESHOTS=oneshot_cf1_cf6.sh bash oneshot_vf_mode_regress.sh
 
 # Reprint the table from existing OUT dirs

@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from common_asc_harness import boot, compile_prim, set_out  # noqa: E402
-from vf_mode import vf_region  # noqa: E402
+from vf_mode import compile_target, vf_region  # noqa: E402
 
 
 def build_sp1(T_: int, K: int, H: int, G: int, threads: int, arm: str, Eexp: int | None = None):
@@ -150,7 +150,7 @@ def main():
         print(f"unknown arm {arm!r}; use keep_pos|remat_pos", flush=True)
         return 2
     tag = f"sp1_t{T_}_k{K}_h{H}_g{G}_t{threads}_{arm}"
-    so = compile_prim(build_sp1(T_, K, H, G, threads, arm), tag, target="ascend")
+    so = compile_prim(build_sp1(T_, K, H, G, threads, arm), tag, target=compile_target())
     print("SO", so) if so else None
     return 0 if so else 1
 

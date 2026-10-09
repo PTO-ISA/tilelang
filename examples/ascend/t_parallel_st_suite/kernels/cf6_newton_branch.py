@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from common_asc_harness import boot, compile_prim, set_out  # noqa: E402
-from vf_mode import vf_region  # noqa: E402
+from vf_mode import compile_target, vf_region  # noqa: E402
 
 EPS = 1e-4
 N_FAST = 3
@@ -61,7 +61,7 @@ def main():
     threads = int(sys.argv[2]) if len(sys.argv) > 2 else 32
     pnear = int(sys.argv[3]) if len(sys.argv) > 3 else 5
     tag = f"cf6_e{E}_t{threads}_pnear{pnear}"
-    so = compile_prim(build_cf6(E, threads), tag, target="ascend")
+    so = compile_prim(build_cf6(E, threads), tag, target=compile_target())
     if so is None:
         return 1
     print("SO", so)

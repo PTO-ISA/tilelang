@@ -21,7 +21,7 @@ Arms (separate Python ``@T.prim_func`` bodies):
 SV6/SV1B lessons:
 - Mutable accum: ``acc[i,j] = acc[i,j] + ...`` on fragment (OK)
 - Prefer fp32 Out (avoid half uint2 packs)
-- ``target=ascend`` + cython via ``compile_prim``
+- compile target follows ``ST_VF_MODE`` (default ``ascend``) + cython via ``compile_prim``
 """
 from __future__ import annotations
 

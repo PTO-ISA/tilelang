@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from common_asc_harness import boot, compile_prim, set_out  # noqa: E402
-from vf_mode import vf_region  # noqa: E402
+from vf_mode import compile_target, vf_region  # noqa: E402
 
 
 def build_sp5(N: int, H: int, G: int, Qg: int, threads: int, arm: str):
@@ -103,7 +103,7 @@ def main():
         print(f"unknown arm {arm!r}; use sideband|interleave", flush=True)
         return 2
     tag = f"sp5_n{N}_h{H}_g{G}_qg{Qg}_t{threads}_{arm}"
-    so = compile_prim(build_sp5(N, H, G, Qg, threads, arm), tag, target="ascend")
+    so = compile_prim(build_sp5(N, H, G, Qg, threads, arm), tag, target=compile_target())
     print("SO", so) if so else None
     return 0 if so else 1
 

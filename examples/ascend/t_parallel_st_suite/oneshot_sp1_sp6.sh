@@ -2,7 +2,8 @@
 # SimtVF Parallel SP1–SP6 single-axis redesign (2026-10-07).
 # SP1 Pos KEEP/remat · SP2 Acc/Pos transitional · SP3 fp32 + e8m0 A5 bit-reinterpret
 # (soft Pow2 LUT retired; no native e8m0 vcvt on A5) · SP4 pad · SP5 · SP6 soft LUT appendix.
-# Prefer deps-native lib; target=ascend cython NOT pto. VMI twins later.
+# Compile target follows ST_VF_MODE (default simt-asc → target=ascend, cython).
+# simt-pto / simd-pto compile target=pto. kernels_ptodsl/ is separate.
 set -euo pipefail
 OUT="${ST_SIMTVF_OUT:-/tmp/t_parallel_st_suite}"
 LOG=$OUT/oneshot_sp1_sp6.log
@@ -74,7 +75,7 @@ export TILELANG_DISABLE_CACHE=1
 export TORCH_DEVICE_BACKEND_AUTOLOAD=0
 export CPLUS_INCLUDE_PATH="/usr/include/c++/12:/usr/include/aarch64-linux-gnu/c++/12${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH}"
 export TILELANG_DISABLE_DATA_RACE_CHECK=1
-echo "PY=$PY ASCEND_HOME_PATH=$ASC TILELANG_DEPS=$DEPS CAMODEL_DEPS=$CAMO SIM_DSL=$SIM SOC=$SOC ST_VF_MODE=${ST_VF_MODE:-simt}"
+echo "PY=$PY ASCEND_HOME_PATH=$ASC TILELANG_DEPS=$DEPS CAMODEL_DEPS=$CAMO SIM_DSL=$SIM SOC=$SOC ST_VF_MODE=${ST_VF_MODE:-simt-asc}"
 
 SUMMARY="$OUT/SUMMARY_sp1_sp6_raw.txt"
 : > "$SUMMARY"

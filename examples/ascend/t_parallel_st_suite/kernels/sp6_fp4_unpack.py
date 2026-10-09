@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from common_asc_harness import boot, compile_prim, set_out  # noqa: E402
-from vf_mode import vf_region  # noqa: E402
+from vf_mode import compile_target, vf_region  # noqa: E402
 
 # Soft e2m1 LUT (nibble 0..15) — matches TileKernels unpack_from_e2m1fn_x2.
 # This is intentionally software; HW FP4 = separate future ST.
@@ -116,7 +116,7 @@ def main():
         print(f"unknown arm {arm!r}; use unpack|unpack_sf", flush=True)
         return 2
     tag = f"sp6_n{N}_h{H}_g{G}_t{threads}_{arm}"
-    so = compile_prim(build_sp6(N, H, G, threads, arm), tag, target="ascend")
+    so = compile_prim(build_sp6(N, H, G, threads, arm), tag, target=compile_target())
     print("SO", so) if so else None
     return 0 if so else 1
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Full SimtVF Parallel matrix SV1–SV9 on pto-b10 (REGRESSION-2 recipe).
-# Prefer deps-native lib; target=ascend cython NOT pto. VMI twins are separate.
+# Compile target follows ST_VF_MODE (default simt-asc → target=ascend, cython).
+# simt-pto / simd-pto compile target=pto. kernels_ptodsl/ is separate.
 set -euo pipefail
 OUT="${ST_SIMTVF_OUT:-/tmp/t_parallel_st_suite}"
 LOG=$OUT/oneshot_sv1_sv9.log
@@ -72,7 +73,7 @@ export TILELANG_DISABLE_CACHE=1
 export TORCH_DEVICE_BACKEND_AUTOLOAD=0
 export CPLUS_INCLUDE_PATH="/usr/include/c++/12:/usr/include/aarch64-linux-gnu/c++/12${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH}"
 export TILELANG_DISABLE_DATA_RACE_CHECK=1
-echo "PY=$PY ASCEND_HOME_PATH=$ASC TILELANG_DEPS=$DEPS CAMODEL_DEPS=$CAMO SIM_DSL=$SIM SOC=$SOC ST_VF_MODE=${ST_VF_MODE:-simt}"
+echo "PY=$PY ASCEND_HOME_PATH=$ASC TILELANG_DEPS=$DEPS CAMODEL_DEPS=$CAMO SIM_DSL=$SIM SOC=$SOC ST_VF_MODE=${ST_VF_MODE:-simt-asc}"
 
 SUMMARY="$OUT/SUMMARY_sv1_sv9_raw.txt"
 : > "$SUMMARY"

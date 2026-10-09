@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from common_asc_harness import NEG, INT_MAX, boot, compile_prim, set_out  # noqa: E402
-from vf_mode import vf_region  # noqa: E402
+from vf_mode import compile_target, vf_region  # noqa: E402
 
 
 def build_sv9(num_experts: int, num_topk: int, threads: int, arm: str):
@@ -159,7 +159,7 @@ def main():
         print(f"unknown arm {arm!r}; use keep|remat_scores|remat_idx", flush=True)
         return 2
     tag = f"sv9_e{E}_k{K}_t{threads}_{arm}"
-    so = compile_prim(build_sv9(E, K, threads, arm), tag, target="ascend")
+    so = compile_prim(build_sv9(E, K, threads, arm), tag, target=compile_target())
     if so is None:
         return 1
     print("SO", so)

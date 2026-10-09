@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from common_asc_harness import boot, compile_prim, set_out  # noqa: E402
-from vf_mode import vf_region  # noqa: E402
+from vf_mode import compile_target, vf_region  # noqa: E402
 
 
 def build_sp4(Eexp: int, H: int, threads: int):
@@ -65,7 +65,7 @@ def main():
     threads = int(sys.argv[3]) if len(sys.argv) > 3 else 32
     pad_pct = int(sys.argv[4]) if len(sys.argv) > 4 else 25
     tag = f"sp4_e{Eexp}_h{H}_t{threads}_pad{pad_pct}"
-    so = compile_prim(build_sp4(Eexp, H, threads), tag, target="ascend")
+    so = compile_prim(build_sp4(Eexp, H, threads), tag, target=compile_target())
     print("SO", so) if so else None
     return 0 if so else 1
 

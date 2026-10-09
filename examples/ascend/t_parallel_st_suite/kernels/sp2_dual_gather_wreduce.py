@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from common_asc_harness import boot, compile_prim, set_out  # noqa: E402
-from vf_mode import vf_region  # noqa: E402
+from vf_mode import compile_target, vf_region  # noqa: E402
 
 _SCHED = ("keep_acc", "remat_acc", "keep_pos", "remat_pos")
 
@@ -149,7 +149,7 @@ def main():
     so = compile_prim(
         build_sp2(T_, K, H, G, threads, sf_arm == "sf1", w_arm == "w1", sched),
         tag,
-        target="ascend",
+        target=compile_target(),
     )
     print("SO", so) if so else None
     return 0 if so else 1

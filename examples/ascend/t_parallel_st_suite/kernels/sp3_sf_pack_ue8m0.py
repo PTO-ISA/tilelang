@@ -45,7 +45,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from common_asc_harness import boot, compile_prim, set_out  # noqa: E402
-from vf_mode import vf_region  # noqa: E402
+from vf_mode import compile_target, vf_region  # noqa: E402
 
 # Soft Pow2 LUT path REMOVED. Do not reintroduce.
 
@@ -124,7 +124,7 @@ def main():
         print(f"unknown arm {arm!r}; use fp32|e8m0 (ue8m0 alias→e8m0)", flush=True)
         return 2
     tag = f"sp3_m{M}_h{H}_g{G}_t{threads}_{arm}"
-    so = compile_prim(build_sp3(M, H, G, threads, arm), tag, target="ascend")
+    so = compile_prim(build_sp3(M, H, G, threads, arm), tag, target=compile_target())
     print("SO", so) if so else None
     if arm == "e8m0" and not so:
         print(
