@@ -171,6 +171,20 @@ private:
   void EmitAscendBlockscaledGemmL1(const CallNode *op);
   void EmitAscendCopyMatrixCcToUb(const CallNode *op);
   void EmitAscendCopyMatrixCcToGm(const CallNode *op);
+  void EmitAscendCopyUbufToCbuf(const CallNode *op);
+  void EmitAscendNd2NzPostCopy(const CallNode *op);
+  void EmitAscendNd2NzScatter(const CallNode *op);
+  void EmitGemmRun(const PTOGemmEmitContext &ctx, const std::string &a_mat,
+                   const std::string &b_mat, const std::string &acc,
+                   const std::string &clear_accum,
+                   const std::string &unit_flag_ctrl, int64_t hf32_mode);
+  void
+  EmitBlockscaledGemmRun(const PTOGemmEmitContext &ctx,
+                         const std::string &a_mat, const std::string &b_mat,
+                         const std::string &sfa_mat, const std::string &sfb_mat,
+                         const std::string &acc, const std::string &clear_accum,
+                         const std::string &sf_k_offset,
+                         const std::string &unit_flag_ctrl);
   std::string LocalVarID(const VarNode *var);
   bool IsLocalVarBuffer(const VarNode *var) const;
   void EmitMixedEntrySnapshot(const VarNode *var);
@@ -179,10 +193,6 @@ private:
                                       const ObjectRef &value);
   void PrintPtoVmiCall_(const CallNode *op, std::ostream &os);
   bool IsVmiLocalRegisterBuffer(const BufferNode *buffer) const;
-  // Vector local.var buffers allocated before ``for_stmt`` and stored in its
-  // body. These must be emitted as PTODSL loop-carried state for ``T.serial``.
-  std::vector<const VarNode *>
-  CollectLoopCarriedLocalVars(const Stmt &body) const;
   void CheckVmiLocalRegisterIndex(const BufferNode *buffer,
                                   const PrimExpr &index) const;
   bool HasAscendGemmL1(const PrimFunc &func) const;

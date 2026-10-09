@@ -445,46 +445,6 @@ void CheckConstZero(const PrimExpr &expr, const char *name) {
       << " == 0 for tl.ascend_copy_gm_to_ubuf, got " << expr;
 }
 
-std::string PtoStoreL2CacheToken(int64_t value) {
-  switch (value) {
-  case 0:
-    return "nmfv";
-  case 1:
-    return "nmlv";
-  case 2:
-    return "nmprs";
-  case 3:
-    return "nmred";
-  case 4:
-    return "naci";
-  case 5:
-    return "napw";
-  case 6:
-    return "napi";
-  case 7:
-    return "nared";
-  case 8:
-    return "wbhfv";
-  case 9:
-    return "wbhlv";
-  case 10:
-    return "wbhprs";
-  case 11:
-    return "wbhred";
-  case 12:
-    return "wtsfv";
-  case 13:
-    return "wtslv";
-  case 14:
-    return "wtsprs";
-  case 15:
-    return "wtsred";
-  default:
-    LOG(FATAL) << "Unsupported PTO store l2 cache control value: " << value;
-    return "nmfv";
-  }
-}
-
 bool IsOpName(const ObjectRef &op, const std::string &name) {
   if (auto opt_call_op = op.as<Op>()) {
     return opt_call_op.value()->name == name;
