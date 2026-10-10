@@ -323,6 +323,39 @@ struct PtoRegionScan {
  * Verify and Vectorize. */
 PtoRegionScan ScanPtoRegion(const Stmt &region);
 
+/*!
+ * \brief Parsed and validated direct `tl.tileop.reduce` statement (stage 4A).
+ *
+ * Verify uses this for admission and diagnostics; Vectorize re-parses with
+ * the same implementation before emitting VMI, so the accepted source
+ * surface cannot drift between the two passes.
+ */
+struct PtoDirectReduce {
+  /*! Static 1-D source buffer (whole buffer). */
+  Buffer src;
+  /*! One-element destination buffer. */
+  Buffer dst;
+  /*! Logical extent E = the source buffer's static extent. */
+  int64_t extent = 0;
+  /*! "max" | "min" | "sum". */
+  std::string reduce_type;
+  /*! Always 0 in the first version. */
+  int64_t dim = 0;
+};
+
+/*! True when \p call is a `tl.tileop.reduce` call. */
+bool IsDirectReduceCall(const CallNode *call);
+
+/*!
+ * \brief Parse and validate one direct-reduce call against the stage-4A
+ * contract (static 1-D source, one-element destination, dim=0, batch absent
+ * or 1, clear=True, no nan_propagate, shared/UB buffers, max/min/sum).
+ *
+ * Returns std::nullopt and sets \p reason to the diagnostic on rejection.
+ */
+std::optional<PtoDirectReduce> ParseDirectReduceCall(const CallNode *call,
+                                                     std::string *reason);
+
 } // namespace pto
 } // namespace tl
 } // namespace tvm

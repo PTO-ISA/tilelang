@@ -3282,6 +3282,13 @@ void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
     os << key << "=";
     if (op_name == "tl.vmi.vcvt" && key == "to_dtype" && op->dtype.is_int()) {
       os << PtoSignedIntegerTypeName(op->dtype.element_of());
+    } else if (key == "reassoc") {
+      // PTODSL requires an explicit boolean for the floating-point cross-lane
+      // add (vcadd) reassociation contract; print the Python literal rather
+      // than an integer truth value.
+      const auto *imm = value.as<IntImmNode>();
+      ICHECK(imm != nullptr) << "reassoc annotation must be a boolean constant";
+      os << (imm->value != 0 ? "True" : "False");
     } else if (op_name == "tl.vmi.vload" && key == "size" &&
                op->dtype.element_of().is_float4_e2m1fn()) {
       // TileLang VMI exposes FP4 lane counts logically.  PTO represents each

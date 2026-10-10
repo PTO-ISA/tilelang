@@ -11,6 +11,7 @@
 #include <tvm/tirx/stmt_functor.h>
 
 #include "../../layout/utils.h"
+#include "../../op/utils.h"
 
 #include <functional>
 #include <set>
@@ -1446,6 +1447,169 @@ std::optional<std::string> FindUnsupportedExprNode(const PrimExpr &expr) {
   WhitelistVisitor visitor;
   visitor(expr);
   return visitor.unsupported;
+}
+
+bool IsDirectReduceCall(const CallNode *call) {
+  const auto *op = call->op.as<OpNode>();
+  return op != nullptr && op->name == "tl.tileop.reduce";
+}
+
+std::optional<PtoDirectReduce> ParseDirectReduceCall(const CallNode *call,
+                                                     std::string *reason) {
+  auto reject = [&](const std::string &why) -> std::optional<PtoDirectReduce> {
+    if (reason != nullptr) {
+      *reason = why;
+    }
+    return std::nullopt;
+  };
+  if (!IsDirectReduceCall(call)) {
+    return reject("not a tl.tileop.reduce call");
+  }
+  if (call->args.size() < 5) {
+    return reject("tl.tileop.reduce expects at least five arguments");
+  }
+
+  // Accept both a direct BufferRegion and the front end's tl.region() bridge
+  // form. NormalizeToBufferRegion round-trips through BufferLoad and throws
+  // on regions it cannot express (e.g. a non-constant extent), so a direct
+  // BufferRegion is taken as-is and the region checks below deliver the
+  // diagnostic instead.
+  auto to_region = [&](const PrimExpr &arg,
+                       BufferRegion *out) -> std::optional<std::string> {
+    if (const auto *region = arg.as<BufferRegionNode>()) {
+      *out = GetRef<BufferRegion>(region);
+      return std::nullopt;
+    }
+    try {
+      *out = NormalizeToBufferRegion(arg);
+    } catch (const std::exception &err) {
+      return std::string("the reduce region cannot be normalized: ") +
+             err.what();
+    }
+    return std::nullopt;
+  };
+  BufferRegion src_region;
+  BufferRegion dst_region;
+  if (auto err = to_region(call->args[0], &src_region)) {
+    return reject(err.value());
+  }
+  if (auto err = to_region(call->args[1], &dst_region)) {
+    return reject(err.value());
+  }
+  const auto *type_imm = call->args[2].as<StringImmNode>();
+  const auto *dim_imm = call->args[3].as<IntImmNode>();
+  if (type_imm == nullptr || dim_imm == nullptr) {
+    return reject("tl.tileop.reduce expects constant reduce type and dim");
+  }
+  const std::string reduce_type = type_imm->value;
+  if (reduce_type != "max" && reduce_type != "min" && reduce_type != "sum") {
+    return reject(
+        "direct reduce supports max/min/sum in the first version, got `" +
+        reduce_type + "`");
+  }
+  if (dim_imm->value != 0) {
+    return reject("direct reduce only supports dim=0 in the first version, "
+                  "got dim=" +
+                  std::to_string(dim_imm->value));
+  }
+
+  // batch / nan_propagate ride as call annotations (see the tl.reduce front
+  // end).
+  if (call->annotations.count("batch")) {
+    const auto *batch = call->annotations.Get("batch").value().as<IntImmNode>();
+    if (batch == nullptr || batch->value != 1) {
+      return reject("direct reduce only supports batch=1 in the first version");
+    }
+  }
+  if (call->annotations.count("nan_propagate")) {
+    bool propagate = false;
+    const ObjectRef &value = call->annotations.Get("nan_propagate").value();
+    if (const auto *b = value.as<IntImmNode>()) {
+      propagate = b->value != 0;
+    }
+    if (propagate) {
+      return reject("nan_propagate=True is not supported by direct reduce in "
+                    "the first version");
+    }
+  }
+
+  // `clear` is a Bool (an IntImm with the bool dtype) argument.
+  const auto *clear = call->args[4].as<IntImmNode>();
+  if (clear == nullptr || clear->dtype != DataType::Bool() ||
+      clear->value == 0) {
+    return reject("direct reduce requires clear=True in the first version "
+                  "(clear=False needs seed/accumulation semantics)");
+  }
+
+  // Source: static 1-D buffer, reduced as a whole.
+  if (src_region->region.size() != 1) {
+    return reject(
+        "direct reduce source must be a 1-D buffer in the first version");
+  }
+  const Range &src_range = src_region->region[0];
+  if (!is_zero(src_range->min)) {
+    return reject("direct reduce source region must start at 0");
+  }
+  const auto *src_extent = src_range->extent.as<IntImmNode>();
+  const auto *src_shape = src_region->buffer->shape[0].as<IntImmNode>();
+  if (src_extent == nullptr || src_shape == nullptr) {
+    return reject("direct reduce source must be a static buffer: the region "
+                  "extent and buffer shape must be compile-time constants");
+  }
+  if (src_extent->value != src_shape->value) {
+    return reject("direct reduce reads its whole static source buffer in the "
+                  "first version");
+  }
+  if (src_extent->value <= 0) {
+    return reject("direct reduce source extent must be positive");
+  }
+  if (!IsSharedBuffer(src_region->buffer)) {
+    return reject("direct reduce source must be a shared/UB buffer in the "
+                  "first version");
+  }
+  if (!IsSupportedElementDType(src_region->buffer->dtype)) {
+    std::ostringstream oss;
+    oss << "direct reduce source element dtype "
+        << src_region->buffer->dtype
+        << " is not supported by the first-version unified element "
+           "addressing";
+    return reject(oss.str());
+  }
+
+  // Destination: static one-element buffer of the source element type.
+  if (dst_region->region.size() != 1) {
+    return reject("direct reduce destination must be a 1-D one-element buffer");
+  }
+  const Range &dst_range = dst_region->region[0];
+  if (!is_zero(dst_range->min)) {
+    return reject("direct reduce destination region must start at 0");
+  }
+  const auto *dst_extent = dst_range->extent.as<IntImmNode>();
+  if (dst_extent == nullptr) {
+    return reject("direct reduce destination must be static (compile-time "
+                  "extent)");
+  }
+  if (dst_extent->value != 1) {
+    return reject("direct reduce destination must hold exactly one element, "
+                  "got extent " +
+                  std::to_string(dst_extent->value));
+  }
+  if (!IsSharedBuffer(dst_region->buffer)) {
+    return reject("direct reduce destination must be a shared/UB buffer in "
+                  "the first version");
+  }
+  if (dst_region->buffer->dtype != src_region->buffer->dtype) {
+    return reject(
+        "direct reduce source and destination must share the element dtype");
+  }
+
+  PtoDirectReduce parsed;
+  parsed.src = src_region->buffer;
+  parsed.dst = dst_region->buffer;
+  parsed.extent = src_extent->value;
+  parsed.reduce_type = reduce_type;
+  parsed.dim = 0;
+  return std::optional<PtoDirectReduce>(parsed);
 }
 
 } // namespace pto

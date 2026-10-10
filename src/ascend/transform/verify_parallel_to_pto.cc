@@ -168,11 +168,23 @@ private:
               "hand-written tl.vmi.* calls cannot be mixed with T.Parallel "
               "inside a converting SIMD_VF block");
         }
-        if (name == "tl.tileop.reduce") {
-          parent_->Fail("expression", "cross-lane reduce is not supported");
+        if (pto_analysis::IsDirectReduceCall(op)) {
+          CheckDirectReducePlacement(op);
         }
       }
       StmtExprVisitor::VisitExpr_(op);
+    }
+    void VisitStmt_(const IfThenElseNode *op) final {
+      bool saved = in_control_flow_;
+      in_control_flow_ = true;
+      StmtExprVisitor::VisitStmt_(op);
+      in_control_flow_ = saved;
+    }
+    void VisitStmt_(const WhileNode *op) final {
+      bool saved = in_control_flow_;
+      in_control_flow_ = true;
+      StmtExprVisitor::VisitStmt_(op);
+      in_control_flow_ = saved;
     }
     void VisitStmt_(const AttrStmtNode *op) final {
       if (op->attr_key == tirx::attr::thread_extent) {
@@ -236,10 +248,64 @@ private:
         oss << ")";
         parent_->Fail("region", oss.str());
       }
+      // Direct-reduce placement: admissible at the level of the whole
+      // T.Parallel region (serial wrappers allowed), never inside the unit
+      // or under control flow / re-vectorization.
+      const bool saved_parallel = in_parallel_;
+      const bool saved_other = in_other_wrapper_;
+      if (op->kind == ForKind::kParallel) {
+        in_parallel_ = true;
+      } else if (op->kind == ForKind::kVectorized) {
+        in_other_wrapper_ = true;
+      }
       StmtExprVisitor::VisitStmt_(op);
+      in_parallel_ = saved_parallel;
+      in_other_wrapper_ = saved_other;
     }
 
   private:
+    // ------------------------------------------------------------------
+    // Direct tl.tileop.reduce (stage 4A): placement + contract admission.
+    // ------------------------------------------------------------------
+    void CheckDirectReducePlacement(const CallNode *call) {
+      if (in_parallel_) {
+        parent_->Fail(
+            "placement",
+            "a direct tl.tileop.reduce inside a T.Parallel unit is not "
+            "supported: the reduce must sit outside the unit, at the level of "
+            "the whole T.Parallel region");
+      }
+      if (in_control_flow_) {
+        parent_->Fail(
+            "placement",
+            "a direct tl.tileop.reduce under a conditional branch or a while "
+            "loop is not supported in the first version: the reduce must sit "
+            "at the level of the T.Parallel region (a serial loop around both "
+            "is allowed)");
+      }
+      if (in_other_wrapper_) {
+        parent_->Fail("placement",
+                      "a direct tl.tileop.reduce under a vectorized loop is "
+                      "not supported in the first version");
+      }
+      std::string reason;
+      auto parsed = pto_analysis::ParseDirectReduceCall(call, &reason);
+      if (!parsed.has_value()) {
+        parent_->Fail("direct reduce", reason);
+      }
+      // BufferRegion arguments bypass CheckScope; run the same volatile and
+      // dtype admission on both reduce buffers here.
+      for (const Buffer &buffer : {parsed->src, parsed->dst}) {
+        if (parent_->volatile_allocs_.count(buffer->data.get()) != 0) {
+          std::ostringstream oss;
+          oss << "buffer `" << buffer->name
+              << "` is allocated with the tirx.volatile annotation; volatile "
+                 "accesses are not supported in the first version";
+          parent_->Fail("memory access", oss.str());
+        }
+      }
+    }
+
     void CheckScope(const Buffer &buffer) {
       // Volatile accesses are outside the first-version contract
       // (an unused volatile read must not be DCE-deleted, and a live
@@ -279,6 +345,10 @@ private:
       }
     }
     VerifyParallelToPTOImpl *parent_;
+    /*! Lexical placement of the current node (direct-reduce admission). */
+    bool in_parallel_ = false;
+    bool in_control_flow_ = false;
+    bool in_other_wrapper_ = false;
   };
 
   // ------------------------------------------------------------------
@@ -1029,7 +1099,26 @@ private:
     pto_analysis::PtoRegionScan scan = pto_analysis::ScanPtoRegion(region);
     if (!scan.has_any_parallel) {
       // Pure hand-written VMI region (possibly with control flow): skipped
-      // entirely; no lanes annotation required.
+      // entirely; no lanes annotation required — except for a direct
+      // tl.tileop.reduce, which needs the converting T.Parallel unit of the
+      // stage-4A contract.
+      const CallNode *lone_reduce = nullptr;
+      PostOrderVisit(region, [&](const ObjectRef &node) {
+        if (lone_reduce != nullptr) {
+          return;
+        }
+        if (const auto *call = node.as<CallNode>()) {
+          if (pto_analysis::IsDirectReduceCall(call)) {
+            lone_reduce = call;
+          }
+        }
+      });
+      if (lone_reduce != nullptr) {
+        Fail("placement",
+             "a lone direct tl.tileop.reduce needs a converting T.Parallel "
+             "unit in the same SIMD_VF region (stage-4A contract); this "
+             "region has none");
+      }
       defs_ = std::move(saved);
       return;
     }

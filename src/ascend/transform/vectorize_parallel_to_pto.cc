@@ -235,6 +235,22 @@ private:
   // ------------------------------------------------------------------
   // SIMD_VF block entry
   // ------------------------------------------------------------------
+  // Read the region's lane count from the SIMD_VF annotation written by
+  // T.SimdVF(lanes=...). This is the region-level source of truth for the
+  // direct-reduce lowering (Verify validates the same annotation for
+  // converting regions; this re-read is defensive).
+  static int64_t ReadRegionLanes(const SBlockNode *block) {
+    auto anno = block->annotations.Get("tl.simdvf_lanes");
+    ICHECK(anno.has_value())
+        << "[VectorizeParallelToPTO] internal error: converting SIMD_VF "
+           "without the tl.simdvf_lanes annotation passed Verify";
+    auto imm = anno.value().try_cast<IntImm>();
+    ICHECK(imm.has_value())
+        << "[VectorizeParallelToPTO] internal error: tl.simdvf_lanes must be "
+           "an Int64 constant";
+    return imm.value()->value;
+  }
+
   Stmt VisitStmt_(const SBlockNode *op) final {
     if (op->name_hint != "SIMD_VF") {
       return StmtExprMutator::VisitStmt_(op);
@@ -268,9 +284,19 @@ private:
       for (const For &unit : scan.units) {
         mappings.push_back(pto_analysis::InvertPtoLaneLayout(unit));
       }
-      // Lanes come from the first unit's layout; all units in one VF
-      // share the same L (Verify enforces the annotation consistency).
-      int64_t lanes = mappings[0].lanes;
+      // Region lanes come from the SIMD_VF's own annotation, never from a
+      // converted unit: a direct reduce may appear before the first
+      // T.Parallel unit, so LowerDirectReduce must not depend on per-unit
+      // conversion state. Every unit's inverse mapping must agree with the
+      // annotation (Verify enforces the same consistency).
+      region_lanes_ = ReadRegionLanes(op);
+      for (const pto_analysis::PtoInverseMapping &mapping : mappings) {
+        ICHECK(mapping.lanes == region_lanes_)
+            << "[VectorizeParallelToPTO] internal error: unit lane count "
+            << mapping.lanes << " disagrees with the SIMD_VF annotation "
+            << region_lanes_;
+      }
+      const int64_t lanes = region_lanes_;
       // A full mask binding per VF, shared by the divisible units. A
       // region whose units all have non-divisible extents never uses it
       // (every unit builds its own per-chunk dynamic mask), so the
@@ -294,14 +320,22 @@ private:
             SeqStmt::Flatten(Bind(shared_mask_, mask_value), new_region);
       }
 
-      // Convert each sequential unit in order; unit state (bind
-      // maps, counters) is reset per unit; the shared full mask, when
-      // emitted, is visible to every unit.
-      for (size_t i = 0; i < scan.units.size(); ++i) {
-        Stmt converted = ConvertUnit(scan.units[i], mappings[i]);
-        new_region = ReplaceStmt(new_region, scan.units[i], converted);
-      }
-      new_body = new_region;
+      // Convert the units and lower the direct reduces in one program-order
+      // walk. Unit state (bind maps, counters) is reset per unit; the shared
+      // full mask, when emitted, is visible to every unit.
+      size_t next_unit = 0;
+      new_body = WalkRegion(new_region, scan.units, mappings, &next_unit);
+      ICHECK(next_unit == scan.units.size())
+          << "[VectorizeParallelToPTO] internal error: ordered walk and unit "
+             "scan disagree on the unit count";
+      // Every direct reduce must have been consumed by the walk.
+      PostOrderVisit(new_body, [&](const ObjectRef &node) {
+        if (const auto *call = node.as<CallNode>()) {
+          ICHECK(!pto_analysis::IsDirectReduceCall(call))
+              << "[VectorizeParallelToPTO] internal error: tl.tileop.reduce "
+                 "survived the region walk";
+        }
+      });
     }
 
     // new_body is (mask bind + region with all units converted); the
@@ -311,63 +345,198 @@ private:
                   op->annotations);
   }
 
-  // Replace one statement (the unit's For) with its conversion, recursing
-  // through the same wrapper kinds DiscoverUnits understands.
-  Stmt ReplaceStmt(const Stmt &body, const For &target,
-                   const Stmt &replacement) {
-    if (const auto *for_node = body.as<ForNode>()) {
-      if (for_node == target.get()) {
-        return replacement;
+  // ------------------------------------------------------------------
+  // Program-order walk: converts the units and lowers the direct reduces
+  // (stage 4A) in one pass. The walk recurses through the same wrapper kinds
+  // DiscoverUnits accepts; the units themselves appear in scan order.
+  // ------------------------------------------------------------------
+  Stmt WalkRegion(const Stmt &stmt, const std::vector<For> &units,
+                  const std::vector<pto_analysis::PtoInverseMapping> &mappings,
+                  size_t *next_unit) {
+    if (const auto *for_node = stmt.as<ForNode>()) {
+      if (*next_unit < units.size() &&
+          units[*next_unit].get() == for_node) {
+        // The next unit in program order: convert it in place; the
+        // converted chunk loop contains no units or reduces.
+        size_t index = (*next_unit)++;
+        return ConvertUnit(units[index], mappings[index]);
       }
-      Stmt nb = ReplaceStmt(for_node->body, target, replacement);
-      if (nb.same_as(for_node->body)) {
-        return body;
+      Stmt body = WalkRegion(for_node->body, units, mappings, next_unit);
+      if (body.same_as(for_node->body)) {
+        return stmt;
       }
       For nf = GetRef<For>(for_node);
-      nf.CopyOnWrite()->body = nb;
+      nf.CopyOnWrite()->body = body;
       return nf;
     }
-    if (const auto *seq = body.as<SeqStmtNode>()) {
+    if (const auto *seq = stmt.as<SeqStmtNode>()) {
       Array<Stmt> new_seq;
       bool changed = false;
       for (const auto &s : seq->seq) {
-        Stmt ns = ReplaceStmt(s, target, replacement);
+        Stmt ns = WalkRegion(s, units, mappings, next_unit);
         changed |= !ns.same_as(s);
         new_seq.push_back(ns);
       }
-      return changed ? SeqStmt::Flatten(new_seq) : body;
+      return changed ? SeqStmt::Flatten(new_seq) : stmt;
     }
-    if (const auto *attr = body.as<AttrStmtNode>()) {
-      Stmt nb = ReplaceStmt(attr->body, target, replacement);
-      if (nb.same_as(attr->body)) {
-        return body;
+    if (const auto *attr = stmt.as<AttrStmtNode>()) {
+      Stmt body = WalkRegion(attr->body, units, mappings, next_unit);
+      if (body.same_as(attr->body)) {
+        return stmt;
       }
-      return AttrStmt(attr->node, attr->attr_key, attr->value, nb);
+      return AttrStmt(attr->node, attr->attr_key, attr->value, body);
     }
-    if (const auto *block = body.as<SBlockNode>()) {
-      Stmt nb = ReplaceStmt(block->body, target, replacement);
-      if (nb.same_as(block->body)) {
-        return body;
+    if (const auto *block = stmt.as<SBlockNode>()) {
+      Stmt body = WalkRegion(block->body, units, mappings, next_unit);
+      if (body.same_as(block->body)) {
+        return stmt;
       }
       return SBlock(block->iter_vars, block->reads, block->writes,
-                    block->name_hint, nb, block->init, block->alloc_buffers,
+                    block->name_hint, body, block->init, block->alloc_buffers,
                     block->match_buffers, block->annotations);
     }
-    if (const auto *realize = body.as<SBlockRealizeNode>()) {
-      // nb is the replaced *body* of the block (a SeqStmt/For/etc.), not an
-      // SBlock: rebuild the block with the new body first.
+    if (const auto *realize = stmt.as<SBlockRealizeNode>()) {
       SBlock block = realize->block;
-      Stmt nb = ReplaceStmt(block->body, target, replacement);
-      if (nb.same_as(block->body)) {
-        return body;
+      Stmt body = WalkRegion(block->body, units, mappings, next_unit);
+      if (body.same_as(block->body)) {
+        return stmt;
       }
       SBlock new_block =
           SBlock(block->iter_vars, block->reads, block->writes,
-                 block->name_hint, nb, block->init, block->alloc_buffers,
+                 block->name_hint, body, block->init, block->alloc_buffers,
                  block->match_buffers, block->annotations);
       return SBlockRealize(realize->iter_values, realize->predicate, new_block);
     }
-    return body;
+    if (const auto *eval = stmt.as<EvaluateNode>()) {
+      if (const auto *call = eval->value.as<CallNode>()) {
+        if (pto_analysis::IsDirectReduceCall(call)) {
+          return LowerDirectReduce(call);
+        }
+      }
+      return stmt;
+    }
+    return stmt;
+  }
+
+  // ------------------------------------------------------------------
+  // Direct tl.tileop.reduce lowering (stage 4A)
+  // ------------------------------------------------------------------
+  // Lower one direct reduce into VMI. Reuses the PR262 lowering shape:
+  // ceil-chunk full-width vload, masked fold with keep-prior vsel (the
+  // masked fold zeroes inactive lanes, so vsel restores the earlier
+  // accumulator), one cross-lane vcmax/vcmin/vcadd(reassoc=True), and a
+  // create_mask(1, size=VL) predicated store of the result into dst[0].
+  // sum uses vadd/vcadd with an explicit reassoc annotation.
+  //
+  // Reads of dst[0] elsewhere in the region stay ordinary BufferLoads: the
+  // same-address store->load ordering is the toolchain's job (the PTOAS
+  // vecscope mem_bar pass inserts the VST_VLD barrier), not something this
+  // pass rewrites.
+  Stmt LowerDirectReduce(const CallNode *call) {
+    std::string reason;
+    auto parsed_opt = pto_analysis::ParseDirectReduceCall(call, &reason);
+    ICHECK(parsed_opt.has_value())
+        << "[VectorizeParallelToPTO] internal error: direct reduce passed "
+           "Verify but failed re-parsing: "
+        << reason;
+    const pto_analysis::PtoDirectReduce &parsed = parsed_opt.value();
+
+    const int64_t lanes = region_lanes_;
+    const int64_t domain = parsed.extent;
+    const int64_t nchunks = (domain + lanes - 1) / lanes;
+    ICHECK(lanes > 0) << "[VectorizeParallelToPTO] internal error: direct "
+                         "reduce without a lane count";
+    const DataType dt = parsed.src->dtype;
+    const DataType vty = VectorDType(dt, lanes);
+    const bool is_sum = parsed.reduce_type == "sum";
+    const bool is_max = parsed.reduce_type == "max";
+    const std::string fold = is_sum ? "vadd" : (is_max ? "vmax" : "vmin");
+    const std::string cfold = is_sum ? "vcadd" : (is_max ? "vcmax" : "vcmin");
+
+    Array<Stmt> stmts;
+    Map<String, ObjectRef> size_attrs;
+    size_attrs.Set("size", IntImm(DataType::Int(32), static_cast<int>(lanes)));
+    auto emit_bind = [&](const std::string &name, PrimExpr value) -> Var {
+      Var v(name + "_" + std::to_string(tmp_counter_++), value.dtype());
+      stmts.push_back(Bind(v, value));
+      return v;
+    };
+    // create_mask(n) for n <= lanes (n clamps to the full mask).
+    auto make_mask = [&](int64_t active) -> Var {
+      int64_t n = active;
+      if (n > lanes) n = lanes;
+      if (n < 0) n = 0;
+      return emit_bind(
+          "mask",
+          Call(DataType::Bool(static_cast<int>(lanes)), VmiOp("create_mask"),
+               {IntImm(DataType::Int(32), static_cast<int>(n))}, size_attrs));
+    };
+    auto chunk_active = [&](int64_t chunk) -> int64_t {
+      int64_t begin = chunk * lanes;
+      if (begin >= domain) {
+        return 0;
+      }
+      int64_t n = domain - begin;
+      return n > lanes ? lanes : n;
+    };
+
+    // Full-width source base pointer (extent L, read).
+    PrimExpr src_ptr =
+        Call(DataType::Handle(), tl::access_ptr(),
+             {BufferLoad(parsed.src, {make_zero(DataType::Int(32))}),
+              IntImm(DataType::Int(32), static_cast<int>(lanes)),
+              IntImm(DataType::Int(32), 1)});
+    auto vload_chunk = [&](int64_t chunk) -> Var {
+      return emit_bind("vld_red",
+                       Call(vty, VmiOp("vload"),
+                            {src_ptr,
+                             IntImm(DataType::Int(32),
+                                    static_cast<int>(chunk * lanes))},
+                            size_attrs));
+    };
+
+    // Chunk 0: full when E >= L, otherwise the partial domain mask feeds the
+    // final cross-lane op so pad lanes never participate.
+    Var mask0 = make_mask(chunk_active(0));
+    Var acc = vload_chunk(0);
+    for (int64_t chunk = 1; chunk < nchunks; ++chunk) {
+      Var loaded = vload_chunk(chunk);
+      Var chunk_mask = make_mask(chunk_active(chunk));
+      // Elementwise fold with the chunk mask (no attributes; the mask is
+      // the third operand, same ABI as PR262's fold).
+      Var folded =
+          emit_bind(fold, Call(vty, VmiOp(fold), {acc, loaded, chunk_mask}));
+      // The masked fold zeroes inactive lanes; vsel keeps the earlier
+      // accumulator there (identical to PR262's merge emulation, which
+      // ptoas rejects as an explicit merge pmode).
+      acc = emit_bind("vsel", Call(vty, VmiOp("vsel"), {chunk_mask, folded, acc}));
+    }
+
+    Map<String, ObjectRef> cross_attrs;
+    if (is_sum) {
+      cross_attrs.Set("reassoc", IntImm(DataType::Bool(), 1));
+    }
+    Var reduced = emit_bind(
+        cfold, Call(dt, VmiOp(cfold), {acc, mask0}, cross_attrs));
+
+    // Destination: predicated lane0 store. The broadcast turns the 1-lane
+    // result into a full vector; create_mask(1, size=VL) selects lane 0.
+    Var broadcast = emit_bind(
+        "vbrc_red",
+        Call(vty, VmiOp("vbrc"), {reduced}, size_attrs));
+    Var lane0_mask = emit_bind(
+        "mask",
+        Call(DataType::Bool(static_cast<int>(lanes)), VmiOp("create_mask"),
+             {IntImm(DataType::Int(32), 1)}, size_attrs));
+    PrimExpr dst_ptr =
+        Call(DataType::Handle(), tl::access_ptr(),
+             {BufferLoad(parsed.dst, {make_zero(DataType::Int(32))}),
+              IntImm(DataType::Int(32), 1), IntImm(DataType::Int(32), 2)});
+    stmts.push_back(Evaluate(Call(DataType::Void(), VmiOp("vstore"),
+                                  {broadcast, dst_ptr,
+                                   IntImm(DataType::Int(32), 0), lane0_mask})));
+
+    return SeqStmt::Flatten(stmts);
   }
 
   // ------------------------------------------------------------------
@@ -1036,6 +1205,11 @@ private:
 
   arith::Analyzer analyzer_;
   Var shared_mask_; // one full mask per VF, shared by all units
+  /*! Lane count of the converting SIMD_VF region, read from the
+   * tl.simdvf_lanes annotation at region entry. The direct-reduce lowering
+   * uses this region-level value only: it must stay valid for a reduce that
+   * appears before the first converted unit. */
+  int64_t region_lanes_ = 0;
 
   // Per-unit state.
   Var loop_var_;
