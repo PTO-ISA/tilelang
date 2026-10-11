@@ -148,6 +148,38 @@ def _binds(mod):
     return binds
 
 
+def _rewrite_reduce_eval(mod, mode):
+    """Return a copy of *mod* with the direct-reduce ``Evaluate(Call)``
+    rewritten into a non-standalone shape:
+
+    ``mode="bind"``   -> ``Bind(var, Call(tl.tileop.reduce, ...))``
+    ``mode="nested"`` -> ``Evaluate(call_extern(..., Call(tl.tileop.reduce)))``
+
+    Used to prove that Verify rejects reduce calls that are bound or embedded
+    instead of standing alone as an ``Evaluate`` statement.
+    """
+
+    def mutate(node):
+        if isinstance(node, tvm.tirx.Evaluate) and isinstance(node.value, tvm.tirx.Call):
+            if getattr(node.value.op, "name", None) == "tl.tileop.reduce":
+                if mode == "bind":
+                    var = tvm.tirx.Var("red_bind", node.value.dtype)
+                    return tvm.tirx.Bind(var, node.value)
+                if mode == "nested":
+                    wrapped = tvm.tirx.call_extern("handle", "tl_nested_reduce_probe", node.value)
+                    return tvm.tirx.Evaluate(wrapped)
+        return None
+
+    key, func = next(iter(mod.functions.items()))
+    new_body = tvm.tirx.stmt_functor.ir_transform(func.body, None, mutate, ["tirx.Evaluate"])
+    return tvm.IRModule({key: func.with_body(new_body)})
+
+
+def _run_verify(mod):
+    """Run VerifyParallelToPTO directly (no later pass can be the thrower)."""
+    return ascend_transform.VerifyParallelToPTO()(mod)
+
+
 def _scalar_load_binds(mod, buffer_name):
     """Binds whose value is a plain lane-uniform BufferLoad of *buffer_name*
     (the ordinary scalar-load path: no producer-value substitution)."""
@@ -612,6 +644,46 @@ def test_lone_reduce_without_parallel_is_rejected():
     assert error is not None, "a lone reduce without T.Parallel must be rejected"
     message = str(error)
     assert "T.Parallel" in message, f"expected the placement diagnostic naming T.Parallel, got: {message}"
+
+
+@pytest.mark.pto
+def test_bound_reduce_call_is_rejected_by_verify():
+    """A direct reduce bound to a variable (``Bind(handle, Call)``) is not a
+    standalone statement. Vectorize only lowers ``Evaluate(Call)``, so Verify
+    must reject the bound form with a clear diagnostic instead of letting it
+    reach the region walk."""
+
+    E, lanes = 256, 128
+    stages, _ = _lower_capture(_k_reduce(E, lanes, "max"))
+    mutated = _rewrite_reduce_eval(stages["legalize"], "bind")
+
+    with pytest.raises(Exception) as excinfo:  # noqa: PT011 - FFI surfaces a generic error type
+        _run_verify(mutated)
+    message = str(excinfo.value)
+    assert "[VerifyParallelToPTO]" in message, f"expected a Verify diagnostic, got: {message}"
+    assert "Evaluate" in message and "standalone" in message, (
+        f"the diagnostic must require a standalone Evaluate(Call): {message}"
+    )
+
+
+@pytest.mark.pto
+def test_nested_reduce_call_is_rejected_by_verify():
+    """A direct reduce embedded in another expression
+    (``Evaluate(call_extern(..., Call))``) is rejected as well: the rule is
+    "the reduce call is the direct value of its Evaluate", not merely "some
+    Evaluate contains a reduce call"."""
+
+    E, lanes = 256, 128
+    stages, _ = _lower_capture(_k_reduce(E, lanes, "max"))
+    mutated = _rewrite_reduce_eval(stages["legalize"], "nested")
+
+    with pytest.raises(Exception) as excinfo:  # noqa: PT011 - FFI surfaces a generic error type
+        _run_verify(mutated)
+    message = str(excinfo.value)
+    assert "[VerifyParallelToPTO]" in message, f"expected a Verify diagnostic, got: {message}"
+    assert "standalone" in message or "embedded" in message, (
+        f"the diagnostic must reject embedded reduce calls: {message}"
+    )
 
 
 @pytest.mark.pto

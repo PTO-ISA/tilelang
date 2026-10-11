@@ -10,7 +10,10 @@
  * lanes validity, loop structure/ranges, lane fragment presence and
  * invertibility, per-access patterns (continuous / lane-uniform), the
  * value-expression whitelist, element dtype constraints and region-level
- * rules (no GM access, no mixed hand-written VMI, no threadIdx binding).
+ * rules (no GM access, no mixed hand-written VMI, no threadIdx binding; a
+ * direct tl.tileop.reduce must stand alone as an Evaluate(Call) statement —
+ * binding it to a variable or embedding it in another expression is
+ * rejected here because the vectorizer only lowers that statement form).
  * References are checked against a lexical definition environment:
  * params and buffer data pointers at entry; outer loop vars,
  * thread_extent bindings, flat binds and buffer allocations registered
@@ -169,10 +172,34 @@ private:
               "inside a converting SIMD_VF block");
         }
         if (pto_analysis::IsDirectReduceCall(op)) {
+          if (op != direct_reduce_value_) {
+            parent_->Fail(
+                "direct reduce",
+                "a direct tl.tileop.reduce must be a standalone Evaluate(Call) "
+                "statement; binding it to a variable or embedding it in "
+                "another expression is not supported in the first version");
+          }
           CheckDirectReducePlacement(op);
         }
       }
+      // Only the outermost expression of an Evaluate statement can be the
+      // direct reduce value; a call nested inside another call's arguments
+      // (or inside any other expression node) is not.
+      const CallNode *saved = direct_reduce_value_;
+      direct_reduce_value_ = nullptr;
       StmtExprVisitor::VisitExpr_(op);
+      direct_reduce_value_ = saved;
+    }
+    void VisitStmt_(const EvaluateNode *op) final {
+      const CallNode *saved = direct_reduce_value_;
+      direct_reduce_value_ = nullptr;
+      if (const auto *call = op->value.as<CallNode>()) {
+        if (pto_analysis::IsDirectReduceCall(call)) {
+          direct_reduce_value_ = call;
+        }
+      }
+      StmtExprVisitor::VisitStmt_(op);
+      direct_reduce_value_ = saved;
     }
     void VisitStmt_(const IfThenElseNode *op) final {
       bool saved = in_control_flow_;
@@ -349,6 +376,11 @@ private:
     bool in_parallel_ = false;
     bool in_control_flow_ = false;
     bool in_other_wrapper_ = false;
+    /*! The direct-reduce call currently serving as the outermost expression
+     * of its Evaluate statement, or nullptr anywhere else. A reduce call in
+     * any other expression position (bound to a variable, embedded in
+     * another call) is rejected. */
+    const CallNode *direct_reduce_value_ = nullptr;
   };
 
   // ------------------------------------------------------------------
