@@ -6,7 +6,25 @@
 
 ### Honesty note (this PTO-ISA tip)
 
-Most figures below are **not re-validated** on PTO-ISA/`pto-dev` tip opsim (Simt oneshots still blocked by missing CANN MicroAPI symbols). **Exception:** SP4d/SP5d SIMD VF harvested live on this tip (`fa8ffeeb`, Ascend950PR_9599, 2026-10-08 HK).
+Wenbo tip `3828bbcf` tables below remain the historical Simt vs hand-written `kernels_ptodsl/` baseline. SP4d/SP5d SIMD VF were harvested live on this tip (`fa8ffeeb`, Ascend950PR_9599, 2026-10-08 HK). Live four-way `ST_VF_MODE` regress stamps are in the next section.
+
+### Live regress (this tip, 2026-10-10 HKT)
+
+| Component | Exact stamp |
+|-----------|-------------|
+| **CANN** | `cann_92b2` / `/mnt/fluxdata/Ascend/cann_92b2/cann-9.2.0-beta.2` (**9.2.0-beta.2**) |
+| **TileLang tip** | `31483438` (`314834389d0e0472629702827ddf4d0b1aa5f740`, `feat/st-simtvf-parallel-sv1-sv9`) |
+| **PTOAS** | nightly **0.67** (`.camodel_deps_nightly067`) for simt-pto/simd-pto |
+| **SOC** | Ascend950PR_9599 |
+
+| Mode | Result | Notes |
+|------|-------:|-------|
+| **simt-asc** | **56/61 PASS** | OUT `st_out_cann92b2_20261010_104824`. VF vs Wenbo: `WENBO_VS_CANN92B2_SIMT_ASC_VF_20261010.md` |
+| **simt-pto** | **33/61 PASS** | OUT `st_out_nightly067_simt_pto_20261010_170837`. VF vs baselines: `NIGHTLY067_SIMT_PTO_VS_BASELINES_20261010.md` |
+| **simd-pto** | **0/61 PASS** | `local` from `alloc_fragment`; keep RF — codegen fix. OUT `st_out_simd_pto_20261010_163238` |
+| **simd-asc** | TBD | Pending |
+
+Artifacts under `/mnt/fluxdata/happybot/` on pto-b10. ST kernels keep **`T.alloc_fragment`**.
 
 ---
 

@@ -11,6 +11,17 @@ Primary metric: **total VF cycles** (sum of vector-pipe / VF launch cycles on `c
 | [`docs/st-deck-v2.pptx`](docs/st-deck-v2.pptx) | Slide deck |
 | [`SUMMARY.md`](SUMMARY.md) | Sensitivity axes + VF results |
 
+### Tested versions (live regress, 2026-10-10 HKT)
+
+| Component | Exact stamp used |
+|-----------|------------------|
+| **CANN** | `cann_92b2` → `/mnt/fluxdata/Ascend/cann_92b2/cann-9.2.0-beta.2` (Ascend-cann-toolkit **9.2.0-beta.2**) |
+| **TileLang tip** | `314834389d0e0472629702827ddf4d0b1aa5f740` (`feat/st-simtvf-parallel-sv1-sv9`, short `31483438`) |
+| **PTOAS** | **[PTOAS nightly](https://github.com/hw-native-sys/PTOAS/releases/tag/nightly) `ptoas` 0.67** in `.camodel_deps_nightly067` (for `simt-pto` / `simd-pto`; **not** CANN-bundled PTOAS; **not** ptoas-vmi 0.1.8) |
+| **SOC** | Ascend950PR_9599 |
+
+Live `ST_VF_MODE` rollup on that stack: **simt-asc 56/61**, **simt-pto 33/61**, **simd-pto 0/61**. ST kernels keep **`T.alloc_fragment` (RF/`local`)** — do not rewrite to shared-only; simd-pto needs TileLang SimdVF→PTO codegen. Details + OUT paths: PR [#2](https://github.com/PTO-ISA/tilelang/pull/2) and [`SUMMARY.md`](SUMMARY.md).
+
 ## Case list (21 Simt + 21 SIMD = 42/42)
 
 ### SV1–SV9 — vector / RF
@@ -152,6 +163,9 @@ Cells are `PASS`, `FAIL compile`, `FAIL opsim`, `FAIL no-pass-line`, or `MISSING
 Harness / opsim helpers: `common_asc_harness.py`, `vf_mode.py`, `common_pto_harness.py`, `run_opsim_generic.py`, `run_opsim_topk.py` (SV9).
 Harvest: `harvest_report.py`, `harvest_pass_table.sh`, `harvest_simt_vmi_compare.py`.
 
-### Known blocker on this tip
+### Known blockers / live status on this tip
 
-PTO-ISA `pto-dev` tip may emit CANN MicroAPI DMA symbols (`asc_copy_gm2ub_align`, L2 cache mode, pack helpers) missing from `cann_91b3` / `cann_92b1` on pto-b10. Live opsim can fail until a matching toolkit is available. VF numbers in [`SUMMARY.md`](SUMMARY.md) are from Wenbo tip `3828bbcf` / prior opsim (2026-10-07–08), not re-validated on this tip.
+- **cann_91b3 / cann_92b1:** MicroAPI DMA symbols can be missing — use **cann_92b2** / **9.2.0-beta.2** for `simt-asc` (live **56/61 PASS**).
+- **simt-pto:** needs **PTOAS nightly 0.67** (not ptoas-vmi 0.1.8); live **33/61 PASS**. Remaining FAIL compile are TileLang SimtVF→PTO gaps (f16→f32, etc.).
+- **simd-pto:** **0/61** — `Unsupported storage scope … local` from ST `T.alloc_fragment` (RF). **Keep fragment RF**; needs TileLang SimdVF→PTO codegen fix (do not rewrite kernels to shared-only).
+- Tip SHA for the live run: **`31483438`**. Wenbo VF tables in [`SUMMARY.md`](SUMMARY.md) stay the historical baseline.
