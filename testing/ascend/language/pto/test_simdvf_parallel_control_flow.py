@@ -150,6 +150,22 @@ def _max_min_nodes(mod):
     )
 
 
+def _constant_select_conditions(mod):
+    """Select conditions that are static boolean constants.
+
+    The And/Or/Not expansion in Legalize can expose a constant operand (the
+    analyzer has already proven e.g. ``i < E`` for a divisible shape); a
+    Select with a scalar constant condition has no lane-mask meaning for
+    Vectorize, so the expansion folds it at construction.
+    """
+    bad = []
+    for node in _selects(mod):
+        cond = node.condition
+        if isinstance(cond, tvm.tirx.IntImm) and cond.dtype == "bool":
+            bad.append(cond)
+    return bad
+
+
 # ---------------------------------------------------------------------------
 # Kernels
 # ---------------------------------------------------------------------------
@@ -562,3 +578,155 @@ def test_nested_predicates_legalize_to_nested_selects():
     names = _vmi_call_names(stages["vectorize"])
     assert names.get("tl.vmi.vcmp", 0) >= 2, f"both comparisons must lower to vcmp, got {names}"
     assert "tl.vmi.vsel" in names, "the Selects must lower to vsel"
+
+
+# ---------------------------------------------------------------------------
+# Constant predicate folding in the And/Or/Not expansion
+# (issue-5B-CF-CONSTANT-SELECT: the TopK candidate guard shape)
+# ---------------------------------------------------------------------------
+
+
+def _k_guard_and_true(E, lanes, dtype="float32"):
+    """``(i < E) & (a[i] > 0)``: for a divisible shape the first conjunct is
+    provably true, so Simplify leaves a constant operand inside the
+    bitwise_and and Legalize expands it into a Select on the constant."""
+
+    @T.prim_func
+    def main(A: T.Tensor((E,), dtype), B: T.Tensor((E,), dtype)):
+        with T.Kernel(1):
+            a = T.alloc_shared((E,), dtype)
+            b = T.alloc_shared((E,), dtype)
+            T.copy(A, a)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(E):
+                    if (i < E) & (a[i] > 0):
+                        b[i] = a[i] * 2
+                    else:
+                        b[i] = a[i] + 1
+            T.copy(b, B)
+
+    return main
+
+
+def _k_guard_or_false(E, lanes, dtype="float32"):
+    """``(i >= E) | (a[i] > 0)``: the first disjunct is provably false."""
+
+    @T.prim_func
+    def main(A: T.Tensor((E,), dtype), B: T.Tensor((E,), dtype)):
+        with T.Kernel(1):
+            a = T.alloc_shared((E,), dtype)
+            b = T.alloc_shared((E,), dtype)
+            T.copy(A, a)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(E):
+                    if (i >= E) | (a[i] > 0):
+                        b[i] = a[i] * 2
+                    else:
+                        b[i] = a[i] + 1
+            T.copy(b, B)
+
+    return main
+
+
+def _k_guard_not_and_true(E, lanes, dtype="float32"):
+    """``~((i < E) & (a[i] > 0))``: negation whose operand carries the
+    provably-true conjunct."""
+
+    @T.prim_func
+    def main(A: T.Tensor((E,), dtype), B: T.Tensor((E,), dtype)):
+        with T.Kernel(1):
+            a = T.alloc_shared((E,), dtype)
+            b = T.alloc_shared((E,), dtype)
+            T.copy(A, a)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(E):
+                    if ~((i < E) & (a[i] > 0)):
+                        b[i] = a[i] + 1
+                    else:
+                        b[i] = a[i] * 2
+            T.copy(b, B)
+
+    return main
+
+
+def _k_guard_dynamic_and(E, lanes, dtype="float32"):
+    """A fully dynamic conjunction used directly as the if-condition."""
+
+    @T.prim_func
+    def main(A: T.Tensor((E,), dtype), B: T.Tensor((E,), dtype)):
+        with T.Kernel(1):
+            a = T.alloc_shared((E,), dtype)
+            b = T.alloc_shared((E,), dtype)
+            T.copy(A, a)
+            T.copy(B, b)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(E):
+                    if (a[i] > 0) & (b[i] > 1):
+                        a[i] = a[i] * 2
+                    else:
+                        a[i] = a[i] + 1
+            T.copy(a, B)
+
+    return main
+
+
+@pytest.mark.pto
+def test_conjunct_with_constant_true_has_no_scalar_select():
+    E, lanes = 128, 128
+    stages, _ = _lower_capture(_k_guard_and_true(E, lanes))
+
+    legalized = stages["legalize"]
+    assert not _if_then_elses(legalized), "the guarded branch must be legalized away"
+    assert not _constant_select_conditions(legalized), (
+        f"a Select kept a static boolean condition: {_constant_select_conditions(legalized)}"
+    )
+    assert _selects(legalized), "the store must still select on the dynamic comparison"
+    names = _vmi_call_names(stages["vectorize"])
+    assert "tl.vmi.vsel" in names, f"the folded guard must lower to vsel: {names}"
+
+
+@pytest.mark.pto
+def test_disjunct_with_constant_false_has_no_scalar_select():
+    E, lanes = 128, 128
+    stages, _ = _lower_capture(_k_guard_or_false(E, lanes))
+
+    legalized = stages["legalize"]
+    assert not _if_then_elses(legalized), "the guarded branch must be legalized away"
+    assert not _constant_select_conditions(legalized), (
+        f"a Select kept a static boolean condition: {_constant_select_conditions(legalized)}"
+    )
+    assert _selects(legalized), "the store must still select on the dynamic comparison"
+    names = _vmi_call_names(stages["vectorize"])
+    assert "tl.vmi.vsel" in names, f"the folded guard must lower to vsel: {names}"
+
+
+@pytest.mark.pto
+def test_negated_conjunct_with_constant_true_has_no_scalar_select():
+    E, lanes = 128, 128
+    stages, _ = _lower_capture(_k_guard_not_and_true(E, lanes))
+
+    legalized = stages["legalize"]
+    assert not _if_then_elses(legalized), "the guarded branch must be legalized away"
+    assert not _constant_select_conditions(legalized), (
+        f"a Select kept a static boolean condition: {_constant_select_conditions(legalized)}"
+    )
+    assert _selects(legalized), "the store must still select on the dynamic comparison"
+    names = _vmi_call_names(stages["vectorize"])
+    assert "tl.vmi.vsel" in names, f"the folded guard must lower to vsel: {names}"
+
+
+@pytest.mark.pto
+def test_dynamic_conjunct_keeps_both_comparisons():
+    """The fix folds only static constants: a fully dynamic conjunction still
+    expands to nested Selects over both lane-varying comparisons."""
+    E, lanes = 128, 128
+    stages, _ = _lower_capture(_k_guard_dynamic_and(E, lanes))
+
+    legalized = stages["legalize"]
+    assert not _constant_select_conditions(legalized)
+    assert len(_selects(legalized)) >= 2, (
+        f"a dynamic conjunction must stay two nested Selects: {_selects(legalized)}"
+    )
+    names = _vmi_call_names(stages["vectorize"])
+    assert names.get("tl.vmi.vcmp", 0) >= 2, f"both comparisons must lower to vcmp: {names}"
+    assert "tl.vmi.vsel" in names, f"the nested Selects must lower to vsel: {names}"

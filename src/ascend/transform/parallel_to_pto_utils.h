@@ -331,11 +331,14 @@ PtoRegionScan ScanPtoRegion(const Stmt &region);
  * surface cannot drift between the two passes.
  */
 struct PtoDirectReduce {
-  /*! Static 1-D source buffer (whole buffer). */
+  /*! Static 1-D source buffer (the backing buffer; the reduce consumes its
+   * prefix region [0, extent)). */
   Buffer src;
   /*! One-element destination buffer. */
   Buffer dst;
-  /*! Logical extent E = the source buffer's static extent. */
+  /*! Logical extent E = the static prefix region length; it drives the
+   * chunk count and the reduce masks. The backing buffer only has to
+   * provide capacity for the full-width chunked read (caller guarantee). */
   int64_t extent = 0;
   /*! "max" | "min" | "sum". */
   std::string reduce_type;
@@ -348,8 +351,12 @@ bool IsDirectReduceCall(const CallNode *call);
 
 /*!
  * \brief Parse and validate one direct-reduce call against the stage-4A
- * contract (static 1-D source, one-element destination, dim=0, batch absent
- * or 1, clear=True, no nan_propagate, shared/UB buffers, max/min/sum).
+ * contract (static 1-D source prefix region [0, E) with E <= backing
+ * capacity, one-element destination, dim=0, batch absent or 1, clear=True,
+ * no nan_propagate, shared/UB buffers, max/min/sum). A source stride list
+ * is accepted only when it is a single stride provably equal to one
+ * (arith::Analyzer); strided UB views need stride-aware/gather lowering
+ * and are intentionally deferred.
  *
  * Returns std::nullopt and sets \p reason to the diagnostic on rejection.
  */

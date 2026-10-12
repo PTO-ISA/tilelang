@@ -425,8 +425,9 @@ private:
   // ceil-chunk full-width vload, masked fold with keep-prior vsel (the
   // masked fold zeroes inactive lanes, so vsel restores the earlier
   // accumulator), one cross-lane vcmax/vcmin/vcadd(reassoc=True), and a
-  // create_mask(1, size=VL) predicated store of the result into dst[0].
-  // sum uses vadd/vcadd with an explicit reassoc annotation.
+  // one-element vstore of the result into dst[0] (no broadcast, no VL-wide
+  // mask; PTOAS picks the 1PT store pattern). sum uses vadd/vcadd with an
+  // explicit reassoc annotation.
   //
   // Reads of dst[0] elsewhere in the region stay ordinary BufferLoads: the
   // same-address store->load ordering is the toolchain's job (the PTOAS
@@ -519,22 +520,19 @@ private:
     Var reduced = emit_bind(
         cfold, Call(dt, VmiOp(cfold), {acc, mask0}, cross_attrs));
 
-    // Destination: predicated lane0 store. The broadcast turns the 1-lane
-    // result into a full vector; create_mask(1, size=VL) selects lane 0.
-    Var broadcast = emit_bind(
-        "vbrc_red",
-        Call(vty, VmiOp("vbrc"), {reduced}, size_attrs));
-    Var lane0_mask = emit_bind(
-        "mask",
-        Call(DataType::Bool(static_cast<int>(lanes)), VmiOp("create_mask"),
-             {IntImm(DataType::Int(32), 1)}, size_attrs));
+    // Destination: one-element VMI store (design section 7.2). The cross-lane
+    // result is stored directly over a one-element access_ptr; no VL-wide
+    // broadcast and no VL-wide lane0 mask are emitted for the write-back.
+    // PTOAS lowers the one-element store to the dtype's 1PT pattern
+    // (group_store -> vsts {dist = "1PT_*"}); the per-chunk input domain
+    // masks built above stay untouched.
     PrimExpr dst_ptr =
         Call(DataType::Handle(), tl::access_ptr(),
              {BufferLoad(parsed.dst, {make_zero(DataType::Int(32))}),
               IntImm(DataType::Int(32), 1), IntImm(DataType::Int(32), 2)});
     stmts.push_back(Evaluate(Call(DataType::Void(), VmiOp("vstore"),
-                                  {broadcast, dst_ptr,
-                                   IntImm(DataType::Int(32), 0), lane0_mask})));
+                                  {reduced, dst_ptr,
+                                   IntImm(DataType::Int(32), 0)})));
 
     return SeqStmt::Flatten(stmts);
   }

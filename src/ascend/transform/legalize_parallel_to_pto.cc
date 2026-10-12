@@ -135,8 +135,19 @@ bool IsMaskLogicCall(const CallNode *call, const char *tail) {
 //   select(~a, t, f)  => select(a, f, t)
 // (Boolean *values* under T.Parallel stay mask logic and are converted by
 // VectorizeParallelToPTO to vand/vor/vnot.)
+//
+// Static predicates fold at construction: the expansion can expose a
+// constant operand (the analyzer has already proven e.g. `i < E` for a
+// divisible shape, so Simplify leaves a bool literal inside the
+// bitwise_and/or/not), and a Select with a scalar constant condition has no
+// lane mask for Vectorize: select(true, t, f) -> t, select(false, t, f) -> f.
 PrimExpr ExpandPredSelect(const PrimExpr &cond, const PrimExpr &tval,
                           const PrimExpr &fval) {
+  if (const auto *imm = cond.as<IntImmNode>()) {
+    if (imm->dtype == DataType::Bool()) {
+      return imm->value != 0 ? tval : fval;
+    }
+  }
   if (const auto *andn = cond.as<AndNode>()) {
     return ExpandPredSelect(andn->a, ExpandPredSelect(andn->b, tval, fval),
                             fval);

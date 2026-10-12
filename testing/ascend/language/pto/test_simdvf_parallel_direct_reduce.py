@@ -14,8 +14,10 @@ Covered contract (design stage 4A / direct ``tl.tileop.reduce``):
   ``dim=0``, ``batch=1``, ``clear=True``, no ``nan_propagate``;
 * lowering to VMI happens inside Vectorize: ceil-chunk full-width ``vload``,
   masked fold with keep-prior ``vsel``, one cross-lane ``vcmax``/``vcmin``/
-  ``vcadd(reassoc=True)``, and a ``create_mask(1, size=VL)`` predicated store
-  of the result into ``destination[0]`` (never gated by the lane0 config);
+  ``vcadd(reassoc=True)``, and a **single-element** VMI store of the result
+  into ``destination[0]`` (a 3-argument ``vstore`` over a 1-element
+  ``access_ptr``; no VL-wide broadcast, no VL-wide lane0 mask; PTOAS lowers
+  it to the dtype's ``1PT`` store). The per-chunk input domain masks stay;
 * reads of ``destination[0]`` elsewhere in the region stay ordinary
   ``BufferLoad`` accesses; the same-address store/load ordering is the
   toolchain's responsibility (the PTOAS vecscope mem_bar pass), not something
@@ -194,18 +196,68 @@ def _scalar_load_binds(mod, buffer_name):
     return found
 
 
-def _is_create_mask_of(mask_expr, lanes, count, binds):
-    """Return whether *mask_expr* is a Var bound to create_mask(count, size=lanes)."""
-    if not isinstance(mask_expr, tvm.tirx.Var):
-        return False
-    value = binds.get(mask_expr)
-    if value is None or not isinstance(value, tvm.tirx.Call):
-        return False
-    if getattr(getattr(value, "op", None), "name", None) != "tl.vmi.create_mask":
-        return False
-    if not value.args or not isinstance(value.args[0], tvm.tirx.IntImm):
-        return False
-    return int(value.args[0]) == count
+def _reduce_result_vars(mod):
+    """Vars bound to a cross-lane direct-reduce call."""
+    result = set()
+    for var, value in _binds(mod).items():
+        if not isinstance(value, tvm.tirx.Call):
+            continue
+        if getattr(getattr(value, "op", None), "name", None) in (
+            "tl.vmi.vcmax",
+            "tl.vmi.vcmin",
+            "tl.vmi.vcadd",
+        ):
+            result.add(var)
+    return result
+
+
+def _writeback_stores(mod):
+    """vstore calls whose value is the cross-lane reduce result."""
+    result_vars = _reduce_result_vars(mod)
+    stores = []
+    for call in _vmi_calls(mod).get("tl.vmi.vstore", []):
+        if call.args and isinstance(call.args[0], tvm.tirx.Var) and call.args[0] in result_vars:
+            stores.append(call)
+    return stores
+
+
+def _single_element_writeback(mod):
+    """Assert and return the single-element reduce write-back.
+
+    The target form (design section 7.2) is one VMI store of the 1-element
+    reduce result into a 1-element access_ptr: ``vstore(reduced, dst_ptr, 0)``
+    with no VL-wide broadcast and no VL-wide lane0 mask. Returns
+    ``(store_call, access_ptr_call)``.
+    """
+    stores = _writeback_stores(mod)
+    assert len(stores) == 1, (
+        f"expected exactly one reduce write-back store, got {len(stores)}"
+    )
+    call = stores[0]
+    assert len(call.args) == 3, (
+        "the write-back must store the single-element reduce result directly "
+        f"(value, ptr, offset); got {len(call.args)} arguments"
+    )
+    ptr = call.args[1]
+    assert isinstance(ptr, tvm.tirx.Call) and getattr(ptr.op, "name", None) == "tl.access_ptr", ptr
+    extent = int(ptr.args[1])
+    assert extent == 1, f"the write-back access_ptr must have extent 1, got {extent}"
+    return call, ptr
+
+
+def _reduce_result_broadcasts(mod):
+    """Binds of a ``vbrc`` whose source is a cross-lane reduce result (the
+    full-width broadcast the write-back must not use)."""
+    result_vars = _reduce_result_vars(mod)
+    found = []
+    for var, value in _binds(mod).items():
+        if not isinstance(value, tvm.tirx.Call):
+            continue
+        if getattr(getattr(value, "op", None), "name", None) != "tl.vmi.vbrc":
+            continue
+        if value.args and isinstance(value.args[0], tvm.tirx.Var) and value.args[0] in result_vars:
+            found.append(var)
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -332,7 +384,7 @@ def _k_reduce_serial_k(E, lanes, dtype="float32"):
 
 
 @pytest.mark.pto
-def test_reduce_max_emits_fold_cross_lane_and_lane0_predicated_store():
+def test_reduce_max_emits_fold_cross_lane_and_single_element_store():
     E, lanes = 150, 128
     stages, _ = _lower_capture(_k_reduce(E, lanes, "max"))
 
@@ -346,33 +398,50 @@ def test_reduce_max_emits_fold_cross_lane_and_lane0_predicated_store():
     assert names.get("tl.vmi.vsel"), f"the masked fold must keep prior lanes via vsel: {sorted(names)}"
     assert len(names.get("tl.vmi.vcmax", [])) == 1, f"exactly one cross-lane vcmax expected: {sorted(names)}"
     assert names.get("tl.vmi.vload"), "the source must be read full-width in chunks"
+    assert names.get("tl.vmi.create_mask"), "the per-chunk input domain masks must stay"
 
-    binds = _binds(vectorized)
-    stores = names.get("tl.vmi.vstore", [])
-    lane0_stores = [
-        call
-        for call in stores
-        if len(call.args) == 4 and _is_create_mask_of(call.args[3], lanes, 1, binds)
-    ]
-    assert lane0_stores, "the reduce result must be written with a create_mask(1) predicated store"
+    _single_element_writeback(vectorized)
 
 
 @pytest.mark.pto
-def test_reduce_min_emits_vmin_vcmin_and_lane0_store():
+def test_destination_writeback_is_a_single_element_vstore():
+    """The write-back is one 3-argument ``vstore(reduced, dst_ptr, 0)`` of the
+    cross-lane result over a 1-element ``access_ptr``: no VL broadcast of the
+    result and no VL-wide lane0 mask are emitted for it (design section 7.2),
+    while the per-chunk input domain masks stay."""
+
+    for rtype in ("max", "min", "sum"):
+        E, lanes = 150, 128
+        stages, _ = _lower_capture(_k_reduce(E, lanes, rtype))
+        vectorized = stages["vectorize"]
+
+        call, ptr = _single_element_writeback(vectorized)
+        assert isinstance(call.args[0], tvm.tirx.Var)
+        assert call.args[0] in _reduce_result_vars(vectorized), (
+            "the stored value must be the cross-lane reduce result itself"
+        )
+        assert not _reduce_result_broadcasts(vectorized), (
+            f"{rtype}: the write-back must not broadcast the single-element result to VL"
+        )
+        names = _vmi_calls(vectorized)
+        assert names.get("tl.vmi.create_mask"), (
+            f"{rtype}: the per-chunk input domain masks must stay"
+        )
+
+
+@pytest.mark.pto
+def test_reduce_min_emits_vmin_vcmin_and_single_element_store():
     E, lanes = 150, 128
     stages, _ = _lower_capture(_k_reduce(E, lanes, "min"))
 
-    names = _vmi_calls(stages["vectorize"])
+    vectorized = stages["vectorize"]
+    names = _vmi_calls(vectorized)
     assert names.get("tl.vmi.vmin"), f"the fold must use vmin: {sorted(names)}"
     assert len(names.get("tl.vmi.vcmin", [])) == 1, f"exactly one cross-lane vcmin expected: {sorted(names)}"
     assert not names.get("tl.vmi.vmax"), "min must not use vmax"
     assert not names.get("tl.vmi.vcadd"), "min must not use vcadd"
 
-    binds = _binds(stages["vectorize"])
-    stores = names.get("tl.vmi.vstore", [])
-    assert any(
-        len(call.args) == 4 and _is_create_mask_of(call.args[3], lanes, 1, binds) for call in stores
-    ), "the reduce result must be written with a create_mask(1) predicated store"
+    _single_element_writeback(vectorized)
 
 
 @pytest.mark.pto
@@ -409,13 +478,8 @@ def test_destination_read_stays_a_plain_buffer_load():
         "reads of the reduce destination must stay plain BufferLoads"
     )
 
-    # The reduce's own lane0 write-back is still present and predicated.
-    names = _vmi_calls(vectorized)
-    binds = _binds(vectorized)
-    stores = names.get("tl.vmi.vstore", [])
-    assert any(
-        len(call.args) == 4 and _is_create_mask_of(call.args[3], lanes, 1, binds) for call in stores
-    ), "the reduce's own destination write must stay lane0-predicated"
+    # The reduce's own single-element write-back is still present.
+    _single_element_writeback(vectorized)
 
 
 @pytest.mark.pto
@@ -429,11 +493,7 @@ def test_reduce_inside_serial_k_loop_compiles_repeatedly():
     names = _vmi_calls(vectorized)
     assert len(names.get("tl.vmi.vcmax", [])) == 1, f"one static vcmax inside the k loop: {sorted(names)}"
 
-    binds = _binds(vectorized)
-    stores = names.get("tl.vmi.vstore", [])
-    assert any(
-        len(call.args) == 4 and _is_create_mask_of(call.args[3], lanes, 1, binds) for call in stores
-    ), "the repeated reduce must still write lane0 predicated"
+    _single_element_writeback(vectorized)
 
 
 # ---------------------------------------------------------------------------
@@ -765,8 +825,239 @@ def test_reduce_before_first_parallel_lowers_with_region_lanes():
 
     names = _vmi_calls(vectorized)
     assert len(names.get("tl.vmi.vcmax", [])) == 1, f"exactly one cross-lane vcmax expected: {sorted(names)}"
-    binds = _binds(vectorized)
-    assert any(
-        len(call.args) == 4 and _is_create_mask_of(call.args[3], lanes, 1, binds)
-        for call in names.get("tl.vmi.vstore", [])
-    ), "the reduce before the first unit must still write lane0 predicated"
+    _single_element_writeback(vectorized)
+
+
+# ---------------------------------------------------------------------------
+# Prefix source region: logical extent E <= backing capacity
+# (issue-5B-REDUCE-PREFIX-REGION, user-approved minimal fix)
+# ---------------------------------------------------------------------------
+
+
+def _k_reduce_prefix(E, cap, lanes, rtype="max", dtype="float32"):
+    """Source backing capacity *cap* written in full by the unit; the reduce
+    consumes the prefix region ``src[0:E]``. The padding lanes hold values
+    that would corrupt the answer if the logical-extent tail mask were
+    missing (the device numeric uses answer-corrupting padding)."""
+    reduce_op = {"max": T.reduce_max, "min": T.reduce_min, "sum": T.reduce_sum}[rtype]
+
+    @T.prim_func
+    def main(A: T.Tensor((cap,), dtype), B: T.Tensor((2,), dtype)):
+        with T.Kernel(1):
+            src = T.alloc_shared((cap,), dtype)
+            dst = T.alloc_shared((2,), dtype)
+            T.copy(A, src)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(cap):
+                    src[i] = src[i] * 2
+                dst[1] = 7.0
+                reduce_op(src[0:E], dst[0:1], dim=0, clear=True)
+            T.copy(dst, B)
+
+    return main
+
+
+def _create_mask_constants(mod):
+    """The IntImm operands of every tl.vmi.create_mask call."""
+    consts = []
+    for call in _vmi_calls(mod).get("tl.vmi.create_mask", []):
+        if call.args and isinstance(call.args[0], tvm.tirx.IntImm):
+            consts.append(int(call.args[0]))
+    return consts
+
+
+@pytest.mark.pto
+def test_prefix_source_region_uses_the_logical_extent_for_masks():
+    """E=150 < capacity 256, L=128: the region extent is the logical E, so
+    the tail chunk mask is create_mask(22) — proof that the mask follows the
+    prefix extent, not the backing capacity (a whole-P reduce would use only
+    create_mask(128) chunks)."""
+    E, cap, lanes = 150, 256, 128
+    stages, _ = _lower_capture(_k_reduce_prefix(E, cap, lanes, "max"))
+
+    vectorized = stages["vectorize"]
+    assert not _reduce_calls(vectorized), "Vectorize must consume tl.tileop.reduce"
+    names = _vmi_calls(vectorized)
+    assert len(names.get("tl.vmi.vcmax", [])) == 1, f"one cross-lane vcmax expected: {sorted(names)}"
+    assert names.get("tl.vmi.vmax"), f"the fold must use vmax: {sorted(names)}"
+    assert names.get("tl.vmi.vsel"), f"the tail chunk needs the keep-prior vsel: {sorted(names)}"
+    _single_element_writeback(vectorized)
+
+    consts = _create_mask_constants(vectorized)
+    assert 22 in consts, f"the tail chunk mask must cover the logical extent (150-128=22), got {consts}"
+
+
+@pytest.mark.pto
+def test_prefix_source_region_below_one_lane_uses_partial_mask():
+    """E=70 < L=128: a single chunk whose domain mask is create_mask(70)."""
+    E, cap, lanes = 70, 128, 128
+    stages, _ = _lower_capture(_k_reduce_prefix(E, cap, lanes, "max"))
+
+    vectorized = stages["vectorize"]
+    names = _vmi_calls(vectorized)
+    assert len(names.get("tl.vmi.vcmax", [])) == 1, f"one cross-lane vcmax expected: {sorted(names)}"
+    _single_element_writeback(vectorized)
+    consts = _create_mask_constants(vectorized)
+    assert 70 in consts, f"the domain mask must cover the logical extent, got {consts}"
+
+
+@pytest.mark.pto
+def test_prefix_extent_beyond_capacity_is_rejected():
+    """The prefix must stay inside the backing buffer: extent > capacity is
+    rejected by Verify (rejection is on the reduce contract, so it holds for
+    every later pass as well)."""
+    E, cap, lanes = 300, 256, 128
+
+    @T.prim_func
+    def main(A: T.Tensor((cap,), "float32"), B: T.Tensor((2,), "float32")):
+        with T.Kernel(1):
+            src = T.alloc_shared((cap,), "float32")
+            dst = T.alloc_shared((2,), "float32")
+            T.copy(A, src)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(cap):
+                    src[i] = src[i] * 2
+                T.reduce_max(src[0:E], dst[0:1], dim=0, clear=True)
+            T.copy(dst, B)
+
+    _, error = _lower_capture(main, expect_error=True)
+    assert error is not None, "a prefix beyond the backing capacity must be rejected"
+    message = str(error)
+    assert "capacity" in message or "backing" in message, (
+        f"expected the capacity diagnostic, got: {message}"
+    )
+
+
+@pytest.mark.pto
+def test_prefix_region_with_nonzero_min_is_rejected():
+    """A region that does not start at 0 is not a prefix and stays rejected."""
+    E, cap, lanes = 256, 256, 128
+
+    @T.prim_func
+    def main(A: T.Tensor((cap,), "float32"), B: T.Tensor((2,), "float32")):
+        with T.Kernel(1):
+            src = T.alloc_shared((cap,), "float32")
+            dst = T.alloc_shared((2,), "float32")
+            T.copy(A, src)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(cap):
+                    src[i] = src[i] * 2
+                evaluate(
+                    tirx.call_intrin(
+                        "handle",
+                        tirx.op.Op.get("tl.tileop.reduce"),
+                        region(tirx.BufferLoad(src, [tirx.IntImm("int32", 1)]), "r", E - 1),
+                        region(tirx.BufferLoad(dst, [tirx.IntImm("int32", 0)]), "w", 1),
+                        "max",
+                        0,
+                        True,
+                    )
+                )
+            T.copy(dst, B)
+
+    _, error = _lower_capture(main, expect_error=True)
+    assert error is not None, "a non-prefix region must be rejected"
+    assert "starting at 0" in str(error), f"expected the prefix diagnostic, got: {error}"
+
+
+def _k_reduce_strided_source(stride, extent=256, backing_capacity=512, lanes=128):
+    """Build a direct Reduce over an explicit strided UB view.
+
+    The backing allocation is deliberately large enough for the physical
+    footprint of the view.  This isolates the direct-Reduce source-layout
+    contract from addressability: the first version accepts only a compact
+    (unit-stride) UB source and must reject a view that would need
+    stride-aware/gather lowering.
+    """
+
+    @T.prim_func
+    def main(A: T.Tensor((backing_capacity,), "float32"), B: T.Tensor((1,), "float32")):
+        with T.Kernel(1):
+            backing = T.alloc_shared((backing_capacity,), "float32")
+            best = T.alloc_shared((1,), "float32")
+            src = T.StridedTensor(
+                (extent,), (stride,), "float32", data=backing.data, scope="shared.dyn"
+            )
+            T.copy(A, backing)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(backing_capacity):
+                    backing[i] = backing[i] * 2
+                T.reduce_max(src[0:extent], best, dim=0, clear=True)
+            T.copy(best, B)
+
+    return main
+
+
+@pytest.mark.pto
+def test_reduce_explicit_unit_stride_source_is_accepted():
+    """An explicit stride proven equal to one is still a compact source."""
+
+    stages, error = _lower_capture(_k_reduce_strided_source(1), expect_error=True)
+    assert error is None, f"unit-stride source must be accepted, got: {error}"
+    assert not _reduce_calls(stages["vectorize"]), "Vectorize must consume tl.tileop.reduce"
+
+
+@pytest.mark.pto
+def test_reduce_non_unit_stride_source_is_rejected():
+    """Direct Reduce does not silently reinterpret a strided UB view."""
+
+    _, error = _lower_capture(_k_reduce_strided_source(2), expect_error=True)
+    assert error is not None, "non-unit-stride source must be rejected"
+    assert "stride" in str(error).lower(), f"expected the stride diagnostic, got: {error}"
+
+
+@pytest.mark.pto
+def test_reduce_provably_unit_stride_expression_is_accepted():
+    """A non-literal stride expression proven equal to one stays accepted.
+
+    The stride is a ``Cast`` node rather than an ``IntImm``: a literal-only
+    check would reject it, so this pins the analyzer-based acceptance
+    (``CanProveEqual``) instead of an equality against the integer constant.
+    """
+
+    stride = tirx.Cast("int32", tirx.const(1, "int64"))
+    stages, error = _lower_capture(_k_reduce_strided_source(stride), expect_error=True)
+    assert error is None, f"provably-unit stride must be accepted, got: {error}"
+    # Keep the probe honest: if the frontend ever folds the expression to a
+    # literal, swap in another provably-unit expression so this still
+    # exercises the analyzer path and not the IntImm fast path.
+    assert "strides=(T.Cast" in stages["legalize"].script(), (
+        "the expression stride was folded to a literal before reaching the "
+        "pipeline; replace the expression to keep the test discriminating"
+    )
+    assert not _reduce_calls(stages["vectorize"]), "Vectorize must consume tl.tileop.reduce"
+
+
+@pytest.mark.pto
+def test_reduce_unprovable_dynamic_stride_source_is_rejected():
+    """An unknown (unprovable) stride must not be treated as unit.
+
+    ``n`` is a bound kernel parameter, so the rejection must come from the
+    direct-reduce stride contract and not from an unbound-variable frontend
+    error masking the parser diagnostic.
+    """
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((512,), "float32"),
+        B: T.Tensor((1,), "float32"),
+        n: T.int32,
+    ):
+        with T.Kernel(1):
+            backing = T.alloc_shared((512,), "float32")
+            best = T.alloc_shared((1,), "float32")
+            src = T.StridedTensor(
+                (256,), (n,), "float32", data=backing.data, scope="shared.dyn"
+            )
+            T.copy(A, backing)
+            with T.SimdVF(lanes=128):
+                for i in T.Parallel(512):
+                    backing[i] = backing[i] * 2
+                T.reduce_max(src[0:256], best, dim=0, clear=True)
+            T.copy(best, B)
+
+    _, error = _lower_capture(main, expect_error=True)
+    assert error is not None, "a dynamic unprovable stride must be rejected"
+    assert "contiguous unit stride" in str(error), (
+        f"expected the stride diagnostic, got: {error}"
+    )

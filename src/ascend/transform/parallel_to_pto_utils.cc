@@ -1541,14 +1541,19 @@ std::optional<PtoDirectReduce> ParseDirectReduceCall(const CallNode *call,
                   "(clear=False needs seed/accumulation semantics)");
   }
 
-  // Source: static 1-D buffer, reduced as a whole.
+  // Source: static 1-D prefix region [0, E) of a static buffer. The region
+  // length is the logical extent E (it drives the chunk count and the
+  // reduce masks); the backing buffer only has to provide the capacity for
+  // the full-width chunked read, which the caller guarantees (design 7.1:
+  // capacity/alignment/readability are the caller's responsibility).
   if (src_region->region.size() != 1) {
     return reject(
         "direct reduce source must be a 1-D buffer in the first version");
   }
   const Range &src_range = src_region->region[0];
   if (!is_zero(src_range->min)) {
-    return reject("direct reduce source region must start at 0");
+    return reject("direct reduce source region must be a prefix starting at "
+                  "0");
   }
   const auto *src_extent = src_range->extent.as<IntImmNode>();
   const auto *src_shape = src_region->buffer->shape[0].as<IntImmNode>();
@@ -1556,12 +1561,30 @@ std::optional<PtoDirectReduce> ParseDirectReduceCall(const CallNode *call,
     return reject("direct reduce source must be a static buffer: the region "
                   "extent and buffer shape must be compile-time constants");
   }
-  if (src_extent->value != src_shape->value) {
-    return reject("direct reduce reads its whole static source buffer in the "
-                  "first version");
-  }
   if (src_extent->value <= 0) {
     return reject("direct reduce source extent must be positive");
+  }
+  if (src_extent->value > src_shape->value) {
+    return reject("direct reduce source prefix exceeds the backing buffer "
+                  "capacity");
+  }
+  // Direct Reduce emits contiguous VMI loads from the source base pointer.
+  // An omitted stride list denotes the ordinary compact 1-D buffer; when a
+  // stride is present, keep the same contract only if the analyzer can prove
+  // the sole stride is one.  Strided UB views require stride-aware/gather
+  // lowering and are intentionally deferred to a later capability.
+  if (!src_region->buffer->strides.empty()) {
+    if (src_region->buffer->strides.size() != 1) {
+      return reject("direct reduce source must have a contiguous unit stride; "
+                    "strided UB views are unsupported in the first version");
+    }
+    const PrimExpr &src_stride = src_region->buffer->strides[0];
+    arith::Analyzer stride_analyzer;
+    if (!stride_analyzer.CanProveEqual(src_stride,
+                                       make_const(src_stride.dtype(), 1))) {
+      return reject("direct reduce source must have a contiguous unit stride; "
+                    "strided UB views are unsupported in the first version");
+    }
   }
   if (!IsSharedBuffer(src_region->buffer)) {
     return reject("direct reduce source must be a shared/UB buffer in the "
