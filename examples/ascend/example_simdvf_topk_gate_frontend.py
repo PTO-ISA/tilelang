@@ -9,9 +9,11 @@ sha256 492a5b0a91c8f3b8...).  Adaptations for the current pto-dev pipeline
 * pipeline contract is now ``Verify -> Legalize -> Vectorize`` (PR262 used
   ``SimdVFLowerControlFlow -> SimdVFLowerReduce -> Verify -> Vectorize``);
   ''assert_lowered_contract'' captures and checks the three PTO passes;
-* the whole index chain is **int32** (PR #2 / 5B): tournament ``idx_cand``,
-  ``best``, ``idx_ub`` and the GM ``IdxOut`` output are int32; the int64
-  widening copy-out and its ``T.assume(0 <= idx_ub[0])`` are gone;
+* the tournament index chain stays **int32** (``idx_cand``/``best``/
+  ``idx_ub``); the GM ``IdxOut`` ABI is **int64** like PR262 and the int64
+  value is produced by the ``tl.ExpandDtypeMismatchedCopy`` expansion
+  (int32 UB -> widen VF -> int64 scratch -> same-dtype copy), *without*
+  PR262's ``T.assume(0 <= idx_ub[0])`` zext shortcut;
 * the staging buffer ``s`` is allocated at ``P = align(E, lanes)`` and only
   the first ``E`` elements are copied; ``s[E:P]`` stays uninitialized but
   readable (design TopK contract);
@@ -106,7 +108,7 @@ def topk_gate_frontend(
     @T.prim_func
     def main(
         A: T.Tensor((num_experts,), "float32"),
-        IdxOut: T.Tensor((num_topk,), "int32"),
+        IdxOut: T.Tensor((num_topk,), "int64"),
     ):
         with T.Kernel(1):
             # s32 compute is valid: expert ids / Parallel indices fit int32.
@@ -158,8 +160,11 @@ def topk_gate_frontend(
                         if idxs[i] == best[0]:
                             scores[i] = -T.infinity(T.float32)
                 T.ascend_pipe_barrier("PIPE_V")
-            # Same-dtype int32 copy-out (GPU TileKernels returns int64; the
-            # Ascend frontend keeps the whole index chain int32).
+            # int64 GM ABI (GPU TileKernels returns int64). idx_ub stays
+            # int32; the dtype-mismatched copy is expanded into the UB widen
+            # VF + int64 scratch + same-dtype copy by
+            # tl.ExpandDtypeMismatchedCopy (signed widening, no assume-based
+            # zext proof).
             T.copy(idx_ub, IdxOut)
 
     return main
@@ -265,7 +270,9 @@ def assert_lowered_contract(compiled, captured: dict | None = None) -> dict:
 
 
 def ref_topk_indices(scores_1d, k: int):
-    """PR262 tournament reference, including repeated winners at -inf."""
+    """PR262 tournament reference, including repeated winners at -inf.
+
+    Returns the int64 GM ABI dtype so callers compare full int64 values."""
     import torch
 
     scores = torch.as_tensor(scores_1d, dtype=torch.float32).clone()
@@ -277,7 +284,7 @@ def ref_topk_indices(scores_1d, k: int):
         i = int(idxs.min())
         out.append(i)
         scores[i] = neg
-    return torch.tensor(out, dtype=torch.int32)
+    return torch.tensor(out, dtype=torch.int64)
 
 
 if __name__ == "__main__":

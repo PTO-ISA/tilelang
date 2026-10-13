@@ -7,8 +7,10 @@ sha256 a426c70e2a2cda43...): a re-export shim over the tournament body in
 ``example_simdvf_topk_gate_frontend`` so both names stay in sync.
 
 The normative contract now lowers through ``Verify -> Legalize -> Vectorize``
-(assert_lowered_contract captures the three passes) and the whole index chain
-is int32. See example_simdvf_topk_gate_frontend for the full adaptation list.
+(assert_lowered_contract captures the three passes); the tournament index
+chain stays int32 while the GM ``IdxOut`` ABI is int64, produced by the
+``tl.ExpandDtypeMismatchedCopy`` UB widening. See
+example_simdvf_topk_gate_frontend for the full adaptation list.
 """
 
 from __future__ import annotations
