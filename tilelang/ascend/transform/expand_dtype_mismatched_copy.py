@@ -361,7 +361,15 @@ def _prove(analyzer, constraints, predicate) -> bool:
 
 def _emit_serial_widen(src_buf, src_index, scratch, extent: int):
     """Signed serial widen baseline; the reverse index keeps the legacy
-    MergeUB-style alias analysis safe (no overlapping R/W at the same index)."""
+    MergeUB-style alias analysis safe (no overlapping R/W at the same index).
+
+    No ``tl.ub_force_loop_live`` hint is attached: the key has no consumer in
+    the current pipeline (``InferBufferAliases``/``MergeUBAllocations`` do not
+    read it), and the Task 3 loop-liveness device matrix - two iterations with
+    loop-carried updates, reuse on/off, and source/guard readbacks that
+    consume those updates after the loop - shows the existing liveness rules
+    keep the source and neighboring live buffers intact.
+    """
     i = tirx.Var("cast_i", "int32")
     rev = tirx.const(extent - 1, "int32") - i
     loaded = BufferLoad(src_buf, [src_index + rev])
@@ -373,7 +381,6 @@ def _emit_serial_widen(src_buf, src_index, scratch, extent: int):
         tirx.const(extent, "int32"),
         ForKind.SERIAL,
         store,
-        annotations={"tl.ub_force_loop_live": tirx.const(1, "int32")},
     )
 
 
