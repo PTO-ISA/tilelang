@@ -4,8 +4,11 @@ The pass runs after ``InsertNd2Nz`` and before ``VFChecker`` on the PTO route.
 It consumes the op exactly as the Ascend frontend emits it
 (``tl.tileop.ascend_copy`` over ``tl.region`` pairs) and rewrites the widening
 copy into a bare ``SIMD_VF`` widen plus a same-dtype ``tl.tileop.ascend_copy``
-(int64 scratch -> original int64 GM destination).  Task 1 delivers the signed
-serial baseline only: no VMI path, no assume/zext optimisation, no padding.
+(int64 scratch -> original int64 GM destination).  K in ``{2,4,8,64}`` widens
+through signed VMI (``vcmps``/``vsel``/``vintlv``; below K=64 via a
+split-loop-filled compiler pad); every other legal static K keeps the signed
+serial baseline.  No assume/zext optimisation: an element-wise assume never
+switches the widen to zext.
 """
 
 from __future__ import annotations
@@ -83,7 +86,9 @@ def _extents(reg_call):
 
 
 def test_expand_ascend_copy_i32_i64():
-    mod, src, dst = _copy_module(k=8, dst_base=3)
+    # K=6 stays on the serial signed path (K=8 is VMI since Task 2); this test
+    # pins the serial-path structure and the shape of the rewrite itself.
+    mod, src, dst = _copy_module(k=6, dst_base=3)
     after = _expand(mod)
 
     copies = calls(after, "tl.tileop.ascend_copy")
@@ -102,10 +107,10 @@ def test_expand_ascend_copy_i32_i64():
     assert out.data.same_as(dst.data), "the GM destination must be the original buffer"
     # Destination region offset/extent unchanged.
     assert int(_min_index(dst_reg)) == 3
-    assert _extents(dst_reg) == [8]
+    assert _extents(dst_reg) == [6]
     # Scratch region starts at zero with the same extent.
     assert int(_min_index(src_reg)) == 0
-    assert _extents(src_reg) == [8]
+    assert _extents(src_reg) == [6]
     assert scratch.scope() in ("shared", "shared.dyn")
 
     # The scratch is declared (as an int64 allocation) and attached to a block.
@@ -374,18 +379,20 @@ def test_expand_rejects_simt_vf_nested_target_copy():
 
 
 def test_expand_preserves_base_and_elem_offset_addressing():
+    # K=6 exercises the serial signed path (K=8 is VMI since Task 2), where the
+    # reverse-index address arithmetic is observable.
     src = tirx.decl_buffer((16,), "int32", name="src", scope="shared.dyn", elem_offset=5, strides=(1,))
     dst = tirx.decl_buffer((24,), "int64", name="dst", scope="global", elem_offset=7, strides=(1,))
     call = tirx.Call(
         "handle",
         tvm.ir.Op.get("tl.tileop.ascend_copy"),
-        [region(src, 1, [3], [8]), region(dst, 2, [4], [8])],
+        [region(src, 1, [3], [6]), region(dst, 2, [4], [6])],
     )
     after = _expand(kernel(tirx.Evaluate(call), buffers=[src, dst]))
 
     vf = next(b for b in nodes(after, tirx.SBlock) if b.name_hint == "SIMD_VF")
-    assert int(vf.reads[0].region[0].min) == 3 and int(vf.reads[0].region[0].extent) == 8
-    assert int(vf.writes[0].region[0].min) == 0 and int(vf.writes[0].region[0].extent) == 8
+    assert int(vf.reads[0].region[0].min) == 3 and int(vf.reads[0].region[0].extent) == 6
+    assert int(vf.writes[0].region[0].min) == 0 and int(vf.writes[0].region[0].extent) == 6
     assert not any(realize.block.same_as(vf) for realize in nodes(after, tirx.SBlockRealize))
 
     out_call = calls(after, "tl.tileop.ascend_copy")[0]
@@ -397,7 +404,7 @@ def test_expand_preserves_base_and_elem_offset_addressing():
     load = nodes(loop.body, tirx.BufferLoad)[0]
     assert load.buffer.same_as(src) and int(load.buffer.elem_offset) == 5
     first = tirx.stmt_functor.substitute(load.indices[0], {loop.loop_var: tirx.const(0, "int32")})
-    assert int(tvm.arith.Analyzer().simplify(first)) == 3 + 8 - 1
+    assert int(tvm.arith.Analyzer().simplify(first)) == 3 + 6 - 1
 
 
 def test_expand_rejects_unsupported_metadata_kinds():
@@ -647,6 +654,159 @@ def test_expand_leaves_foreign_buffer_without_source_fields_alone():
     call = calls(after, "tl.tileop.ascend_copy")[0]
     assert call.annotations["meta"].elem_offset is not None
     assert int(call.annotations["meta"].elem_offset) == 2
+
+
+# ---------------------------------------------------------------------------
+# Task 2: VMI widen admission {2,4,8,64}, signed-only, split pad loops
+# ---------------------------------------------------------------------------
+
+_WIDEN_VMI_K = (2, 4, 8, 64)
+_SERIAL_K = (1, 6, 16, 32, 65)
+
+
+def _widen_module(k):
+    return _copy_module(k=k, dst_base=0, dst_shape=max(k, 16))[0]
+
+
+@pytest.mark.parametrize("k", _WIDEN_VMI_K)
+def test_expand_vmi_widen_for_admitted_k(k):
+    after = _expand(_widen_module(k))
+    assert calls(after, "tl.vmi.vload"), "admitted K must widen through VMI"
+    assert calls(after, "tl.vmi.vcmps"), "the high half must be selected signed (vcmps)"
+    assert calls(after, "tl.vmi.vsel")
+    assert calls(after, "tl.vmi.vintlv")
+    assert len(calls(after, "tl.vmi.pair_get")) == 2, "vintlv exposes two interleaved outputs"
+    vstores = calls(after, "tl.vmi.vstore")
+    if k == 64:
+        assert len(vstores) == 2, "K=64 writes 128 int32 halves through two stores"
+    else:
+        assert len(vstores) == 1
+    for call in (
+        calls(after, "tl.vmi.vload")
+        + calls(after, "tl.vmi.vintlv")
+        + calls(after, "tl.vmi.pair_get")
+        + vstores
+    ):
+        assert "int64" not in str(call.dtype), "no si64 VReg on this path"
+    vf = next(b for b in nodes(after, tirx.SBlock) if b.name_hint == "SIMD_VF")
+    assert not [c for c in nodes(vf.body, tirx.Cast)], "the VMI path must not fall back to serial Cast"
+    if k < 64:
+        allocs = [b for b in nodes(after, tirx.SBlock) for b in (b.alloc_buffers or [])]
+        pads = [b for b in allocs if b.name.endswith("_widen_pad")]
+        assert len(pads) == 1 and int(pads[0].shape[0]) == 64
+        loop_extents = sorted(int(f.extent) for f in nodes(vf.body, tirx.For))
+        assert loop_extents == sorted([k, 64 - k]), "pad copy loop [0,K) plus zero fill [K,64)"
+        assert not nodes(vf.body, tirx.Select), (
+            "the pad must be filled by split loops, never a Select over out-of-range loads"
+        )
+    else:
+        assert not nodes(vf.body, tirx.For), "K=64 reads the source directly, no pad loops"
+
+
+@pytest.mark.parametrize("k", _SERIAL_K)
+def test_expand_serial_fallback_outside_admitted_k(k):
+    after = _expand(_widen_module(k))
+    assert not calls(after, "tl.vmi.vintlv"), "non-admitted K stays on the Task 1 serial path"
+    assert not calls(after, "tl.vmi.vload")
+    vf = next(b for b in nodes(after, tirx.SBlock) if b.name_hint == "SIMD_VF")
+    assert [c for c in nodes(vf.body, tirx.Cast) if str(c.dtype) == "int64"]
+
+
+def test_element_wise_assume_does_not_switch_to_zext():
+    """An element-0 non-negative assume is not a whole-buffer proof: the
+    widen stays signed (vcmps/vsel), no zext optimisation is applied."""
+
+    mod, src, dst = _copy_module(k=8, dst_base=0, dst_shape=16)
+    call = calls(mod, "tl.tileop.ascend_copy")[0]
+    assume = tirx.AttrStmt(
+        tirx.const(0, "int32") <= tirx.BufferLoad(src, [0]),
+        "tl.assume",
+        tirx.const(1, "int32"),
+        tirx.Evaluate(call),
+    )
+    after = _expand(kernel(assume, buffers=[src, dst]))
+    assert calls(after, "tl.vmi.vcmps") and calls(after, "tl.vmi.vsel"), (
+        "the signed select must survive an element-wise assume"
+    )
+    assert calls(after, "tl.vmi.vintlv")
+
+
+@pytest.mark.pto
+def test_frontend_assume_reaches_the_pass_and_stays_signed():
+    """A real frontend ``T.assume(0 <= ub[0])`` reaches the pass input (the
+    ``InjectAssumes`` inner ``tl.assume`` attribute), references the widening
+    copy's source buffer, and the widen stays signed (vcmps/vsel) in the pass
+    output -- an element-wise assume is never turned into a zext proof."""
+
+    import tilelang.ascend.language as T
+    from tilelang.ascend.target import normalize_pto_target
+    from tilelang.engine.lower import lower as _lower
+
+    captured = {}
+    original = transform.ExpandDtypeMismatchedCopy
+
+    def capturing_factory():
+        inner = original()
+
+        def run(mod):
+            captured.setdefault("pre", mod)
+            out = inner(mod)
+            captured["post"] = out
+            return out
+
+        return run
+
+    @T.prim_func
+    def main(A: T.Tensor((2,), "int32"), Out: T.Tensor((2,), "int64")):
+        with T.Kernel(1):
+            ub = T.alloc_shared((2,), "int32")
+            T.copy(A, ub)
+            T.assume(0 <= ub[0])
+            T.copy(ub, Out)
+
+    transform.ExpandDtypeMismatchedCopy = capturing_factory
+    try:
+        target = normalize_pto_target("pto")
+        with target:
+            _lower(main, target=target)
+    finally:
+        transform.ExpandDtypeMismatchedCopy = original
+
+    pre, post = captured["pre"], captured["post"]
+    widening = [
+        call
+        for call in calls(pre, "tl.tileop.ascend_copy")
+        if str(call.args[0].args[0].buffer.dtype) == "int32"
+        and str(call.args[1].args[0].buffer.dtype) == "int64"
+    ]
+    assert widening, "the frontend must emit the widening copy"
+    src_buf = widening[0].args[0].args[0].buffer
+
+    assumes = [
+        attr
+        for attr in nodes(pre, tirx.AttrStmt)
+        if getattr(attr, "attr_key", None) == "tl.assume"
+    ]
+    assert assumes, "the frontend T.assume must reach the pass input as a tl.assume attribute"
+    hits = []
+    for attr in assumes:
+        tirx.stmt_functor.post_order_visit(
+            attr.node,
+            lambda node: hits.append(node)
+            if isinstance(node, tirx.BufferLoad) and node.buffer.same_as(src_buf)
+            else None,
+        )
+    assert hits, "the assume condition must reference the widening copy's source buffer"
+
+    assert [
+        attr
+        for attr in nodes(post, tirx.AttrStmt)
+        if getattr(attr, "attr_key", None) == "tl.assume"
+    ], "the pass must not consume the assume attribute"
+    assert calls(post, "tl.vmi.vcmps") and calls(post, "tl.vmi.vsel"), (
+        "the widen must stay signed (vcmps/vsel) under an element-wise assume"
+    )
+    assert calls(post, "tl.vmi.vintlv")
 
 
 @pytest.mark.pto

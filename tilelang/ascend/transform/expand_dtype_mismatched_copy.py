@@ -7,9 +7,14 @@ PTO route this pass runs after ``InsertNd2Nz`` and before ``VFChecker`` and
 rewrites the widening copy into
 
   1. an int64 ``shared.dyn`` scratch allocation;
-  2. a bare ``SIMD_VF`` block (no ``T.Parallel``) that widens elementwise with
-     a signed serial ``Cast`` — the Task 1 baseline; the VMI/vintlv path and
-     its padding belong to later tasks;
+  2. a bare ``SIMD_VF`` block (no ``T.Parallel``) that widens elementwise.
+     K in ``{2,4,8,64}`` uses the signed VMI path -- ``vcmps`` selects the
+     -1/0 high half, ``vintlv`` interleaves the int32 halves into the scratch
+     through a same-storage int32 view; below K=64 a compiler-owned 64-element
+     pad is filled by two split loops (copy ``[0,K)``, zero ``[K,64)``) so no
+     out-of-range load is ever guarded by a ``Select``.  Every other legal
+     static K keeps the signed serial ``Cast``.  No zext proof is attempted:
+     an element-wise assume never widens the accepted signedness;
   3. a same-dtype ``tl.tileop.ascend_copy`` (int64 scratch -> the original
      int64 GM destination region), which the C++ side parses as an
      ``AscendCopyNode``.
@@ -43,8 +48,10 @@ from tvm import arith, tirx
 from tvm import ir as tvm_ir
 from tvm import runtime as tvm_runtime
 from tvm.tirx import (
+    Bind,
     BufferLoad,
     BufferRegion,
+    BufferStore,
     Call,
     Evaluate,
     For,
@@ -57,9 +64,14 @@ from tvm.tirx.transform import prim_func_pass
 
 _COPY_OP = "tl.tileop.ascend_copy"
 _REGION_OP = "tl.region"
+_ACCESS_PTR_OP = "tl.access_ptr"
 _VF_HINTS = ("SIMD_VF", "SIMT_VF")
 _SCRATCH_SCOPE = "shared.dyn"
 _LEAF_TYPES = (tirx.IntImm, tirx.FloatImm, tirx.StringImm)
+# VMI widen admission (Task 2): every other legal static K uses the serial
+# signed fallback.
+_WIDEN_VMI_K = (2, 4, 8, 64)
+_WIDEN_VL = 64
 
 
 def _op_name(node):
@@ -365,6 +377,184 @@ def _emit_serial_widen(src_buf, src_index, scratch, extent: int):
     )
 
 
+def _vmi(op_tail: str, dtype, args, annotations=None):
+    return Call(dtype, tvm_ir.Op.get(f"tl.vmi.{op_tail}"), list(args), annotations or {})
+
+
+def _element_ptr(buf, index, extent, rw_mask):
+    """``tl.access_ptr`` over one buffer element; *extent* counts elements."""
+    load = BufferLoad(buf, [index])
+    return Call(
+        "handle",
+        tvm_ir.Op.get(_ACCESS_PTR_OP),
+        [load, tirx.const(int(extent), "int32"), tirx.const(rw_mask, "int32")],
+    )
+
+
+def _emit_vmi_widen(src_buf, src_index, scratch, extent, pending_allocs):
+    """Signed widen via ``vcmps``/``vsel`` + ``vintlv`` (admission {2,4,8,64}).
+
+    The high int32 half is 0 or -1 selected from ``lo < 0`` (sext; no zext
+    proof is attempted).  K < 64 first materialises a compiler-owned 64-element
+    pad through two split loops -- a copy loop over ``[0, K)`` that only reads
+    valid source elements, then a zero fill over ``[K, 64)`` -- so no
+    out-of-range load is ever guarded by a ``Select``.  The interleaved halves
+    are stored through an int32 view of the int64 scratch (no si64 VReg);
+    K = 64 writes 128 halves via two stores and exercises both ``vintlv``
+    outputs.
+    """
+    n = extent
+    vl = _WIDEN_VL
+    vec_dt = f"int32x{vl}"
+    mask_dt = f"boolx{vl}"
+    size_ann = {"size": tirx.const(vl, "int32")}
+
+    scratch_i32 = tirx.decl_buffer(
+        [2 * n],
+        dtype="int32",
+        name=f"{scratch.name}_i32view",
+        data=scratch.data,
+        scope=_SCRATCH_SCOPE,
+    )
+
+    pad = None
+    if n < vl:
+        pad = tirx.decl_buffer(
+            [vl],
+            dtype=src_buf.dtype,
+            name=f"{src_buf.name}_widen_pad",
+            scope=_SCRATCH_SCOPE,
+        )
+        pending_allocs.append(pad)
+
+    steps = []
+    steps.append(
+        ("mask", lambda e: _vmi("create_mask", mask_dt, [tirx.const(vl, "int32")], size_ann))
+    )
+    if pad is None:
+        steps.append(("src_ptr", lambda e: _element_ptr(src_buf, src_index, vl, 1)))
+    else:
+        steps.append(("src_ptr", lambda e: _element_ptr(pad, tirx.const(0, "int32"), vl, 1)))
+    steps.append(
+        ("lo", lambda e: _vmi("vload", vec_dt, [e["src_ptr"], tirx.const(0, "int32")], size_ann))
+    )
+    steps.append(
+        (
+            "cmp",
+            lambda e: _vmi(
+                "vcmps",
+                mask_dt,
+                [e["lo"], tirx.const(0, "int32"), e["mask"], tirx.StringImm("lt")],
+            ),
+        )
+    )
+    steps.append(("ones", lambda e: _vmi("vbrc", vec_dt, [tirx.const(-1, "int32")], size_ann)))
+    steps.append(("zeros", lambda e: _vmi("vbrc", vec_dt, [tirx.const(0, "int32")], size_ann)))
+    steps.append(("hi", lambda e: _vmi("vsel", vec_dt, [e["cmp"], e["ones"], e["zeros"]])))
+    steps.append(("pair", lambda e: _vmi("vintlv", vec_dt, [e["lo"], e["hi"], e["mask"]])))
+    steps.append(("a0", lambda e: _vmi("pair_get", vec_dt, [e["pair"], tirx.const(0, "int32")])))
+    steps.append(("a1", lambda e: _vmi("pair_get", vec_dt, [e["pair"], tirx.const(1, "int32")])))
+    store_lanes = 2 * n
+    steps.append(
+        (
+            "store_mask",
+            lambda e: _vmi(
+                "create_mask",
+                mask_dt,
+                [tirx.const(min(store_lanes, vl), "int32")],
+                size_ann,
+            ),
+        )
+    )
+    steps.append(
+        ("dst_ptr0", lambda e: _element_ptr(scratch_i32, tirx.const(0, "int32"), min(store_lanes, vl), 2))
+    )
+    if store_lanes > vl:
+        steps.append(
+            (
+                "store_mask1",
+                lambda e: _vmi(
+                    "create_mask",
+                    mask_dt,
+                    [tirx.const(store_lanes - vl, "int32")],
+                    size_ann,
+                ),
+            )
+        )
+        steps.append(
+            ("dst_ptr1", lambda e: _element_ptr(scratch_i32, tirx.const(vl, "int32"), store_lanes - vl, 2))
+        )
+
+    env_vars = {}
+
+    class _Env:
+        def __getitem__(self, key):
+            return env_vars[key]
+
+    fake = _Env()
+    computed = []
+    for name, maker in steps:
+        val = maker(fake)
+        var = tirx.Var(name, val.dtype)
+        env_vars[name] = var
+        computed.append((var, val))
+
+    stmts = [Bind(var, val) for var, val in computed]
+    stmts.append(
+        Evaluate(
+            _vmi(
+                "vstore",
+                "void",
+                [
+                    env_vars["a0"],
+                    env_vars["dst_ptr0"],
+                    tirx.const(0, "int32"),
+                    env_vars["store_mask"],
+                ],
+            )
+        )
+    )
+    if store_lanes > vl:
+        stmts.append(
+            Evaluate(
+                _vmi(
+                    "vstore",
+                    "void",
+                    [
+                        env_vars["a1"],
+                        env_vars["dst_ptr1"],
+                        tirx.const(0, "int32"),
+                        env_vars["store_mask1"],
+                    ],
+                )
+            )
+        )
+
+    prefix = []
+    if pad is not None:
+        i = tirx.Var("widen_pad_i", "int32")
+        prefix.append(
+            For(
+                i,
+                tirx.const(0, "int32"),
+                tirx.const(n, "int32"),
+                ForKind.SERIAL,
+                BufferStore(pad, BufferLoad(src_buf, [src_index + i]), [i]),
+            )
+        )
+        z = tirx.Var("widen_zero_i", "int32")
+        prefix.append(
+            For(
+                z,
+                tirx.const(n, "int32"),
+                tirx.const(vl - n, "int32"),
+                ForKind.SERIAL,
+                BufferStore(pad, tirx.const(0, "int32"), [z]),
+            )
+        )
+    return SeqStmt(prefix + stmts)
+
+
 def _rewrite_copy(value, state):
     if not (isinstance(value, Call) and _op_name(value) == _COPY_OP):
         return None
@@ -427,7 +617,13 @@ def _rewrite_copy(value, state):
     )
     state["alloc"][-1].append(scratch)
 
-    widen = _emit_serial_widen(src_buf, src_load.indices[0], scratch, src_k)
+    use_vmi = src_k in _WIDEN_VMI_K
+    if use_vmi:
+        widen = _emit_vmi_widen(
+            src_buf, src_load.indices[0], scratch, src_k, state["alloc"][-1]
+        )
+    else:
+        widen = _emit_serial_widen(src_buf, src_load.indices[0], scratch, src_k)
     vf = SBlock(
         [],
         [BufferRegion(src_buf, [tvm_ir.Range.from_min_extent(src_load.indices[0], src_ext[0])])],
@@ -437,7 +633,10 @@ def _rewrite_copy(value, state):
         None,
         [],
         [],
-        {"tl.simdvf_lanes": tirx.const(128, "int64")},
+        {
+            "tl.simdvf_lanes": tirx.const(128, "int64"),
+            "tl.widen_vmi": tirx.const(1 if use_vmi else 0, "int32"),
+        },
     )
 
     scratch_load = BufferLoad(scratch, [tirx.const(0, "int32")])
