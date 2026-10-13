@@ -91,6 +91,13 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     # emitted ops.
     mod = ascend_transform.InsertNd2Nz()(mod)
 
+    if target_is_pto(target):
+        # The widening i32 UB -> i64 GM copies the Ascend frontend emits
+        # (TopK index ABI) must be expanded into a bare SIMD_VF widen plus a
+        # same-dtype ascend_copy before VFChecker rejects the dtype-mismatched
+        # DMA ("DMA copies cannot perform type casting").
+        mod = ascend_transform.ExpandDtypeMismatchedCopy()(mod)
+
     # Run VFChecker after InsertNd2Nz: the UB->L1 copies it would otherwise
     # reject (e.g. casting copies) are by now rewritten into a SIMD_VF scatter.
     tilelang.ascend.analysis.VFChecker()(mod)

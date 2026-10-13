@@ -53,6 +53,7 @@ _PTO_PARALLEL_PASSES = (
 )
 _ASCENDC_SIMDVF_PASS = "tl.AscendSimdVFLowerParallel"
 _SLOT_STORAGE_PASS = "PlanPtoSlotStorage"
+_PTO_EXPAND_COPY_PASS = "tl.ExpandDtypeMismatchedCopy"
 
 
 class _PassRecorder(PassEventObserver):
@@ -222,6 +223,26 @@ def test_pto_handwritten_vmi_without_parallel_is_accepted():
     for pass_name in _PTO_PARALLEL_PASSES:
         assert pass_name in names, f"{pass_name} missing on the PTO route; tail: {names[-12:]}"
     _maybe_dump_artifacts("pto-handwritten-vmi", names, artifact)
+
+
+@pytest.mark.pto
+def test_pto_runs_expand_dtype_mismatched_copy_after_nd2nz():
+    artifact, names = _lower_with_trace(_simdvf_parallel_kernel(), "pto")
+    assert "tl.InsertNd2Nz" in names and _PTO_EXPAND_COPY_PASS in names, (
+        f"the PTO route must run {_PTO_EXPAND_COPY_PASS} after InsertNd2Nz; tail: {names[-12:]}"
+    )
+    assert names.index("tl.InsertNd2Nz") < names.index(_PTO_EXPAND_COPY_PASS), (
+        "ExpandDtypeMismatchedCopy must run after InsertNd2Nz so VFChecker sees the expanded copy"
+    )
+    _maybe_dump_artifacts("pto-expand-dtype-copy-order", names, artifact)
+
+
+def test_ascendc_route_does_not_run_expand_dtype_mismatched_copy():
+    artifact, names = _lower_with_trace(_simdvf_parallel_kernel(), "ascend")
+    assert _PTO_EXPAND_COPY_PASS not in names, (
+        "the AscendC route must not run the PTO dtype-mismatched copy expansion"
+    )
+    _maybe_dump_artifacts("ascendc-expand-dtype-copy-absence", names, artifact)
 
 
 @pytest.mark.pto

@@ -4,6 +4,7 @@
 from tilelang.transform import _ffi_api
 
 from . import z3_scheduler  # noqa: F401
+from .expand_dtype_mismatched_copy import ExpandDtypeMismatchedCopy  # noqa: F401
 
 
 def InsertNd2Nz():
