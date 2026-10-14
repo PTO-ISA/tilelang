@@ -323,13 +323,12 @@ TVM_DLL const Op &device_assert_with_msg();
 //
 // ABI notes:
 // - The TIR positional operands only carry dataflow values such as
-//   ptr/offset/values/mask. Python keyword-only API parameters like size,
-//   to_dtype, dist_mode, group, pmode, and order are lowered as call
-//   annotations instead of extra positional operands.
-// - vload(ptr, offset) with annotations {size, to_dtype?, stride?,
-//   block_stride?, repeat_stride?, dist_mode?, group?}
-// - vstore(values, destination_ptr, offset, mask?) with annotations
-//   {stride?, block_stride?, repeat_stride?, dist_mode?, group?, pmode?}
+//   ptr/offset/values/mask. Python keyword-only API parameters such as size,
+//   group, pmode, and order are lowered as call annotations instead of extra
+//   positional operands.
+// - vload(ptr, offset) with annotations {size, stride?, block_stride?, group?}
+// - vstore(value, destination_ptr, offset, mask?) with annotations
+//   {stride?, block_stride?, group?}
 // - create_mask(active_lanes) with annotations {size, group?}
 // - vci(base) with annotations {size, order?}
 // - vbrc(value) with annotations {size, group?}

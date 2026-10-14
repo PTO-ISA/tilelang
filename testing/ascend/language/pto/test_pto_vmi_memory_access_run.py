@@ -672,40 +672,6 @@ def test_cross_row_descriptor_20_trials(npu):
 
 
 # ---------------------------------------------------------------------------
-# Ordinary broadcast: one-element descriptor fed by a real DMA producer
-# ---------------------------------------------------------------------------
-def _broadcast_descriptor_kernel():
-    @T.prim_func
-    def main(A: T.Tensor((256,), F32), C: T.Tensor((128,), F32)):
-        with T.Kernel(1):
-            work = T.alloc_shared((2, 128), F32)
-            out = T.alloc_shared((128,), F32)
-            T.copy(A, work)
-            with T.SimdVF():
-                v = T.vmi.vload(work[0, 64], size=128, dist_mode="brc")
-                T.vmi.vstore(v, out[0])
-            T.copy(out, C)
-
-    return main
-
-
-def test_broadcast_descriptor_20_trials(npu):
-    kernel, source = _compile(_broadcast_descriptor_kernel())
-    assert 'dist_mode="brc"' in source, source
-    _assert_mte2_to_v_then_load(
-        source.splitlines(),
-        lambda line: "mte_gm_ub" in line,
-        "size=128)",
-    )
-
-    def make_case(trial):
-        a = _float_inputs((256,), trial)
-        return [a], a[64].reshape(1).expand(128).clone()
-
-    _run_trials(kernel, make_case, npu, trials=20)
-
-
-# ---------------------------------------------------------------------------
 # Gather / scatter with non-zero direct and explicit-pointer bases
 # ---------------------------------------------------------------------------
 def _gather_kernel(explicit_pointer):
