@@ -5187,17 +5187,6 @@ CodeGenTileLangPTO::PtoValueKind CodeGenTileLangPTO::ClassifyVmiCallResult_(
     return PtoValueKind::kVmiPair;
   }
   if (name == "tl.vmi.vload") {
-    // vload is data unless the explicit dist_mode=dintlv annotation selects
-    // the pair-returning form.
-    auto it = op->annotations.find("dist_mode");
-    if (it != op->annotations.end()) {
-      const auto *mode = (*it).second.as<StringImmNode>();
-      ICHECK(mode != nullptr)
-          << "tl.vmi.vload dist_mode annotation must be a string";
-      if (mode->value == "dintlv") {
-        return PtoValueKind::kVmiPair;
-      }
-    }
     return PtoValueKind::kVmiData;
   }
   if (name == "tl.vmi.pair_get") {
@@ -5538,34 +5527,6 @@ void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
     print_ptr_with_offset(op->args[1], op->args[2]);
     os << ", " << PrintExpr_(op->args[3]) << ", " << PrintExpr_(op->args[4]);
     needs_comma = true;
-  } else if (op_name == "tl.vmi.vstore") {
-    auto dist_mode_it = op->annotations.find("dist_mode");
-    ObjectRef dist_mode = dist_mode_it != op->annotations.end()
-                              ? (*dist_mode_it).second
-                              : ObjectRef();
-    const bool is_dintlv_store =
-        dist_mode.defined() && dist_mode.as<StringImmNode>() != nullptr &&
-        Downcast<StringImm>(dist_mode)->value == "dintlv";
-    if (is_dintlv_store) {
-      ICHECK_GE(op->args.size(), 4U)
-          << op_name
-          << " with dist_mode=dintlv expects (even, odd, ptr, offset[, mask])";
-      os << "(" << PrintExpr_(op->args[0]) << ", " << PrintExpr_(op->args[1])
-         << ")";
-      for (size_t i = 2; i < op->args.size(); ++i) {
-        os << ", " << PrintExpr_(op->args[i]);
-      }
-      needs_comma = true;
-    } else {
-      for (size_t i = 0; i < op->args.size(); ++i) {
-        const PrimExpr &arg = op->args[i];
-        if (needs_comma) {
-          os << ", ";
-        }
-        os << PrintExpr_(arg);
-        needs_comma = true;
-      }
-    }
   } else {
     for (size_t i = 0; i < op->args.size(); ++i) {
       const PrimExpr &arg = op->args[i];
@@ -5614,14 +5575,7 @@ void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
       os << ", ";
     }
     os << key << "=";
-    if (op_name == "tl.vmi.vstore" && key == "dist_mode") {
-      // TileLang uses "dintlv" for two-input stores; PTODSL uses "intlv".
-      // Load operations keep "dintlv". Map the store mode only at emission;
-      // tuple recognition above uses the original annotation.
-      const auto *mode = value.as<StringImmNode>();
-      ICHECK(mode != nullptr) << "tl.vmi.vstore dist_mode must be a string";
-      os << "\"" << (mode->value == "dintlv" ? "intlv" : mode->value) << "\"";
-    } else if (op_name == "tl.vmi.vcvt" && key == "to_dtype" &&
+    if (op_name == "tl.vmi.vcvt" && key == "to_dtype" &&
                op->dtype.is_int()) {
       os << PtoSignedIntegerTypeName(op->dtype.element_of());
     } else if (op_name == "tl.vmi.vload" && key == "size" &&
