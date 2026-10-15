@@ -216,6 +216,13 @@ protected:
    */
   bool HandleTypeMatch_(const VarNode *buf_var, DataType t) const;
 
+  /*!
+   * \brief Return the registered data type for buf_var, or fallback if absent.
+   * \param buf_var The buffer variable.
+   * \param fallback The type to use when buf_var has no registered handle type.
+   */
+  DataType GetHandleType_(const VarNode *buf_var, DataType fallback) const;
+
 protected:
   /*! \brief the storage scope of allocation */
   std::unordered_map<const VarNode *, std::string> alloc_storage_scope_;

@@ -2985,6 +2985,15 @@ std::string CodeGenTileLangPTO::GetAscendCopyGmUbExpr_(const CallNode *op) {
                    &dst_index, &dst_dtype, &dst_scope);
   GetCopyEndpoint_(op->args[1], "PTO GM->UB MTE source", &src_var, &src_index,
                    &src_dtype, &src_scope);
+  auto effective_ptr_dtype = [&](const VarNode *var, const std::string &scope,
+                                 DataType fallback) {
+    return (scope.empty() || scope == "global") ? GetHandleType_(var, fallback)
+                                                : fallback;
+  };
+  const DataType dst_ptr_dtype =
+      effective_ptr_dtype(dst_var, dst_scope, dst_dtype);
+  const DataType src_ptr_dtype =
+      effective_ptr_dtype(src_var, src_scope, src_dtype);
   ICHECK(dst_scope == "shared" || dst_scope == "shared.dyn")
       << "PTO GM->UB MTE destination must use shared/shared.dyn (UB) "
          "storage, got scope `"
@@ -2992,15 +3001,18 @@ std::string CodeGenTileLangPTO::GetAscendCopyGmUbExpr_(const CallNode *op) {
   ICHECK(src_scope.empty() || src_scope == "global")
       << "PTO GM->UB MTE source must use global (GM) storage, got scope `"
       << src_scope << "`";
-  ICHECK(IsStorageDtypeCompatible(dst_dtype, src_dtype))
-      << "PTO GM->UB MTE does not support dtype conversion: source is "
-      << src_dtype << ", destination is " << dst_dtype;
 
   int64_t data_select = 0;
   ICHECK(TryGetConstInt(op->args[7], &data_select) &&
          (data_select == 0 || data_select == 1))
       << "PTO GM->UB MTE requires dataSelect to be the constant 0 or 1, got "
       << op->args[7];
+  if (data_select != 0) {
+    ICHECK(IsStorageDtypeCompatible(dst_ptr_dtype, src_ptr_dtype))
+        << "PTO GM->UB MTE with padding does not support dtype conversion: "
+        << "source is " << src_ptr_dtype << ", destination is "
+        << dst_ptr_dtype;
+  }
   std::string left_padding =
       RemoveOutermostParentheses(PrintExpr_(op->args[5]));
   std::string right_padding =
@@ -3023,20 +3035,17 @@ std::string CodeGenTileLangPTO::GetAscendCopyGmUbExpr_(const CallNode *op) {
       << "PTO GM->UB MTE l2_cache_ctl must be in [0, 15], got "
       << l2_cache_ctrl;
 
-  std::string dst = current_function_is_cube_
-                        ? GetLocalPtrExpr(op->args[0], "ub", dst_dtype)
-                        : RemoveOutermostParentheses(PrintExpr_(op->args[0]));
-  std::string src = RemoveOutermostParentheses(PrintExpr_(op->args[1]));
-  // Match the Ascend target's no-padding GM->UB behavior, which emits uint8_t
-  // pointers when no padding is requested
-  if (data_select == 0) {
-    if (src_dtype != DataType::UInt(8)) {
-      src = "pto.castptr(" + src + ", pto.ptr(pto.ui8, \"gm\"))";
-    }
-    if (dst_dtype != DataType::UInt(8)) {
-      dst = "pto.castptr(" + dst + ", pto.ptr(pto.ui8, \"ub\"))";
-    }
+  DataType copy_dtype = dst_ptr_dtype;
+  if (data_select == 0 && PhysicalElementBits(src_ptr_dtype) !=
+                              PhysicalElementBits(dst_ptr_dtype)) {
+    copy_dtype = DataType::UInt(8);
   }
+  std::string dst =
+      GetAscendCopyPtrExpr_(op->args[0], dst_var, dst_index, dst_dtype,
+                            copy_dtype, "ub", "PTO GM->UB MTE destination");
+  std::string src =
+      GetAscendCopyPtrExpr_(op->args[1], src_var, src_index, src_dtype,
+                            copy_dtype, "gm", "PTO GM->UB MTE source");
   std::string burst_num = RemoveOutermostParentheses(PrintExpr_(op->args[3]));
   std::string burst_len = RemoveOutermostParentheses(PrintExpr_(op->args[4]));
   std::string src_stride = RemoveOutermostParentheses(PrintExpr_(op->args[9]));
@@ -3087,6 +3096,15 @@ std::string CodeGenTileLangPTO::GetAscendCopyUbGmExpr_(const CallNode *op) {
                    &dst_index, &dst_dtype, &dst_scope);
   GetCopyEndpoint_(op->args[1], "PTO UB->GM MTE source", &src_var, &src_index,
                    &src_dtype, &src_scope);
+  auto effective_ptr_dtype = [&](const VarNode *var, const std::string &scope,
+                                 DataType fallback) {
+    return (scope.empty() || scope == "global") ? GetHandleType_(var, fallback)
+                                                : fallback;
+  };
+  const DataType dst_ptr_dtype =
+      effective_ptr_dtype(dst_var, dst_scope, dst_dtype);
+  const DataType src_ptr_dtype =
+      effective_ptr_dtype(src_var, src_scope, src_dtype);
   ICHECK(dst_scope.empty() || dst_scope == "global")
       << "PTO UB->GM MTE destination must use global (GM) storage, got scope `"
       << dst_scope << "`";
@@ -3094,17 +3112,21 @@ std::string CodeGenTileLangPTO::GetAscendCopyUbGmExpr_(const CallNode *op) {
       << "PTO UB->GM MTE source must use shared/shared.dyn (UB) storage, got "
          "scope `"
       << src_scope << "`";
-  ICHECK(IsStorageDtypeCompatible(dst_dtype, src_dtype))
-      << "PTO UB->GM MTE does not support dtype conversion: source is "
-      << src_dtype << ", destination is " << dst_dtype;
   ValidateUBCopyLayout_(src_index, src_dtype, op->args[3], op->args[4],
                         op->args[7], make_zero(DataType::Int(32)),
                         make_zero(DataType::Int(32)), false,
                         "PTO UB->GM MTE source");
-  std::string dst = RemoveOutermostParentheses(PrintExpr_(op->args[0]));
-  std::string src = current_function_is_cube_
-                        ? GetLocalPtrExpr(op->args[1], "ub", src_dtype)
-                        : RemoveOutermostParentheses(PrintExpr_(op->args[1]));
+  DataType copy_dtype = dst_ptr_dtype;
+  if (PhysicalElementBits(src_ptr_dtype) !=
+      PhysicalElementBits(dst_ptr_dtype)) {
+    copy_dtype = DataType::UInt(8);
+  }
+  std::string dst =
+      GetAscendCopyPtrExpr_(op->args[0], dst_var, dst_index, dst_dtype,
+                            copy_dtype, "gm", "PTO UB->GM MTE destination");
+  std::string src =
+      GetAscendCopyPtrExpr_(op->args[1], src_var, src_index, src_dtype,
+                            copy_dtype, "ub", "PTO UB->GM MTE source");
   std::string burst_num = RemoveOutermostParentheses(PrintExpr_(op->args[3]));
   std::string burst_len = RemoveOutermostParentheses(PrintExpr_(op->args[4]));
   std::string l2_cache = StoreL2CacheName(op->args[5]);
@@ -3226,6 +3248,39 @@ void CodeGenTileLangPTO::GetCopyEndpoint_(const PrimExpr &expr,
   if (*scope == "gm") {
     *scope = "global";
   }
+}
+
+std::string CodeGenTileLangPTO::GetAscendCopyPtrExpr_(
+    const PrimExpr &expr, const VarNode *buffer_var, const PrimExpr &index,
+    DataType access_dtype, DataType copy_dtype, const std::string &space,
+    const char *context) {
+  if (space == "ub" && current_function_is_cube_) {
+    return GetLocalPtrExpr(expr, space, copy_dtype);
+  }
+
+  if (copy_dtype != DataType::UInt(8)) {
+    std::string ptr = RemoveOutermostParentheses(PrintExpr_(expr));
+    if (access_dtype != copy_dtype) {
+      ptr = "pto.castptr(" + ptr + ", " + PointerTypeName(copy_dtype, space) +
+            ")";
+    }
+    return ptr;
+  }
+
+  std::string ptr = GetVarID(buffer_var);
+  if (GetHandleType_(buffer_var, access_dtype) != copy_dtype) {
+    ptr =
+        "pto.castptr(" + ptr + ", " + PointerTypeName(copy_dtype, space) + ")";
+  }
+  if (is_zero(index)) {
+    return ptr;
+  }
+
+  arith::Analyzer analyzer;
+  PrimExpr byte_offset =
+      ElementIndexToByteOffsetExpr(index, access_dtype, context, &analyzer);
+  return "pto.addptr(" + ptr + ", " +
+         RemoveOutermostParentheses(PrintExpr_(byte_offset)) + ")";
 }
 
 void CodeGenTileLangPTO::ValidateUBCopyLayout_(
@@ -5575,8 +5630,7 @@ void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
       os << ", ";
     }
     os << key << "=";
-    if (op_name == "tl.vmi.vcvt" && key == "to_dtype" &&
-               op->dtype.is_int()) {
+    if (op_name == "tl.vmi.vcvt" && key == "to_dtype" && op->dtype.is_int()) {
       os << PtoSignedIntegerTypeName(op->dtype.element_of());
     } else if (op_name == "tl.vmi.vload" && key == "size" &&
                op->dtype.element_of().is_float4_e2m1fn()) {
