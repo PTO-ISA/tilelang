@@ -447,31 +447,23 @@ def test_pto_fp4_multidim_bufferload_uses_packed_linear_offset():
     [
         (
             lambda value, mask: T.vmi.vload(value, size=16, dist_mode="invalid"),
-            "does not support dist_mode",
+            "dist_mode",
         ),
         (
             lambda value, mask: T.vmi.vload(value, size=16, to_dtype="float32"),
             "to_dtype",
         ),
         (
-            lambda value, mask: T.vmi.vload(value, size=16, dist_mode="unpack"),
-            "requires to_dtype",
-        ),
-        (
-            lambda value, mask: T.vmi.vload(value, size=16, dist_mode="unpack", to_dtype="float16"),
-            "unpack must widen",
-        ),
-        (
-            lambda value, mask: T.vmi.vload(value, size=16, dist_mode="continuous", group=2, stride=1),
-            "dist_mode together with group",
+            lambda value, mask: T.vmi.vload(value, size=16, group=2, stride=1, block_stride=8),
+            "block_stride together with group",
         ),
         (
             lambda value, mask: T.vmi.vload(value, size=16, group=2),
             "requires stride",
         ),
         (
-            lambda value, mask: T.vmi.vload(value, size=16, block_stride=1),
-            "requires block_stride and repeat_stride together",
+            lambda value, mask: T.vmi.vload(value, size=16, block_stride=1, stride=1),
+            "does not allow stride together with block_stride",
         ),
         (
             lambda value, mask: T.vmi.vload(value, size=16, stride=1),
@@ -483,7 +475,7 @@ def test_pto_fp4_multidim_bufferload_uses_packed_linear_offset():
         ),
         (
             lambda value, mask: T.vmi.vstore(value, value, mask=mask, dist_mode="dintlv"),
-            "requires an \\(even, odd\\) pair",
+            "dist_mode",
         ),
         (
             lambda value, mask: T.vmi.vstore(T.vmi.VmiPair(value), value, mask=mask),
@@ -495,7 +487,7 @@ def test_pto_fp4_multidim_bufferload_uses_packed_linear_offset():
         ),
         (
             lambda value, mask: T.vmi.vstore(value, value, mask=mask, dist_mode="brc"),
-            "does not support dist_mode",
+            "dist_mode",
         ),
         (
             lambda value, mask: T.vmi.vcvt(value, "float16", mask=mask),
@@ -918,7 +910,7 @@ def test_pto_pair_unpacks_and_indexes_once(monkeypatch):
 
 
 @pytest.mark.pto
-def test_pto_vload_dintlv_returns_pair(monkeypatch):
+def test_pto_vload_returns_single_vector(monkeypatch):
     calls = []
 
     monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
@@ -930,33 +922,20 @@ def test_pto_vload_dintlv_returns_pair(monkeypatch):
     )
     monkeypatch.setattr(
         T.vmi,
-        "_wrap_pair",
-        lambda pair: T.vmi.VmiPair(pair),
-    )
-    monkeypatch.setattr(
-        T.vmi,
         "access_ptr",
         lambda source, access_type, extent=None, offset=0: ("access_ptr", source, access_type, extent, offset),
-    )
-    monkeypatch.setattr(
-        T.vmi.tirx,
-        "call_intrin",
-        lambda dtype, op, *args, **kwargs: (
-            calls.append((dtype, getattr(op, "name", op), args)) or ("call", dtype, getattr(op, "name", op), args)
-        ),
     )
 
     source = SimpleNamespace(
         dtype="ptr",
         type_annotation=SimpleNamespace(element_type=SimpleNamespace(dtype="float32")),
     )
-    pair = T.vmi.vload(source, size=64, dist_mode="dintlv")
-    assert isinstance(pair, T.vmi.VmiPair)
-    assert calls[0][0] == "vload"
-    left, right = pair
-    assert left[2] == "tl.vmi.pair_get"
-    assert right[2] == "tl.vmi.pair_get"
-    assert pair[1][2] == "tl.vmi.pair_get"
+    value = T.vmi.vload(source, size=64)
+    assert value.dtype == "float32x64"
+    assert len(calls) == 1
+    assert calls[0][0:2] == ("vload", "float32x64")
+    assert calls[0][2][0] is source
+    assert set(calls[0][3]) == {"size", "stride", "block_stride", "group", "loc", "ip"}
 
 
 @pytest.mark.pto
@@ -966,10 +945,6 @@ def test_vmi_fp4_rejects_unsupported_paths(monkeypatch):
 
     with pytest.raises(ValueError, match="even FP4 lane count"):
         T.vmi.vload(fp4, size=255)
-    with pytest.raises(TypeError, match="does not unpack or convert packed FP4"):
-        T.vmi.vload(fp4, size=256, dist_mode="unpack", to_dtype="uint8")
-    with pytest.raises(TypeError, match='does not support packed FP4 with dist_mode="dintlv"'):
-        T.vmi.vload(fp4, size=256, dist_mode="dintlv")
     with pytest.raises(TypeError, match="does not support packed FP4 vectors"):
         T.vmi.vadd(fp4, fp4, SimpleNamespace(dtype="boolx256"))
     with pytest.raises(TypeError, match="does not support packed FP4 vectors"):
@@ -1041,17 +1016,6 @@ def test_vmi_fp4_vstore_requires_physical_mask_lanes(monkeypatch):
 
 
 @pytest.mark.pto
-def test_vmi_vstore_dintlv_rejects_mismatched_pair_types(monkeypatch):
-    monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
-    with pytest.raises(TypeError, match="requires identical VMI vector types"):
-        T.vmi.vstore(
-            (SimpleNamespace(dtype="float16x64"), SimpleNamespace(dtype="float16x32")),
-            SimpleNamespace(dtype="ptr"),
-            dist_mode="dintlv",
-        )
-
-
-@pytest.mark.pto
 def test_vmi_fp4_vload_keeps_logical_size_and_packs_offset(monkeypatch):
     calls = []
     monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
@@ -1069,11 +1033,8 @@ def test_vmi_fp4_vload_keeps_logical_size_and_packs_offset(monkeypatch):
         (fp4_ptr, 128),
         {
             "size": 256,
-            "to_dtype": None,
             "stride": None,
             "block_stride": None,
-            "repeat_stride": None,
-            "dist_mode": None,
             "group": None,
             "loc": None,
             "ip": None,
@@ -1082,43 +1043,13 @@ def test_vmi_fp4_vload_keeps_logical_size_and_packs_offset(monkeypatch):
 
 
 @pytest.mark.pto
-def test_vmi_fp4_rejects_non_contiguous_modes(monkeypatch):
+def test_vmi_fp4_rejects_grouped_accesses(monkeypatch):
     monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
     fp4_ptr = SimpleNamespace(dtype="ptr", type_annotation=SimpleNamespace(element_type=SimpleNamespace(dtype="float4_e2m1fn")))
     with pytest.raises(TypeError, match="only supports contiguous packed FP4 loads"):
         T.vmi.vload(fp4_ptr, size=256, group=2, stride=128)
-    with pytest.raises(TypeError, match="only supports contiguous packed FP4 loads"):
-        T.vmi.vload(fp4_ptr, size=256, dist_mode="brc")
     with pytest.raises(TypeError, match="only supports contiguous packed FP4 stores"):
         T.vmi.vstore(SimpleNamespace(dtype="float4_e2m1fnx256"), fp4_ptr, group=2, stride=128)
-
-
-@pytest.mark.pto
-def test_pto_pair_return_path_can_be_reused_for_vstore(monkeypatch):
-    pair = T.vmi.VmiPair(SimpleNamespace(dtype="float32x64"))
-    calls = []
-
-    monkeypatch.setattr(T.vmi, "require_vmi_scope", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        T.vmi.tirx,
-        "call_intrin",
-        lambda dtype, op, *args, **kwargs: ("call", dtype, getattr(op, "name", op), args),
-    )
-    monkeypatch.setattr(
-        T.vmi, "_call_vmi", lambda op, result_dtype, *args, **kwargs: calls.append((op, result_dtype, args, kwargs)) or "ok"
-    )
-    monkeypatch.setattr(T.vmi, "_lanes_of", lambda value: 64)
-    monkeypatch.setattr(
-        T.vmi,
-        "access_ptr",
-        lambda source, access_type, extent=None, offset=0: ("access_ptr", source, access_type, extent, offset),
-    )
-
-    out = T.vmi.vstore(pair, SimpleNamespace(dtype="ptr"), mask=SimpleNamespace(dtype="pred"), dist_mode="dintlv")
-    assert out == "ok"
-    assert calls[-1][0] == "vstore"
-    assert calls[-1][2][0][2] == "tl.vmi.pair_get"
-    assert calls[-1][2][1][2] == "tl.vmi.pair_get"
 
 
 @pytest.mark.pto
@@ -1236,27 +1167,6 @@ def test_pto_codegen_preserves_vmi_merge_mode():
     source = _lower_in_target(func, "pto").kernel_source
     assert "pto.vmi.vdiv(" in source
     assert 'pmode="merge"' in source
-
-
-@pytest.mark.pto
-def test_pto_codegen_keeps_dintlv_vstore_pair_grouped():
-    @T.prim_func
-    def func(A: T.Buffer((64,), "float32"), B: T.Buffer((64,), "float32")):
-        with T.Kernel(1) as _:
-            a_ub = T.alloc_shared((64,), "float32")
-            b_ub = T.alloc_shared((64,), "float32")
-            T.copy(A, a_ub)
-            with T.SimdVF():
-                mask = T.vmi.create_mask(64, size=64)
-                src = T.vmi.vload(a_ub[0], size=64)
-                interleaved = T.vmi.vintlv(src, src, mask)
-                T.vmi.vstore(interleaved, b_ub[0], mask, dist_mode="dintlv")
-            T.copy(b_ub, B)
-
-    source = _lower_in_target(func, "pto").kernel_source
-    vstore_line = next(line for line in source.splitlines() if "pto.vmi.vstore(" in line and 'dist_mode="dintlv"' in line)
-    assert re.search(r"pto\.vmi\.vstore\(\(\(.+\)\[0\], \(.+\)\[1\]\), ", vstore_line)
-    assert not re.search(r"pto\.vmi\.vstore\(\(.+\)\[0\], \(.+\)\[1\], ", vstore_line)
 
 
 @pytest.mark.pto

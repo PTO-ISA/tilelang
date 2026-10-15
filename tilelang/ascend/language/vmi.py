@@ -263,35 +263,21 @@ def _normalize_pto_vcvt_rounding(mode, *, context: str, allowed=None):
     return normalized
 
 
-def _validate_pto_load_modes(
+def _validate_pto_memory_modes(
     context: str,
     *,
-    dist_mode,
     group,
     stride,
     block_stride,
-    repeat_stride,
-    allow_group_brc: bool,
-    allowed_dist_modes,
 ):
-    if dist_mode is not None and dist_mode not in allowed_dist_modes:
-        expected = ", ".join(repr(mode) for mode in sorted(allowed_dist_modes, key=str))
-        raise TypeError(f"{context} does not support dist_mode={dist_mode!r}; expected one of {expected}")
-
     if group is not None:
-        if dist_mode is not None and (not allow_group_brc or dist_mode != "brc"):
-            raise TypeError(f"{context} does not allow dist_mode together with group")
-        if block_stride is not None or repeat_stride is not None:
+        if block_stride is not None:
             raise TypeError(f"{context} does not allow block_stride together with group")
         if stride is None:
             raise TypeError(f"{context} with group=... requires stride")
         return
 
-    if block_stride is not None or repeat_stride is not None:
-        if dist_mode is not None:
-            raise TypeError(f"{context} does not allow dist_mode together with block_stride")
-        if block_stride is None or repeat_stride is None:
-            raise TypeError(f"{context} requires block_stride and repeat_stride together")
+    if block_stride is not None:
         if stride is not None:
             raise TypeError(f"{context} does not allow stride together with block_stride")
         return
@@ -445,91 +431,54 @@ def vload(
     offset=None,
     *,
     size,
-    to_dtype=None,
     stride=None,
     block_stride=None,
-    repeat_stride=None,
-    dist_mode=None,
     group=None,
     loc=None,
     ip=None,
 ):
     """Load a VMI vector from either `a_ub[0]`-style buffer loads or ptr+offset form."""
-    _validate_pto_load_modes(
+    _validate_pto_memory_modes(
         "T.vmi.vload(...)",
-        dist_mode=dist_mode,
         group=group,
         stride=stride,
         block_stride=block_stride,
-        repeat_stride=repeat_stride,
-        allow_group_brc=True,
-        allowed_dist_modes={None, "continuous", "dintlv", "unpack", "brc"},
     )
     if size is None:
         raise TypeError("T.vmi.vload(...) requires size")
-    if to_dtype is not None and dist_mode != "unpack":
-        raise TypeError('T.vmi.vload(...) accepts to_dtype only when dist_mode="unpack"')
     source_elem = _require_address_element_dtype(source, context="T.vmi.vload(...)")
-    # Keep si*/ui* spelling for PTODSL annotations. Unpack vload itself is not
-    # legalized on the current VPTO path; this preserves a correct annotation
-    # if enabled later.
-    to_dtype_annot = None
     is_packed_fp4 = str(source_elem) == "float4_e2m1fn"
     if is_packed_fp4:
         if size % 2:
             raise ValueError("T.vmi.vload(...) requires an even FP4 lane count for packed FP4 storage")
-        if to_dtype is not None or dist_mode == "unpack":
-            raise TypeError("T.vmi.vload(...) does not unpack or convert packed FP4 source vectors")
-        if dist_mode == "dintlv":
-            raise TypeError('T.vmi.vload(...) does not support packed FP4 with dist_mode="dintlv"')
-        if group is not None or block_stride is not None or repeat_stride is not None or dist_mode == "brc":
+        if group is not None or block_stride is not None:
             raise TypeError("T.vmi.vload(...) only supports contiguous packed FP4 loads")
-    if dist_mode == "unpack":
-        if to_dtype is None:
-            raise TypeError('T.vmi.vload(...) requires to_dtype when dist_mode="unpack"')
-        to_dtype_annot = _pto_to_dtype_annotation(to_dtype)
-        to_dtype = _scalar_dtype(to_dtype, context="T.vmi.vload(..., to_dtype=...)")
-        if getattr(to_dtype, "bits", None) != 2 * getattr(source_elem, "bits", None):
-            raise TypeError("T.vmi.vload(...) unpack must widen by exactly one step")
 
-    result_dtype = _vector_result_dtype(
-        source,
-        size,
-        elem_dtype=to_dtype if to_dtype is not None else source_elem,
-    )
+    result_dtype = _vector_result_dtype(source, size, elem_dtype=source_elem)
     ptr, extra_offset = _resolve_ptr_and_offset(source, offset, access_type="r", extent=size)
     if is_packed_fp4:
         extra_offset = _pack_fp4_element_offset(extra_offset, context="T.vmi.vload(...)")
     attrs = {
         "size": size,
-        "to_dtype": to_dtype_annot,
         "stride": stride,
         "block_stride": block_stride,
-        "repeat_stride": repeat_stride,
-        "dist_mode": dist_mode,
         "group": group,
         "loc": loc,
         "ip": ip,
     }
-    call = _call_vmi("vload", result_dtype, ptr, extra_offset, **attrs)
-    if dist_mode == "dintlv":
-        return _wrap_pair(call)
-    return call
+    return _call_vmi("vload", result_dtype, ptr, extra_offset, **attrs)
 
 
 @_scope_guarded
 def vstore(
-    values,
+    value,
     destination,
     offset=None,
     mask=None,
     *,
     stride=None,
     block_stride=None,
-    repeat_stride=None,
-    dist_mode=None,
     group=None,
-    pmode=None,
     loc=None,
     ip=None,
 ):
@@ -537,41 +486,24 @@ def vstore(
     if mask is None and _looks_like_mask(offset):
         mask = offset
         offset = None
-    _validate_pto_load_modes(
+    _validate_pto_memory_modes(
         "T.vmi.vstore(...)",
-        dist_mode=dist_mode,
         group=group,
         stride=stride,
         block_stride=block_stride,
-        repeat_stride=repeat_stride,
-        allow_group_brc=False,
-        allowed_dist_modes={None, "continuous", "dintlv"},
     )
     if group is not None and mask is not None:
         raise TypeError("T.vmi.vstore(...) group mode does not take a mask operand")
-    value_dtype = None
-    if dist_mode == "dintlv":
-        if isinstance(values, VmiPair):
-            value_dtype = _element_dtype_of(values)
-            values = tuple(values)
-        elif not _is_sequence(values) or len(values) != 2:
-            raise TypeError('T.vmi.vstore(...) with dist_mode="dintlv" requires an (even, odd) pair')
-        else:
-            _require_same_vreg_type(values[0], values[1], context="T.vmi.vstore(...)", allow_packed_fp4=True)
-    elif isinstance(values, VmiPair) or _is_sequence(values):
-        raise TypeError('T.vmi.vstore(...) expects a single VMI vector unless dist_mode="dintlv"')
+    if isinstance(value, VmiPair) or _is_sequence(value):
+        raise TypeError("T.vmi.vstore(...) expects a single VMI vector; store each result separately")
 
-    store_extent = _lanes_of(values[0]) if _is_sequence(values) else _lanes_of(values)
+    store_extent = _lanes_of(value)
     ptr, extra_offset = _resolve_ptr_and_offset(destination, offset, access_type="w", extent=store_extent)
-    value_args = list(values) if _is_sequence(values) else [values]
-    if value_dtype is None:
-        value_dtype = _element_dtype_of(values[0]) if _is_sequence(values) else _element_dtype_of(values)
+    value_dtype = _element_dtype_of(value)
     if str(value_dtype) == "float4_e2m1fn":
         if store_extent % 2:
             raise ValueError("T.vmi.vstore(...) requires an even FP4 lane count for packed FP4 storage")
-        if dist_mode == "dintlv":
-            raise TypeError('T.vmi.vstore(...) does not support packed FP4 with dist_mode="dintlv"')
-        if group is not None or block_stride is not None or repeat_stride is not None:
+        if group is not None or block_stride is not None:
             raise TypeError("T.vmi.vstore(...) only supports contiguous packed FP4 stores")
         extra_offset = _pack_fp4_element_offset(extra_offset, context="T.vmi.vstore(...)")
         if mask is not None:
@@ -590,16 +522,13 @@ def vstore(
     return _call_vmi(
         "vstore",
         "void",
-        *value_args,
+        value,
         ptr,
         extra_offset,
         mask,
         stride=stride,
         block_stride=block_stride,
-        repeat_stride=repeat_stride,
-        dist_mode=dist_mode,
         group=group,
-        pmode=pmode,
         loc=loc,
         ip=ip,
     )

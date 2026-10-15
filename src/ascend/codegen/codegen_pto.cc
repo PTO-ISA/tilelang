@@ -3141,34 +3141,6 @@ void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
     print_ptr_with_offset(op->args[1], op->args[2]);
     os << ", " << PrintExpr_(op->args[3]) << ", " << PrintExpr_(op->args[4]);
     needs_comma = true;
-  } else if (op_name == "tl.vmi.vstore") {
-    auto dist_mode_it = op->annotations.find("dist_mode");
-    ObjectRef dist_mode = dist_mode_it != op->annotations.end()
-                              ? (*dist_mode_it).second
-                              : ObjectRef();
-    const bool is_dintlv_store =
-        dist_mode.defined() && dist_mode.as<StringImmNode>() != nullptr &&
-        Downcast<StringImm>(dist_mode)->value == "dintlv";
-    if (is_dintlv_store) {
-      ICHECK_GE(op->args.size(), 4U)
-          << op_name
-          << " with dist_mode=dintlv expects (even, odd, ptr, offset[, mask])";
-      os << "(" << PrintExpr_(op->args[0]) << ", " << PrintExpr_(op->args[1])
-         << ")";
-      for (size_t i = 2; i < op->args.size(); ++i) {
-        os << ", " << PrintExpr_(op->args[i]);
-      }
-      needs_comma = true;
-    } else {
-      for (size_t i = 0; i < op->args.size(); ++i) {
-        const PrimExpr &arg = op->args[i];
-        if (needs_comma) {
-          os << ", ";
-        }
-        os << PrintExpr_(arg);
-        needs_comma = true;
-      }
-    }
   } else {
     for (size_t i = 0; i < op->args.size(); ++i) {
       const PrimExpr &arg = op->args[i];
