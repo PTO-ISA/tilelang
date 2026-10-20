@@ -134,6 +134,50 @@ def AscendSimdVFLowerParallel():
     return _ffi_api.AscendSimdVFLowerParallel()  # type: ignore
 
 
+def VerifyParallelToPTO():
+    """Read-only verification of the PTO Parallel input contract.
+
+    Runs on the PTO target only: SIMD_VF blocks whose T.Parallel units fall
+    outside the supported mapping contract are rejected, while functions
+    without a PTO target pass through unchanged.
+    """
+    return _ffi_api.VerifyParallelToPTO()  # type: ignore
+
+
+def LegalizeParallelToPTO():
+    """Placeholder for the PTO Parallel legalization stage.
+
+    Only the registration exists for now, so that the formal PTO pipeline
+    order is fixed; the safe scalar If/Select/Min/Max rewrites are left to
+    a later change. The placeholder preserves the input IR and rejects
+    nothing.
+    """
+    return _ffi_api.LegalizeParallelToPTO()  # type: ignore
+
+
+def VerifyPTOCodegenLegality():
+    """Verify PTO requirements before code generation without modifying IR.
+
+    Consumes the final device TIR after LowerDeviceKernelLaunch and the final
+    layout and UB rewrites. Currently checks destination alignment for
+    default/continuous explicit-mask VMI stores of b8/b16/b32 data: 32 bytes
+    for ordinary stores, or natural element alignment for recognized 1PT
+    writeback. Bool data is excluded. Shapes, layouts, masks and addresses are
+    unchanged. Functions without a PTO target pass through unchanged.
+    """
+    return _ffi_api.VerifyPTOCodegenLegality()  # type: ignore
+
+
+def VectorizeParallelToPTO():
+    """Rewrite verified T.Parallel loops inside PTO SIMD_VF blocks into
+    logical VMI code.
+
+    Runs on the PTO target only; functions without a PTO target pass
+    through unchanged.
+    """
+    return _ffi_api.VectorizeParallelToPTO()  # type: ignore
+
+
 def AscendThreadSync(storage_scope: str):
     """Insert thread-storage synchronization independently within each SIMT_VF."""
     return _ffi_api.AscendThreadSync(storage_scope)
@@ -245,6 +289,7 @@ __all__ = [
     "NormalizeBufferVersion",
     "NormalizeControlFlowForSchedule",
     "NormalizeConflictHints",
+    "LegalizeParallelToPTO",
     "PrepareMultiBuffer",
     "ResolveCore",
     "RewriteAscendBufferVersionLayout",
@@ -253,4 +298,7 @@ __all__ = [
     "RewriteFp4ToFp4x2",
     "RewriteFlagToBuf",
     "UnrollLoopSkipVF",
+    "VectorizeParallelToPTO",
+    "VerifyParallelToPTO",
+    "VerifyPTOCodegenLegality",
 ]
