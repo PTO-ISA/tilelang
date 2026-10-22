@@ -675,6 +675,12 @@ bool CodeGenTileLangPY::HandleTypeMatch_(const VarNode *buf_var,
   return it->second == t;
 }
 
+DataType CodeGenTileLangPY::GetHandleType_(const VarNode *buf_var,
+                                           DataType fallback) const {
+  auto it = handle_data_type_.find(buf_var);
+  return it == handle_data_type_.end() ? fallback : it->second;
+}
+
 void CodeGenTileLangPY::EscapeStringLiteral_(const std::string &s,
                                              std::ostream &os) {
   os << '"';

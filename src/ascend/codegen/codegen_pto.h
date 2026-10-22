@@ -103,6 +103,12 @@ private:
   std::string GetAddressOfExpr_(const CallNode *op);
   std::string GetAscendCopyGmUbExpr_(const CallNode *op);
   std::string GetAscendCopyUbGmExpr_(const CallNode *op);
+  std::string GetAscendCopyPtrExpr_(const PrimExpr &expr,
+                                    const VarNode *buffer_var,
+                                    const PrimExpr &index,
+                                    DataType access_dtype, DataType copy_dtype,
+                                    const std::string &space,
+                                    const char *context);
   void RecordAscendCopyPadValue_(const CallNode *op);
   void EmitAscendSetAtomic(const CallNode *op);
   void EmitCopyPadMerge_(int merged_value_id, DataType expected_dtype);

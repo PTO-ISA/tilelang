@@ -317,8 +317,6 @@ def test_continuous_load_covers_full_physical_vectors(dtype, size, expected):
 # ---------------------------------------------------------------------------
 
 
-
-
 # ---------------------------------------------------------------------------
 # Logical size 80 / masks never shrink the footprint
 # ---------------------------------------------------------------------------
@@ -424,7 +422,6 @@ def test_group_slot_uses_one_element_per_group():
 
     assert _vload_descriptor(slot) == (64, 449, 1, 0)
     assert _vstore_descriptor(slot) == (256, 449, 2, 0)
-
 
 
 def test_group_static_negative_stride_relocates_lowest_address():
