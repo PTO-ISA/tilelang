@@ -126,6 +126,45 @@ def _k_newton_inside(E, lanes, dtype="float32"):
     return main
 
 
+def _k_runtime_shell_no_carry(E, lanes, dtype="float32"):
+    """Shell with a runtime trip count and no carried value."""
+    P = (E + lanes - 1) // lanes * lanes
+
+    @T.prim_func
+    def main(X: T.Tensor((P,), dtype), Y: T.Tensor((P,), dtype), iters: T.int32):
+        with T.Kernel(1):
+            x_ub = T.alloc_shared((P,), dtype)
+            out_ub = T.alloc_shared((P,), dtype)
+            T.copy(X, x_ub)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(E):
+                    for _t in T.serial(iters):
+                        out_ub[i] = x_ub[i] * T.float32(2.0)
+            T.copy(out_ub, Y)
+
+    return main
+
+
+def _k_runtime_shell_carry(E, lanes, dtype="float32"):
+    """Seed store + runtime-bound self-RMW: the carry pattern with a dynamic K."""
+    P = (E + lanes - 1) // lanes * lanes
+
+    @T.prim_func
+    def main(X: T.Tensor((P,), dtype), Y: T.Tensor((P,), dtype), iters: T.int32):
+        with T.Kernel(1):
+            x_ub = T.alloc_shared((P,), dtype)
+            y_ub = T.alloc_shared((P,), dtype)
+            T.copy(X, x_ub)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(E):
+                    y_ub[i] = T.float32(0.0)
+                    for _t in T.serial(iters):
+                        y_ub[i] = y_ub[i] + x_ub[i]
+            T.copy(y_ub, Y)
+
+    return main
+
+
 def _k_shell_no_carry(E, lanes, dtype="float32"):
     """Loop body only reads x and writes out: no carried value, no seed."""
     P = (E + lanes - 1) // lanes * lanes
@@ -263,6 +302,40 @@ def test_shell_without_carry_is_preserved():
     assert "_carry" not in vec, "no carry pattern: nothing must be promoted"
     assert vec.count("vstore") == 1, "the single out store stays a vstore"
     assert _serial_shells_named(stages["vectorize"], "_t")
+
+
+@pytest.mark.pto
+def test_runtime_bound_shell_is_admitted_and_preserved():
+    """The trip count may be a runtime scalar: the bound is copied through."""
+    E, lanes = 256, 64
+    stages, error = _lower_capture(_k_runtime_shell_no_carry(E, lanes))
+    assert error is None, f"a runtime-bound shell must lower, got: {error}"
+
+    shells = _serial_shells_named(stages["vectorize"], "_t")
+    assert shells, "the runtime-bound shell must survive vectorization"
+    assert not isinstance(shells[0].extent, tvm.tirx.IntImm), (
+        "the trip count must stay a runtime expression, got "
+        f"{shells[0].extent}"
+    )
+    vec = str(stages["vectorize"])
+    assert "_carry" not in vec, "no carry pattern here: nothing to promote"
+
+
+@pytest.mark.pto
+def test_runtime_bound_shell_still_promotes_carry():
+    """A runtime trip count does not change the carry promotion decision."""
+    E, lanes = 256, 64
+    stages, error = _lower_capture(_k_runtime_shell_carry(E, lanes))
+    assert error is None, f"a runtime-bound carried shell must lower, got: {error}"
+
+    vec = str(stages["vectorize"])
+    assert "y_ub_carry" in vec, "the carry must still be promoted to a vreg"
+    assert vec.count("vstore") == 1, (
+        f"expected exactly one writeback vstore, got {vec.count('vstore')}"
+    )
+    shells = _serial_shells_named(stages["vectorize"], "_t")
+    assert shells, "the runtime-bound shell must survive vectorization"
+    assert not isinstance(shells[0].extent, tvm.tirx.IntImm)
 
 
 # ---------------------------------------------------------------------------

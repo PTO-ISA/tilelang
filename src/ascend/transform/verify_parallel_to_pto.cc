@@ -396,26 +396,27 @@ private:
     // not a whitelist. Reject those kinds explicitly.
 
     void VisitStmt_(const ForNode *op) final {
-      // Loop-shell admission: a constant-bound T.serial loop inside
-      // T.Parallel is admitted as a preserved shell (Vectorize copies the
-      // loop through and converts only its body). The induction variable
-      // is lane-uniform by construction, so it is registered as a uniform
-      // definition while the body runs through the same unit-level
-      // checks. Non-serial kinds and non-constant bounds stay rejected
-      // at this stage.
+      // Loop-shell admission: a T.serial loop inside T.Parallel is admitted
+      // as a preserved shell (Vectorize copies the loop through and converts
+      // only its body). The induction variable is lane-uniform by
+      // construction, so it is registered as a uniform definition while the
+      // body runs through the same unit-level checks. Neither the shell nor
+      // its body depends on the trip count being known at compile time: the
+      // bound is copied through verbatim, so a runtime extent is admitted as
+      // well. A constant extent must still be positive; a runtime extent is
+      // the program's contract (the same assumption any `for` carries).
+      // Non-serial kinds stay rejected at this stage.
       if (op->kind != ForKind::kSerial) {
         parent_->Fail("loop structure",
                       "only T.serial loops inside T.Parallel are supported "
                       "at this stage (pipelined and while loops are "
                       "rejected)");
       }
-      const auto *min_imm = op->min.as<IntImmNode>();
       const auto *extent_imm = op->extent.as<IntImmNode>();
-      if (min_imm == nullptr || extent_imm == nullptr ||
-          extent_imm->value <= 0) {
+      if (extent_imm != nullptr && extent_imm->value <= 0) {
         parent_->Fail("loop structure",
-                      "T.serial inside T.Parallel must have constant bounds "
-                      "and a positive extent at this stage");
+                      "T.serial inside T.Parallel must have a positive "
+                      "extent");
       }
       if (op->step.defined()) {
         const auto *step_imm = op->step.value().as<IntImmNode>();
