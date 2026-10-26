@@ -335,10 +335,11 @@ def test_single_sided_if_becomes_a_predicated_store():
 
 
 @pytest.mark.pto
-def test_conditional_arm_that_reads_its_own_write_is_rejected():
-    """A store that reads a buffer another store of the same arm wrote has no
-    ordering point inside a vecscope, so it must be rejected rather than
-    lowered into an unordered pair."""
+def test_conditional_arm_that_reads_its_own_write_keeps_arm_order():
+    """A store may read what an earlier store of the same arm wrote. The two
+    arms are then emitted in their source order, each gated by the branch
+    condition, so the read-after-write keeps its meaning; the backend's
+    vecscope memory barriers order the resulting UB accesses."""
 
     E, lanes = 150, 128
     P = (E + lanes - 1) // lanes * lanes
@@ -359,12 +360,18 @@ def test_conditional_arm_that_reads_its_own_write_is_rejected():
                         y[0, i] = y[1, i] * 3
             T.copy(y, Y)
 
-    _, error = _lower_capture(main, expect_error=True)
-    assert error is not None, "an unordered read-after-write inside one arm must be rejected"
-    assert "no ordering point inside a vecscope" in str(error), f"got: {error}"
+    mod, error = _lower_capture(main, expect_error=True)
+    assert error is None, f"the ordered arm read-after-write must lower, got: {error}"
+
+    legalized = mod["legalize"]
+    assert not _if_then_elses(legalized), "the branch must be legalized away"
+    stores = _predicated_stores(legalized)
+    # Two stores per arm, all four gated by the branch condition: the arm order
+    # is kept, and the complementary predicates keep the arms exclusive.
+    assert len(stores) == 4, f"expected four predicated stores, got {len(stores)}"
+    assert not _selects(legalized), "an ordered arm must not be merged into a Select"
 
 
-@pytest.mark.pto
 def test_minmax_legalizes_without_residual_max_min_nodes():
     E, lanes = 150, 128
     stages, _ = _lower_capture(_k_minmax(E, lanes))

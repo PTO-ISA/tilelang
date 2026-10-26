@@ -378,22 +378,21 @@ private:
       for (const BufferStoreNode *th : then_stores) {
         emit_predicated_store(th, cond);
       }
-    } else if (arms_ordered) {
-      // A store reads what another store of the same arm wrote. Preserving
-      // that read-after-write would need an ordering point between the two
-      // stores, and a vecscope has none: the second access may observe the
-      // value the buffer held before the first. Reject instead of emitting a
-      // silently unordered pair.
-      Fail("a conditional branch writes a buffer and then reads it back in "
-           "the same arm; the read-after-write has no ordering point inside "
-           "a vecscope. Write the value through a bind expression, or split "
-           "the two stores into separate T.Parallel units");
-    } else if (arms_predicated) {
-      // A nested one-sided branch already left a predicate on a store, so
-      // the two arms cannot be merged into value choices (that would drop
-      // the inner predicate). Emit each arm in its source order, gated by
-      // the branch condition; the complementary predicates keep the arms
-      // exclusive.
+    } else if (arms_predicated || arms_ordered) {
+      // Two different reasons not to merge the arms into value choices:
+      //
+      //  * a nested one-sided branch already left a predicate on a store, and
+      //    a Select over two values cannot express "write only these lanes";
+      //  * a store reads what an earlier store of the same arm wrote, so the
+      //    arm's write order carries meaning.
+      //
+      // Both are handled by emitting each arm in its source order, gated by
+      // the branch condition: the complementary predicates keep the arms
+      // exclusive, and the source order of an arm is preserved. The UB
+      // read-after-write this can leave inside one vecscope is ordered by the
+      // backend's vecscope memory barriers (pto.mem_bar "VST_VLD"), which run
+      // after vecscope inference; the same guarantee the pipeline now relies
+      // on for every other round-trip buffer.
       for (const BufferStoreNode *th : then_stores) {
         emit_predicated_store(th, cond);
       }

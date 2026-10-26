@@ -169,6 +169,33 @@ def _build_or_condition():
     return main
 
 
+def _build_arm_read_after_write():
+    """Each arm writes one axis and then reads it back to compute the other.
+
+    The two arms are emitted in source order, gated by the branch condition;
+    the UB read-after-write inside an arm is ordered by the backend's vecscope
+    memory barriers.
+    """
+
+    @T.prim_func
+    def main(A: T.Tensor((E,), "float32"), Y: T.Tensor((2, E), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((E,), "float32")
+            y_ub = T.alloc_shared((2, E), "float32")
+            T.copy(A, a_ub)
+            with T.SimdVF(lanes=LANES):
+                for i in T.Parallel(E):
+                    if a_ub[i] > T.float32(0.0):
+                        y_ub[0, i] = a_ub[i]
+                        y_ub[1, i] = y_ub[0, i] * T.float32(2.0)
+                    else:
+                        y_ub[1, i] = a_ub[i]
+                        y_ub[0, i] = y_ub[1, i] * T.float32(3.0)
+            T.copy(y_ub, Y)
+
+    return main
+
+
 def _build_carried_conditional():
     """One-sided write to the loop-carried buffer: the update keeps the
     register value on the lanes the condition does not select."""
@@ -218,6 +245,12 @@ def _gold_nested_then_else(a, b):
 
 def _gold_or(x, z):
     return np.where((x > 0) | (z > 0), np.float32(1.0), np.float32(7.0)).astype(np.float32)
+
+
+def _gold_arm_read_after_write(a):
+    y0 = np.where(a > 0, a, a * 3.0)
+    y1 = np.where(a > 0, a * 2.0, a)
+    return np.stack([y0, y1]).astype(np.float32)
 
 
 def _gold_carried(x, thr):
@@ -304,6 +337,23 @@ def test_nested_then_else_keeps_the_inner_predicate():
         _gold_nested_then_else(a, b),
         "nested then/else",
     )
+
+
+@pytest.mark.pto
+@requires_npu
+def test_arm_read_after_write_numeric():
+    """The arm's own write-then-read must be ordered (membar), not stale."""
+    rng = np.random.default_rng(6)
+    a = rng.uniform(-2.0, 2.0, E).astype(np.float32)
+    gold = _gold_arm_read_after_write(a)
+    args = (torch.from_numpy(a).to(_dev()),)
+
+    polluter = _compile(_build_polluter())
+    kernel = _compile(_build_arm_read_after_write())
+    for r in range(int(os.environ.get("ROUNDS", "3"))):
+        polluter()
+        torch.npu.synchronize()
+        _run_and_compare(kernel, args, gold, f"arm read-after-write round {r}")
 
 
 @pytest.mark.pto
