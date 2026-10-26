@@ -558,6 +558,83 @@ def _k_nested_three_way(E=150, lanes=128, dtype="float32"):
     return main
 
 
+def _k_scalar_bool_select(E=150, lanes=128, dtype="float32"):
+    """Both arms write one address and the condition is a bare scalar bool."""
+
+    P = (E + lanes - 1) // lanes * lanes
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((P,), dtype),
+        B: T.Tensor((P,), dtype),
+        flag: T.bool,
+        Y: T.Tensor((P,), dtype),
+    ):
+        with T.Kernel(1):
+            a = T.alloc_shared((P,), dtype)
+            b = T.alloc_shared((P,), dtype)
+            y = T.alloc_shared((P,), dtype)
+            T.copy(A, a)
+            T.copy(B, b)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(E):
+                    if flag:
+                        y[i] = a[i]
+                    else:
+                        y[i] = b[i]
+            T.copy(y, Y)
+
+    return main
+
+
+def _k_scalar_bool_predicate(E=150, lanes=128, dtype="float32"):
+    """One-sided branch under a bare scalar bool."""
+
+    P = (E + lanes - 1) // lanes * lanes
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((P,), dtype),
+        flag: T.bool,
+        Y: T.Tensor((P,), dtype),
+    ):
+        with T.Kernel(1):
+            a = T.alloc_shared((P,), dtype)
+            y = T.alloc_shared((P,), dtype)
+            T.copy(A, a)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(E):
+                    if flag:
+                        y[i] = a[i]
+            T.copy(y, Y)
+
+    return main
+
+
+def _k_scalar_bool_and_lane_cond(E=150, lanes=128, dtype="float32"):
+    """A scalar bool combined with a lane-varying condition."""
+
+    P = (E + lanes - 1) // lanes * lanes
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((P,), dtype),
+        flag: T.bool,
+        Y: T.Tensor((P,), dtype),
+    ):
+        with T.Kernel(1):
+            a = T.alloc_shared((P,), dtype)
+            y = T.alloc_shared((P,), dtype)
+            T.copy(A, a)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(E):
+                    if flag and a[i] > T.float32(0.0):
+                        y[i] = a[i]
+            T.copy(y, Y)
+
+    return main
+
+
 def _k_boolean_mask(E, lanes, dtype="float32"):
     """A boolean expression over two comparisons used as the guard; the mask
     is bound first (a value position), so the condition keeps the mask-logic
@@ -585,6 +662,54 @@ def _k_boolean_mask(E, lanes, dtype="float32"):
             T.copy(c, C)
 
     return main
+
+
+@pytest.mark.pto
+def test_scalar_bool_select_condition_becomes_a_full_mask():
+    """A bare scalar bool has no operand to compare, so it is widened to int32,
+    broadcast, and compared against zero: the result is an all-true /
+    all-false lane mask that `vsel` can consume."""
+
+    stages, error = _lower_capture(_k_scalar_bool_select())
+    assert error is None, f"a scalar bool condition must lower, got: {error}"
+
+    legalized = stages["legalize"]
+    assert not _if_then_elses(legalized), "the branch must be legalized away"
+    assert _selects(legalized), "both arms write one address: a Select"
+
+    names = _vmi_call_names(stages["vectorize"])
+    assert names.get("tl.vmi.vbrc", 0) >= 1, f"the scalar bool must be broadcast, got {names}"
+    assert "tl.vmi.vcmps" in names, f"the broadcast bool must be compared against zero, got {names}"
+    assert "tl.vmi.vsel" in names, f"the Select must lower to vsel, got {names}"
+
+
+@pytest.mark.pto
+def test_scalar_bool_store_predicate_becomes_a_full_mask():
+    """The same widening applies to a one-sided branch's store predicate, which
+    previously broadcast the bool into a `boolxN` instead of a mask."""
+
+    stages, error = _lower_capture(_k_scalar_bool_predicate())
+    assert error is None, f"a scalar bool predicate must lower, got: {error}"
+
+    legalized = stages["legalize"]
+    stores = _predicated_stores(legalized)
+    assert len(stores) == 1, f"expected one predicated store, got {len(stores)}"
+
+    names = _vmi_call_names(stages["vectorize"])
+    assert "tl.vmi.vcmps" in names, f"the predicate must become a mask, got {names}"
+    assert "tl.vmi.vstore" in names, "the predicated store must survive"
+
+
+@pytest.mark.pto
+def test_scalar_bool_in_mask_logic_keeps_a_lane_mask():
+    """`flag and (a[i] > 0)` must widen the scalar side before `mask_and`."""
+
+    stages, error = _lower_capture(_k_scalar_bool_and_lane_cond())
+    assert error is None, f"a scalar bool in mask logic must lower, got: {error}"
+
+    names = _vmi_call_names(stages["vectorize"])
+    assert "tl.vmi.mask_and" in names, f"the conjunction must lower to mask_and, got {names}"
+    assert "tl.vmi.vcmps" in names, f"the scalar bool must be widened first, got {names}"
 
 
 @pytest.mark.pto

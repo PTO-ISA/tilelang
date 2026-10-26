@@ -196,6 +196,29 @@ def _build_arm_read_after_write():
     return main
 
 
+def _build_scalar_bool_choice():
+    """Both arms write one address under a bare scalar bool condition."""
+
+    @T.prim_func
+    def main(A: T.Tensor((E,), "float32"), B: T.Tensor((E,), "float32"),
+             flag: T.bool, Y: T.Tensor((E,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((E,), "float32")
+            b_ub = T.alloc_shared((E,), "float32")
+            y_ub = T.alloc_shared((E,), "float32")
+            T.copy(A, a_ub)
+            T.copy(B, b_ub)
+            with T.SimdVF(lanes=LANES):
+                for i in T.Parallel(E):
+                    if flag:
+                        y_ub[i] = a_ub[i]
+                    else:
+                        y_ub[i] = b_ub[i]
+            T.copy(y_ub, Y)
+
+    return main
+
+
 def _build_carried_conditional():
     """One-sided write to the loop-carried buffer: the update keeps the
     register value on the lanes the condition does not select."""
@@ -354,6 +377,26 @@ def test_arm_read_after_write_numeric():
         polluter()
         torch.npu.synchronize()
         _run_and_compare(kernel, args, gold, f"arm read-after-write round {r}")
+
+
+@pytest.mark.pto
+@requires_npu
+@pytest.mark.parametrize("flag", [True, False])
+def test_scalar_bool_condition_selects_the_whole_vector(flag):
+    """A scalar bool becomes an all-true / all-false mask."""
+    rng = np.random.default_rng(7)
+    a = rng.uniform(-2.0, 2.0, E).astype(np.float32)
+    b = rng.uniform(-2.0, 2.0, E).astype(np.float32)
+    gold = (a if flag else b).astype(np.float32)
+
+    kernel = _compile(_build_scalar_bool_choice())
+    out = kernel(
+        torch.from_numpy(a).to(_dev()),
+        torch.from_numpy(b).to(_dev()),
+        flag,
+    ).cpu().numpy().astype(np.float32)
+    bad = int((~np.isclose(out, gold, rtol=1e-6, atol=1e-6)).sum())
+    assert bad == 0, f"flag={flag}: {bad}/{E} mismatched"
 
 
 @pytest.mark.pto
