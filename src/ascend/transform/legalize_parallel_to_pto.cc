@@ -97,9 +97,9 @@ bool CollectStores(const Stmt &stmt,
 }
 
 // True when \p call is one of the boolean mask-combine ops that
-// VectorizeParallelToPTO lowers to the VMI op \p vmi_name ("mask_and" /
-// "mask_or" / "mask_not"): the shared name table carries every admitted
-// spelling (tirx./tir. bitwise_* and tir.And|Or|Not).
+// VectorizeParallelToPTO lowers to the VMI op \p vmi_name ("vand" / "vor" /
+// "vnot"): the shared name table carries every admitted spelling
+// (tirx./tir. bitwise_* and tir.And|Or|Not).
 bool IsMaskLogicCall(const CallNode *call, const char *vmi_name) {
   if (const auto *op = call->op.as<OpNode>()) {
     const char *mapped = pto::MaskLogicVmiOpName(op->name);
@@ -127,15 +127,15 @@ PrimExpr ExpandPredSelect(const PrimExpr &cond, const PrimExpr &tval,
     return ExpandPredSelect(notn->a, fval, tval);
   }
   if (const auto *call = cond.as<CallNode>()) {
-    if (IsMaskLogicCall(call, "mask_and") && call->args.size() == 2) {
+    if (IsMaskLogicCall(call, "vand") && call->args.size() == 2) {
       return ExpandPredSelect(
           call->args[0], ExpandPredSelect(call->args[1], tval, fval), fval);
     }
-    if (IsMaskLogicCall(call, "mask_or") && call->args.size() == 2) {
+    if (IsMaskLogicCall(call, "vor") && call->args.size() == 2) {
       return ExpandPredSelect(call->args[0], tval,
                               ExpandPredSelect(call->args[1], tval, fval));
     }
-    if (IsMaskLogicCall(call, "mask_not") && call->args.size() == 1) {
+    if (IsMaskLogicCall(call, "vnot") && call->args.size() == 1) {
       return ExpandPredSelect(call->args[0], fval, tval);
     }
   }

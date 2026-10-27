@@ -50,17 +50,18 @@ std::string AccessPatternToString(AccessPattern pattern) {
 const char *MaskLogicVmiOpName(const std::string &tir_op_name) {
   // TileLang `a & b` / `a | b` / `~a` on bool predicates arrive as
   // tirx.bitwise_* calls (plus the tir.bitwise_* and tir.And/Or/Not
-  // spellings); Vectorize rewrites them to the mapped mask op.
+  // spellings); Vectorize rewrites them to the PTODSL bitwise vector ops,
+  // whose mask register overload implements the boolean combine.
   static const std::pair<const char *, const char *> kMaskLogicTable[] = {
-      {"tirx.bitwise_and", "mask_and"},
-      {"tir.bitwise_and", "mask_and"},
-      {"tir.And", "mask_and"},
-      {"tirx.bitwise_or", "mask_or"},
-      {"tir.bitwise_or", "mask_or"},
-      {"tir.Or", "mask_or"},
-      {"tirx.bitwise_not", "mask_not"},
-      {"tir.bitwise_not", "mask_not"},
-      {"tir.Not", "mask_not"},
+      {"tirx.bitwise_and", "vand"},
+      {"tir.bitwise_and", "vand"},
+      {"tir.And", "vand"},
+      {"tirx.bitwise_or", "vor"},
+      {"tir.bitwise_or", "vor"},
+      {"tir.Or", "vor"},
+      {"tirx.bitwise_not", "vnot"},
+      {"tir.bitwise_not", "vnot"},
+      {"tir.Not", "vnot"},
   };
   for (const auto &entry : kMaskLogicTable) {
     if (tir_op_name == entry.first) {
@@ -679,8 +680,8 @@ public:
       const std::string &name = call_op.value()->name;
       // TileLang `a & b` / `a | b` / `~a` on bool predicates arrive as
       // tirx.bitwise_* (not And/Or/Not nodes). Verify admits them; Vectorize
-      // rewrites them to mask_and/mask_or/mask_not (the shared
-      // MaskLogicVmiOpName table).
+      // rewrites them to vand/vor/vnot (the shared MaskLogicVmiOpName
+      // table).
       if (MaskLogicVmiOpName(name) != nullptr) {
         for (const auto &arg : op->args) {
           VisitExpr(arg);

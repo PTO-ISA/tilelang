@@ -158,14 +158,15 @@ private:
         "tl.vmi.vsqrt",
         "tl.vmi.vcvt",
         "tl.vmi.vinterpret_cast",
-        // Control-flow ops (vcmp/vcmps produce masks, vsel/mask_* combine
-        // them); an unused result is discardable like the arithmetic ops.
+        // Control-flow ops (vcmp/vcmps produce masks, vsel/vand/vor/vnot
+        // combine them); an unused result is discardable like the arithmetic
+        // ops.
         "tl.vmi.vcmp",
         "tl.vmi.vcmps",
         "tl.vmi.vsel",
-        "tl.vmi.mask_and",
-        "tl.vmi.mask_or",
-        "tl.vmi.mask_not",
+        "tl.vmi.vand",
+        "tl.vmi.vor",
+        "tl.vmi.vnot",
         "tl.access_ptr",
     };
     bool discardable = true;
@@ -1871,7 +1872,7 @@ private:
           store_mask = EmitBind(
               "mand",
               Call(DataType::Bool(static_cast<int>(lanes_)),
-                   VmiOp("mask_and"), {mask_var_, pred_mask}),
+                   VmiOp("vand"), {mask_var_, pred_mask}),
               &pre);
         }
         for (const auto &s : pre) {
@@ -2075,12 +2076,12 @@ private:
         name = op_node->name;
       }
       if (const char *mask_op = pto_analysis::MaskLogicVmiOpName(name)) {
-        const bool is_not = std::string_view(mask_op) == "mask_not";
+        const bool is_not = std::string_view(mask_op) == "vnot";
         ICHECK_EQ(call->args.size(), is_not ? 1 : 2);
         if (is_not) {
           PrimExpr a = ConvertExpr(call->args[0], pre);
           DataType mask_ty = DataType::Bool(static_cast<int>(lanes_));
-          return EmitBind("mnot", Call(mask_ty, VmiOp("mask_not"), {a}), pre);
+          return EmitBind("mnot", Call(mask_ty, VmiOp("vnot"), {a}), pre);
         }
         return ConvertMaskLogic(call->args[0], call->args[1], mask_op, pre);
       }
@@ -2178,17 +2179,17 @@ private:
       return current;
     }
     if (const auto *andn = expr.as<AndNode>()) {
-      return ConvertMaskLogic(andn->a, andn->b, "mask_and", pre);
+      return ConvertMaskLogic(andn->a, andn->b, "vand", pre);
     }
     if (const auto *orn = expr.as<OrNode>()) {
-      return ConvertMaskLogic(orn->a, orn->b, "mask_or", pre);
+      return ConvertMaskLogic(orn->a, orn->b, "vor", pre);
     }
     if (const auto *notn = expr.as<NotNode>()) {
       PrimExpr a = AsLaneMask(ConvertExpr(notn->a, pre), pre);
       DataType mask_ty = DataType::Bool(static_cast<int>(lanes_));
       ICHECK(a.dtype().lanes() > 1)
-          << "[VectorizeParallelToPTO] mask_not expects a lane mask";
-      return EmitBind("mnot", Call(mask_ty, VmiOp("mask_not"), {a}), pre);
+          << "[VectorizeParallelToPTO] vnot expects a lane mask";
+      return EmitBind("mnot", Call(mask_ty, VmiOp("vnot"), {a}), pre);
     }
     if (const auto *sel = expr.as<SelectNode>()) {
 

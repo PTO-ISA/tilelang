@@ -259,8 +259,9 @@ struct VectorCastPlan {
 using CastPlan = std::variant<ScalarCastPlan, VectorCastPlan>;
 
 // Maps a frontend boolean-combine op name (tirx./tir.bitwise_{and,or,not}
-// or tir.{And,Or,Not}) to its VMI mask op name ("mask_and"/"mask_or"/
-// "mask_not"); returns nullptr for any other name.
+// or tir.{And,Or,Not}) to the PTODSL bitwise vector op whose mask register
+// overload implements the boolean combine ("vand"/"vor"/"vnot"); returns
+// nullptr for any other name.
 const char *MaskLogicVmiOpName(const std::string &tir_op_name);
 
 // The tirx.* unary math ops with a VMI mapping (fabs/exp/log/sqrt):

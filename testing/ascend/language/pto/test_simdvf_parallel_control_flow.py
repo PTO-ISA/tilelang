@@ -282,7 +282,7 @@ def test_if_else_legalizes_to_select_without_residual_branch():
     names = _vmi_call_names(vectorized)
     assert "tl.vmi.vcmp" in names or "tl.vmi.vcmps" in names, "the comparison must lower to vcmp/vcmps"
     assert "tl.vmi.vsel" in names, "the Select must lower to vsel"
-    assert "tl.vmi.mask_and" not in names, "this case must not need mask_and"
+    assert "tl.vmi.vand" not in names, "this case must not need the boolean combine"
 
     # A conditional nested inside a branch recurses through the same rewrite
     # and ends as nested Selects (no residual IfThenElse anywhere).
@@ -328,7 +328,7 @@ def test_single_sided_if_becomes_a_predicated_store():
     vectorized = stages["vectorize"]
     names = _vmi_call_names(vectorized)
     assert "tl.vmi.vstore" in names, "the predicated store must lower to vstore"
-    assert "tl.vmi.mask_and" in names, "the predicate must be conjoined into the store mask"
+    assert "tl.vmi.vand" in names, "the predicate must be conjoined into the store mask"
 
     stores_v = _collect(vectorized, lambda n: isinstance(n, tvm.tirx.BufferStore))
     assert not any(s.buffer.name == "b" for s in stores_v), "no scalar store to the destination may survive"
@@ -665,7 +665,7 @@ def _k_scalar_bool_and_lane_cond(E=150, lanes=128, dtype="float32"):
 def _k_boolean_mask(E, lanes, dtype="float32"):
     """A boolean expression over two comparisons used as the guard; the mask
     is bound first (a value position), so the condition keeps the mask-logic
-    form through Legalize and Vectorize converts it to mask_and."""
+    form through Legalize and Vectorize converts it to vand."""
 
     @T.prim_func
     def main(
@@ -745,32 +745,31 @@ def test_scalar_bool_store_predicate_becomes_a_full_mask():
 
 @pytest.mark.pto
 def test_scalar_bool_in_mask_logic_keeps_a_lane_mask():
-    """`flag and (a[i] > 0)` must widen the scalar side before `mask_and`."""
+    """`flag and (a[i] > 0)` must widen the scalar side before the combine."""
 
     stages, error = _lower_capture(_k_scalar_bool_and_lane_cond())
     assert error is None, f"a scalar bool in mask logic must lower, got: {error}"
 
     names = _vmi_call_names(stages["vectorize"])
-    assert "tl.vmi.mask_and" in names, f"the conjunction must lower to mask_and, got {names}"
+    assert "tl.vmi.vand" in names, f"the conjunction must lower to vand, got {names}"
     assert "tl.vmi.vcmps" in names, f"the scalar bool must be widened first, got {names}"
 
 
 @pytest.mark.pto
-def test_boolean_mask_value_lowers_to_mask_and_and_vand():
+def test_boolean_mask_value_lowers_to_vand():
     E, lanes = 256, 128
     stages, _ = _lower_capture(_k_boolean_mask(E, lanes))
 
     names = _vmi_call_names(stages["vectorize"])
-    assert names.get("tl.vmi.mask_and") == 1, f"mask_and must be emitted once, got {names}"
+    assert names.get("tl.vmi.vand") == 1, f"vand must be emitted once, got {names}"
     assert "tl.vmi.vsel" in names, "the guarded Select must lower to vsel"
     assert names.get("tl.vmi.vcmp", 0) >= 2, "both comparisons must lower to vcmp"
 
-    # Registration + codegen mapping: the full PTO compile emits the current
-    # PTODSL surface name (pto.vmi.vand) for the TileLang mask_and op.
+    # The boolean combine is the existing PTODSL bitwise vector op on mask
+    # registers, so the emitted PTODSL name equals the TileLang op name.
     kernel = tilelang.compile(_k_boolean_mask(E, lanes), target="pto", out_idx=-1)
     source = kernel.get_kernel_source()
-    assert "pto.vmi.vand(" in source, "mask_and must map to pto.vmi.vand in the emitted PTODSL"
-    assert "pto.vmi.mask_and(" not in source, "the TileLang-only op name must not leak into PTODSL"
+    assert "pto.vmi.vand(" in source, "the boolean combine must emit pto.vmi.vand"
 
 
 @pytest.mark.pto

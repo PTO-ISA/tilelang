@@ -685,7 +685,7 @@ private:
      * additionally apply the VMI operation matrix. `vmi_op` carries the
      * kind's VMI op for Add/Sub/Mul/Div (vadd/vsub/vmul/vdiv) and is
      * nullptr for the relational / boolean kinds that Legalize and
-     * Vectorize express as vcmp+vsel / mask_and|or|not (recursion only).
+     * Vectorize express as vcmp+vsel / vand|vor|vnot (recursion only).
      * The unary Not and the three-operand Select are handled separately
      * by the caller. */
     struct BinaryOperands {
