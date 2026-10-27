@@ -170,9 +170,9 @@ def NormalizeAscendFractalStorage():
     return _ffi_api.NormalizeAscendFractalStorage()  # type: ignore
 
 
-def AscendSimdVFLowerParallel():
+def AscendSimdVFLowerParallel(fill_only: bool = False):
     """Lower T.Parallel inside SIMD_VF blocks to MicroAPI register-level vector ops."""
-    return _ffi_api.AscendSimdVFLowerParallel()  # type: ignore
+    return _ffi_api.AscendSimdVFLowerParallel(fill_only)  # type: ignore
 
 
 def VerifyParallelToPTO():
