@@ -76,6 +76,18 @@ class PassConfigKey(str, Enum):
     TL_ENABLE_AUTO_SCHEDULE = "tl.enable_auto_schedule"
     """Enable Ascend auto scheduling. Default: True."""
 
+    TL_ENABLE_PTO_VMI_COVERAGE_CHECK = "tl.enable_pto_vmi_coverage_check"
+    """Fail on unproven VMI memory-descriptor coverage. Default: False
+
+    When False, LegalizePTOVMIMemoryAccess still materializes the explicit
+    ``tl.access_ptr`` descriptor but does not reject an access whose complete
+    physical envelope cannot be proven to stay inside the logical buffer region.
+    Set to True (or set the ``TILELANG_ENABLE_PTO_VMI_COVERAGE_CHECK``
+    environment variable to a truthy value) to turn the coverage proof back
+    into a hard error. An explicit ``pass_configs`` value takes precedence
+    over the environment-variable default.
+    """
+
     TL_ENABLE_AUTO_WARP_SPECIALIZATION = "tl.enable_auto_warp_specialization"
     """Name of the automatic warp-specialization scheduler to run (e.g.
     "role_based"). Default: unset (disabled)."""

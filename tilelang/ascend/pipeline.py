@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from tvm import IRModule, s_tir, tirx
 from tvm.target import Target
 
@@ -15,6 +17,7 @@ from tilelang.backend.pass_pipeline.pipeline_utils import (
 )
 
 from . import transform as ascend_transform
+from .target import target_is_pto
 
 _MERGE_UB_ALIGNMENT = 32
 
@@ -60,6 +63,17 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     if should_enable_race_check(pass_ctx=pass_ctx):
         mod = tilelang.transform.VerifyParallelLoop()(mod)
     mod = tilelang.transform.InjectAssumes()(mod)
+    # PTO functions normalize VMI allocation markers onto the owning
+    # allocations and lower ordinary VMI memory descriptors while the early
+    # unroll still sees them.  The default mutator-with-analyzer supplies the
+    # enclosing If/loop facts used by the descriptor proof; InjectAssumes only
+    # contributes explicit assumption facts.  VerifyBufferInit and scheduling
+    # both consume the descriptor produced here.
+    if target_is_pto(target):
+        mod = ascend_transform.NormalizePTOAllocMarkers()(mod)
+        default_coverage_check = os.environ.get("TILELANG_ENABLE_PTO_VMI_COVERAGE_CHECK", "0").lower() in ("1", "true", "yes", "on")
+        fail_on_uncovered = pass_ctx.config.get(tilelang.PassConfigKey.TL_ENABLE_PTO_VMI_COVERAGE_CHECK, default_coverage_check)
+        mod = ascend_transform.LegalizePTOVMIMemoryAccess(bool(fail_on_uncovered))(mod)
     # Expand AIV-side dual copies before layout, OOB, and scheduling passes.
     # Reuse an enclosing cthread sid from an explicit T.Vector block; an
     # auto-scheduled mixed T.Kernel gets one synthesized before its core
@@ -118,7 +132,16 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.Simplify()(mod)
 
     mod = ascend_transform.NormalizeBufferVersion()(mod)
-    mod = ascend_transform.AscendSimdVFLowerParallel()(mod)
+    # The PTO target splits here: the formal PTO Parallel pipeline runs
+    # Verify -> Legalize -> Vectorize (Legalize is currently a pass-through
+    # placeholder). The AscendC SIMD_VF lowering only
+    # handles the AscendC target and must not see PTO regions.
+    if target_is_pto(target):
+        mod = ascend_transform.VerifyParallelToPTO()(mod)
+        mod = ascend_transform.LegalizeParallelToPTO()(mod)
+        mod = ascend_transform.VectorizeParallelToPTO()(mod)
+    else:
+        mod = ascend_transform.AscendSimdVFLowerParallel()(mod)
     mod = ascend_transform.AscendLowerTileOp()(mod)
     mod = tilelang.transform.VerifyReducerConsumed()(mod)
 
@@ -184,6 +207,11 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.MakePackedAPI()(mod)
     mod = tilelang.transform.Simplify()(mod)
     mod = tilelang.transform.LowerDeviceKernelLaunch()(mod)
+    # Verify PTO requirements on the final device TIR before code generation.
+    # The current check proves masked-store destination alignment after all
+    # layout and UB address rewrites.
+    if target_is_pto(target):
+        mod = ascend_transform.VerifyPTOCodegenLegality()(mod)
     return mod
 
 

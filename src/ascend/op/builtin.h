@@ -14,6 +14,8 @@ namespace tl {
 // Ascend-specific pass configuration keys. Their string values remain stable
 // because they are part of the Python PassContext interface.
 static constexpr const char *kEnableAutoSchedule = "tl.enable_auto_schedule";
+static constexpr const char *kEnablePtoVmiCoverageCheck =
+    "tl.enable_pto_vmi_coverage_check";
 
 /*!
  * \brief Marker op for user-declared auto-schedule conflict facts.
