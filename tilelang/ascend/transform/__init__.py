@@ -94,7 +94,7 @@ def NormalizePTOAllocMarkers():
     return _ffi_api.NormalizePTOAllocMarkers()  # type: ignore
 
 
-def LegalizePTOVMIMemoryAccess():
+def LegalizePTOVMIMemoryAccess(fail_on_uncovered: bool = False):
     """Build and verify the explicit VMI memory descriptor before scheduling.
 
     Every ordinary ``T.vmi.vload`` / ``T.vmi.vstore`` address (a scalar-origin
@@ -112,7 +112,7 @@ def LegalizePTOVMIMemoryAccess():
     Functions without a PTO target pass through unchanged; the pass is a no-op
     on IR without VMI accesses.
     """
-    return _ffi_api.LegalizePTOVMIMemoryAccess()  # type: ignore
+    return _ffi_api.LegalizePTOVMIMemoryAccess(fail_on_uncovered)  # type: ignore
 
 
 def AutoSchedule():

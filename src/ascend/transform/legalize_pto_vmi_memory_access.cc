@@ -1071,7 +1071,8 @@ struct DescriptorPlan {
 };
 
 Rejection AcceptPlan(arith::Analyzer *analyzer, const AccessAddress &address,
-                     const DescriptorPlan &plan, int64_t low, int64_t high) {
+                     const DescriptorPlan &plan, int64_t low, int64_t high,
+                     bool fail_on_uncovered) {
   std::optional<int64_t> constant = ConstInt(plan.extent);
   if (constant.has_value()) {
     if (constant.value() <= 0) {
@@ -1121,6 +1122,9 @@ Rejection AcceptPlan(arith::Analyzer *analyzer, const AccessAddress &address,
         LocalCoverageReason(analyzer, address.buffer, plan.starts, plan.extent);
   }
   if (coverage.has_value()) {
+    if (!fail_on_uncovered) {
+      return {};
+    }
     return {RejectionKind::kCoverage, coverage.value()};
   }
   return {};
@@ -1184,6 +1188,7 @@ DescriptorPlan LocalPlan(const AccessAddress &address, int64_t high) {
 DescriptorPlan ChooseNegativePlan(arith::Analyzer *analyzer,
                                   const AccessAddress &address, int64_t low,
                                   int64_t high, bool is_load,
+                                  bool fail_on_uncovered,
                                   const std::string &op_name,
                                   const Span &span) {
   std::optional<std::string> coverage_reason;
@@ -1202,7 +1207,8 @@ DescriptorPlan ChooseNegativePlan(arith::Analyzer *analyzer,
       plan.offset = IntConst(neg_low);
       plan.relative = RelativeOffset(address.buffer, plan.starts);
       if (plan.relative.has_value()) {
-        Rejection rejection = AcceptPlan(analyzer, address, plan, low, high);
+        Rejection rejection =
+            AcceptPlan(analyzer, address, plan, low, high, fail_on_uncovered);
         if (Accepted(rejection)) {
           return plan;
         }
@@ -1226,7 +1232,8 @@ DescriptorPlan ChooseNegativePlan(arith::Analyzer *analyzer,
     plan.relative = IntConst(0);
     plan.origin = true;
     plan.require_static_shape = true;
-    Rejection rejection = AcceptPlan(analyzer, address, plan, low, high);
+    Rejection rejection =
+        AcceptPlan(analyzer, address, plan, low, high, fail_on_uncovered);
     if (Accepted(rejection)) {
       return plan;
     }
@@ -1247,7 +1254,8 @@ DescriptorPlan ChooseNegativePlan(arith::Analyzer *analyzer,
       plan.relative = IntConst(0);
       plan.origin = true;
       plan.require_static_shape = address.buffer->shape.size() > 1;
-      Rejection rejection = AcceptPlan(analyzer, address, plan, low, high);
+      Rejection rejection =
+          AcceptPlan(analyzer, address, plan, low, high, fail_on_uncovered);
       if (Accepted(rejection)) {
         return plan;
       }
@@ -1281,10 +1289,11 @@ DescriptorPlan ChooseNegativePlan(arith::Analyzer *analyzer,
 
 DescriptorPlan ChooseLocalPlan(arith::Analyzer *analyzer,
                                const AccessAddress &address, int64_t low,
-                               int64_t high, const std::string &op_name,
-                               const Span &span) {
+                               int64_t high, bool fail_on_uncovered,
+                               const std::string &op_name, const Span &span) {
   DescriptorPlan plan = LocalPlan(address, high);
-  Rejection rejection = AcceptPlan(analyzer, address, plan, low, high);
+  Rejection rejection =
+      AcceptPlan(analyzer, address, plan, low, high, fail_on_uncovered);
   if (!Accepted(rejection)) {
     FailDescriptor(op_name, rejection.message, address.buffer, span);
   }
@@ -1294,7 +1303,8 @@ DescriptorPlan ChooseLocalPlan(arith::Analyzer *analyzer,
 PrimExpr ValidateExplicitDescriptor(arith::Analyzer *analyzer,
                                     const AccessAddress &address, int64_t low,
                                     int64_t high, const PrimExpr &delta,
-                                    bool is_load, const std::string &op_name,
+                                    bool is_load, bool fail_on_uncovered,
+                                    const std::string &op_name,
                                     const Span &span) {
   if (!IsIntegerScalar(delta)) {
     Fail(op_name + " requires a scalar integer instruction offset", span);
@@ -1304,7 +1314,8 @@ PrimExpr ValidateExplicitDescriptor(arith::Analyzer *analyzer,
   plan.extent = address.extent;
   plan.offset = delta;
   plan.explicit_plan = true;
-  Rejection rejection = AcceptPlan(analyzer, address, plan, low, high);
+  Rejection rejection =
+      AcceptPlan(analyzer, address, plan, low, high, fail_on_uncovered);
   if (!Accepted(rejection)) {
     std::ostringstream oss;
     oss << op_name << " cannot verify the explicit access_ptr descriptor: "
@@ -1771,16 +1782,20 @@ IndexedOwner ValidateIndexedOwner(arith::Analyzer *analyzer,
 // ---------------------------------------------------------------------------
 class VmiMemoryAccessLegalizer : public arith::IRMutatorWithAnalyzer {
 public:
-  static Stmt Apply(Stmt stmt, arith::Analyzer *analyzer) {
-    VmiMemoryAccessLegalizer legalizer(analyzer);
+  static Stmt Apply(Stmt stmt, arith::Analyzer *analyzer,
+                    bool fail_on_uncovered) {
+    VmiMemoryAccessLegalizer legalizer(analyzer, fail_on_uncovered);
     return legalizer(std::move(stmt));
   }
 
 private:
   using Parent = arith::IRMutatorWithAnalyzer;
 
-  explicit VmiMemoryAccessLegalizer(arith::Analyzer *analyzer)
-      : Parent(analyzer) {}
+  explicit VmiMemoryAccessLegalizer(arith::Analyzer *analyzer,
+                                    bool fail_on_uncovered)
+      : Parent(analyzer), fail_on_uncovered_(fail_on_uncovered) {}
+
+  bool fail_on_uncovered_{false};
 
   // Scope every statement reached through the default control-flow traversal.
   // The branches/loops of IRMutatorWithAnalyzer call the virtual VisitStmt for
@@ -2024,14 +2039,15 @@ private:
     PrimExpr new_offset;
     if (address.explicit_address) {
       new_offset = ValidateExplicitDescriptor(
-          analyzer_, address, low, high, input_offset, is_load, op_name, span);
+          analyzer_, address, low, high, input_offset, is_load,
+          fail_on_uncovered_, op_name, span);
       pointer = address.source_operand;
     } else {
       DescriptorPlan plan =
-          low >= 0
-              ? ChooseLocalPlan(analyzer_, address, low, high, op_name, span)
-              : ChooseNegativePlan(analyzer_, address, low, high, is_load,
-                                   op_name, span);
+          low >= 0 ? ChooseLocalPlan(analyzer_, address, low, high,
+                                     fail_on_uncovered_, op_name, span)
+                   : ChooseNegativePlan(analyzer_, address, low, high, is_load,
+                                        fail_on_uncovered_, op_name, span);
       pointer = MakeDescriptor(address.buffer, plan.starts, plan.extent,
                                is_load ? 1 : 2);
       new_offset = plan.offset;
@@ -2235,8 +2251,10 @@ void ScanResidualAutomaticAddresses(const Stmt &stmt) {
   });
 }
 
-Stmt LegalizeVmiStmt(Stmt stmt, arith::Analyzer *analyzer) {
-  Stmt result = VmiMemoryAccessLegalizer::Apply(std::move(stmt), analyzer);
+Stmt LegalizeVmiStmt(Stmt stmt, arith::Analyzer *analyzer,
+                     bool fail_on_uncovered) {
+  Stmt result = VmiMemoryAccessLegalizer::Apply(std::move(stmt), analyzer,
+                                                fail_on_uncovered);
   ScanResidualAutomaticAddresses(result);
   return result;
 }
@@ -2247,14 +2265,16 @@ namespace transform {
 
 using namespace tirx::transform;
 
-Pass LegalizePTOVMIMemoryAccess() {
-  auto pass_func = [](PrimFunc func, const IRModule &, const PassContext &) {
+Pass LegalizePTOVMIMemoryAccess(bool fail_on_uncovered) {
+  auto pass_func = [fail_on_uncovered](PrimFunc func, const IRModule &,
+                                       const PassContext &) {
     Optional<Target> target = func->GetAttr<Target>(tvm::attr::kTarget);
     if (!target.defined() || !TargetIsPTO(target.value())) {
       return func;
     }
     arith::Analyzer analyzer;
-    Stmt body = LegalizeVmiStmt(std::move(func->body), &analyzer);
+    Stmt body =
+        LegalizeVmiStmt(std::move(func->body), &analyzer, fail_on_uncovered);
     if (body.same_as(func->body)) {
       return func;
     }

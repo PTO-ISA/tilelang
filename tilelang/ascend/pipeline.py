@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from tvm import IRModule, s_tir, tirx
 from tvm.target import Target
 
@@ -69,7 +71,9 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     # both consume the descriptor produced here.
     if target_is_pto(target):
         mod = ascend_transform.NormalizePTOAllocMarkers()(mod)
-        mod = ascend_transform.LegalizePTOVMIMemoryAccess()(mod)
+        default_coverage_check = os.environ.get("TILELANG_ENABLE_PTO_VMI_COVERAGE_CHECK", "0").lower() in ("1", "true", "yes", "on")
+        fail_on_uncovered = pass_ctx.config.get(tilelang.PassConfigKey.TL_ENABLE_PTO_VMI_COVERAGE_CHECK, default_coverage_check)
+        mod = ascend_transform.LegalizePTOVMIMemoryAccess(bool(fail_on_uncovered))(mod)
     # Expand AIV-side dual copies before layout, OOB, and scheduling passes.
     # Reuse an enclosing cthread sid from an explicit T.Vector block; an
     # auto-scheduled mixed T.Kernel gets one synthesized before its core
