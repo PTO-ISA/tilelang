@@ -924,21 +924,6 @@ bool IsNoOpStmt(const Stmt &stmt) {
   return false;
 }
 
-bool RegionContainsParallel(const Stmt &body) {
-  bool found = false;
-  PostOrderVisit(body, [&](const ObjectRef &node) {
-    if (found) {
-      return;
-    }
-    if (const auto *for_node = node.as<ForNode>()) {
-      if (for_node->kind == ForKind::kParallel) {
-        found = true;
-      }
-    }
-  });
-  return found;
-}
-
 std::string LaneUseToString(LaneUse use) {
   switch (use) {
   case LaneUse::kUniform:

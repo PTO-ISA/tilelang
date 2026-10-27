@@ -151,13 +151,10 @@ public:
       // outside a converting region is rewritten.
       return StmtExprMutator::VisitStmt_(op);
     }
-    // Only the converting regions are this pass's subject: a SIMD_VF block
-    // that holds a T.Parallel unit. A SIMD_VF block without T.Parallel
-    // (hand-written VMI) is returned unchanged, so its Min/Max keep their
-    // code shape.
-    if (!pto::RegionContainsParallel(op->body)) {
-      return GetRef<Stmt>(op);
-    }
+    // Any SIMD_VF block is traversed; no region-level predicate is needed.
+    // Every rewrite below is gated on `in_parallel_`, which only becomes true
+    // inside a `T.Parallel` loop, so a hand-written VMI region (a SIMD_VF
+    // block without a unit) is left untouched by construction.
     bool saved = in_simd_vf_;
     in_simd_vf_ = true;
     Stmt body = StmtExprMutator::VisitStmt(op->body);
@@ -260,17 +257,21 @@ private:
                          const Optional<Stmt> &else_case) {
     std::vector<const BufferStoreNode *> then_stores;
     std::vector<const BufferStoreNode *> else_stores;
-    const bool then_ok = CollectStores(then_case, &then_stores);
+    // Shape admission, not "the arm writes something": `rewritable` is true
+    // when the arm body is a single BufferStore, a SeqStmt of stores, or a
+    // no-op (an empty arm is therefore rewritable with an empty store list).
+    // `noop` below answers the other question: does the arm write at all?
+    const bool then_rewritable = CollectStores(then_case, &then_stores);
     const bool else_defined = else_case.defined();
-    const bool else_ok =
+    const bool else_rewritable =
         !else_defined || CollectStores(else_case.value(), &else_stores);
 
-    if (!then_ok) {
+    if (!then_rewritable) {
       Fail("If then-branch under T.Parallel must be BufferStore(s) or no-op "
            "(Select-rewritable); unsupported stmt shape (Verify admits the "
            "same shapes)");
     }
-    if (else_defined && !else_ok) {
+    if (else_defined && !else_rewritable) {
       Fail("If else-branch under T.Parallel must be BufferStore(s) or no-op "
            "(Select-rewritable); unsupported stmt shape (Verify admits the "
            "same shapes)");

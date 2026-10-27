@@ -397,11 +397,6 @@ PtoRegionScan ScanPtoRegion(const Stmt &region);
  * Verify admits as Select-rewritable. */
 bool IsNoOpStmt(const Stmt &stmt);
 
-/*! Whether \p body contains any T.Parallel unit anywhere inside it: the
- * test for whether a region is a converting region (a SIMD_VF block
- * without T.Parallel is a hand-written VMI region and stays untouched). */
-bool RegionContainsParallel(const Stmt &body);
-
 // The SBlock name_hint marking a SimdVF vecscope region.
 inline constexpr const char *kSimdVfBlockName = "SIMD_VF";
 

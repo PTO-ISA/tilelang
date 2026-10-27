@@ -4,8 +4,9 @@ Two facts that share the same region-level state handling:
 
 * a per-lane ``T.alloc_var`` becomes a ``local.var`` vreg, one vreg per unit
   and never shared between units;
-* a UB allocation written and read across a vecscope split is hoisted to a
-  single allocation site in the parent block.
+* a UB allocation written before a serial loop and read inside/after it has a
+  single allocation site: the region is always converted as a whole (there is
+  no vecscope split any more; the backend orders the accesses with mem_bar).
 
 Both are structure-only assertions: the pass output is inspected directly.
 """
@@ -247,7 +248,7 @@ def _k_region_local_carrier(E=256, K=8, lanes=64):
 
 
 def _k_neighbour_region_local(E=256, lanes=64):
-    """B.3 shape: `tmp` is not the carrier but lives across the split."""
+    """B.3 shape: `tmp` is written before the loop and read after it."""
     P = (E + lanes - 1) // lanes * lanes
 
     @T.prim_func
@@ -287,7 +288,7 @@ def test_region_local_carrier_has_single_allocation():
     assert _access_count(mod, "scores") >= 4
 
 
-def test_neighbour_region_local_is_hoisted_too():
+def test_neighbour_region_local_keeps_one_allocation():
     captured, _ = _lower_capture(_k_neighbour_region_local())
     mod = captured["vectorize"]
     for name in ("scores", "tmp"):
@@ -296,8 +297,8 @@ def test_neighbour_region_local_is_hoisted_too():
     assert _access_count(mod, "tmp") >= 2
 
 
-def test_no_split_keeps_region_local_allocation():
-    """A region with no carried loop is converted as a whole: no hoisting."""
+def test_region_local_allocation_stays_inside_the_region():
+    """The region is converted as a whole, so its allocation is declared once."""
     P = 256
 
     @T.prim_func
