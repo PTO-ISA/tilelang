@@ -558,6 +558,33 @@ def _k_nested_three_way(E=150, lanes=128, dtype="float32"):
     return main
 
 
+def _k_arm_read_then_write(E=150, lanes=128, dtype="float32"):
+    """One arm reads a buffer and then overwrites it (WAR); the other writes
+    and then reads it back (RAW). Both need the arm's own order preserved."""
+
+    P = (E + lanes - 1) // lanes * lanes
+
+    @T.prim_func
+    def main(A: T.Tensor((P,), dtype), Y: T.Tensor((2, P), dtype)):
+        with T.Kernel(1):
+            a = T.alloc_shared((P,), dtype)
+            y = T.alloc_shared((2, P), dtype)
+            T.copy(A, a)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(E):
+                    y[0, i] = T.float32(7.0)
+                for i in T.Parallel(E):
+                    if a[i] > T.float32(0.0):
+                        y[1, i] = y[0, i]
+                        y[0, i] = T.float32(1.0)
+                    else:
+                        y[0, i] = T.float32(2.0)
+                        y[1, i] = y[0, i]
+            T.copy(y, Y)
+
+    return main
+
+
 def _k_scalar_bool_select(E=150, lanes=128, dtype="float32"):
     """Both arms write one address and the condition is a bare scalar bool."""
 
@@ -662,6 +689,22 @@ def _k_boolean_mask(E, lanes, dtype="float32"):
             T.copy(c, C)
 
     return main
+
+
+@pytest.mark.pto
+def test_conditional_arm_with_read_then_write_keeps_arm_order():
+    """A WAR inside one arm (read a buffer, then overwrite it) is accepted: both
+    arms are emitted in source order with their branch predicate, and the
+    backend orders the resulting accesses (mem_bar)."""
+
+    stages, error = _lower_capture(_k_arm_read_then_write())
+    assert error is None, f"WAR/RAW inside an arm must lower, got: {error}"
+
+    legalized = stages["legalize"]
+    assert not _if_then_elses(legalized), "the branch must be legalized away"
+    stores = _predicated_stores(legalized)
+    assert len(stores) == 4, f"expected four predicated stores, got {len(stores)}"
+    assert not _selects(legalized), "an ordered arm must not be merged into a Select"
 
 
 @pytest.mark.pto

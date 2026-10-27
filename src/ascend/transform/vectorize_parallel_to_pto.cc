@@ -344,11 +344,14 @@ private:
         << "[VectorizeParallelToPTO] internal error: parallel units lost "
            "after scan";
 
-    // The vecscope split: a serial loop that carries a shared buffer
-    // through UB (a unit that both loads and stores the same buffer) has
-    // no ordering point inside one vecscope — every synchronisation
-    // operation delimits a vecscope, so none may appear between two
-    // iterations. When the carry promotion below does not apply (carried
+    // The vecscope split keeps one iteration per vecscope instead of relying
+    // on intra-scope ordering: a serial loop that carries a shared buffer
+    // through UB (a unit that both loads and stores the same buffer) would
+    // otherwise depend on iteration-to-iteration ordering inside one scope.
+    // When the carry promotion below does not apply (the carried value is not
+    // a single full lane vector), hoist the loop nest out of the region and
+    // give every iteration its own region, so consecutive iterations are
+    // separated by a vecscope transition.
     // value is not a single full lane vector), hoist the loop nest out of
     // the region and give every iteration its own region, so consecutive
     // iterations are separated by a vecscope transition, which *is* the
@@ -565,7 +568,8 @@ private:
   //
   // A SIMD_VF region may contain a serial loop whose body carries a shared
   // buffer through UB (load+store the same buffer inside one unit). Inside
-  // one vecscope such a chain has no ordering point, so the split rewrites
+  // one vecscope such a chain would reflect an iteration-to-iteration
+  // dependence; the split gives every iteration its own scope and rewrites
   //
   //   SIMD_VF { pre;  for t { body }  post }
   //
@@ -650,8 +654,8 @@ private:
     std::vector<Stmt> stmts;
     FlattenTopStmts(fn->body, &stmts);
     // Every sibling serial loop that carries a buffer through UB must get its
-    // own region: leaving two of them in one vecscope has no ordering point
-    // between their iterations (the plain path this split exists to avoid).
+    // own region: leaving two of them in one vecscope would interleave their
+    // iterations (the plain path this split exists to avoid).
     std::vector<size_t> nested;
     for (size_t i = 0; i < stmts.size(); ++i) {
       const auto *f = stmts[i].as<ForNode>();
@@ -742,9 +746,9 @@ private:
       for (size_t idx : carriers) {
         if (UsesAnyVar(stmts[idx], outer_binds)) {
           // Fail-closed: the loop must be split — its iterations carry
-          // a buffer through UB, and one vecscope has no ordering point — but
-          // a bind from a sibling statement blocks moving the loop across the
-          // new region boundary. Converting the region as a whole is the
+          // Fail-closed: the loop must be split (its iterations carry a
+          // buffer through UB, so it needs its own region), but a bind from a
+          // sibling statement blocks moving the loop across the new region
           // unreliable shape (the same one the vecscope split exists to
           // avoid), so reject instead of silently emitting it.
           LOG(FATAL)

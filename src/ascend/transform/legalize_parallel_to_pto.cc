@@ -10,10 +10,13 @@
  * destination) or a predicated store (one-sided branch; nested conditions
  * conjoin their predicates), Min/Max become comparisons + Select, and the
  * tl/tir.infinity() constant becomes FloatImm, so the vectorizer only
- * needs vcmp/vcmps + vsel + a masked vstore. A one-sided branch never reads
- * its destination: a vecscope has no ordering point, so a read of the
- * destination would observe stale UB whenever the buffer had been written
- * earlier in the same scope. It never emits VMI and never calls a reducer.
+ * needs vcmp/vcmps + vsel + a masked vstore. A branch that writes a buffer
+ * and then reads it back (or reads it and then overwrites it) is emitted in
+ * its source order with the branch predicate, so the access sequence the
+ * source implies is preserved; ordering inside one vecscope is the backend's
+ * job (PTOAS analyses intra-vecscope UB dependencies and inserts mem_bar), so
+ * this pass neither rejects those shapes nor inserts synchronisation itself.
+ * It never emits VMI and never calls a reducer.
  * A shape whose condition semantics cannot be preserved by the rewrite is
  * reported instead of being silently widened.
  *
@@ -323,35 +326,48 @@ private:
           th->buffer, ExpandPredSelect(cond, then_v, else_v), th->indices));
     };
 
-    // A store whose value reads a buffer another store of the same arm wrote
-    // earlier only keeps its meaning if the arm's write order is preserved.
+    // An arm whose stores depend on each other only keeps its meaning if the
+    // arm's write order is preserved: a later store may read what an earlier
+    // one wrote (RAW), or overwrite what an earlier one read (WAR). Both are
+    // accepted here: the arms are emitted in their source order with the
+    // branch predicate, and the backend orders the resulting UB accesses
+    // (PTOAS analyses intra-vecscope dependencies and inserts mem_bar). This
+    // pass only has to produce the correct access sequence, not to insert
+    // synchronisation itself.
     auto has_intra_arm_dependency =
         [](const std::vector<const BufferStoreNode *> &stores) {
           std::set<const BufferNode *> written;
-          for (const BufferStoreNode *store : stores) {
-            class ReadsAny : public StmtExprVisitor {
-            public:
-              explicit ReadsAny(const std::set<const BufferNode *> &b)
-                  : bufs_(b) {}
-              void VisitExpr_(const BufferLoadNode *op) final {
-                if (bufs_.count(op->buffer.get()) != 0) {
-                  hit_ = true;
-                }
-                StmtExprVisitor::VisitExpr_(op);
-              }
-              bool hit_ = false;
+          std::set<const BufferNode *> read;
+          class Reads : public StmtExprVisitor {
+          public:
+            explicit Reads(std::set<const BufferNode *> *out) : out_(out) {}
+            void VisitExpr_(const BufferLoadNode *op) final {
+              out_->insert(op->buffer.get());
+              StmtExprVisitor::VisitExpr_(op);
+            }
 
-            private:
-              const std::set<const BufferNode *> &bufs_;
-            } probe(written);
+          private:
+            std::set<const BufferNode *> *out_;
+          };
+          for (const BufferStoreNode *store : stores) {
+            std::set<const BufferNode *> store_reads;
+            Reads probe(&store_reads);
             probe(store->value);
             for (const PrimExpr &idx : store->indices) {
               probe(idx);
             }
-            if (probe.hit_) {
+            // RAW: this store reads what an earlier store of the arm wrote.
+            for (const BufferNode *buf : store_reads) {
+              if (written.count(buf) != 0) {
+                return true;
+              }
+            }
+            // WAR: this store overwrites what an earlier store of the arm read.
+            if (read.count(store->buffer.get()) != 0) {
               return true;
             }
             written.insert(store->buffer.get());
+            read.insert(store_reads.begin(), store_reads.end());
           }
           return false;
         };
