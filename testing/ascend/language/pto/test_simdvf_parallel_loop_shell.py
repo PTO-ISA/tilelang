@@ -182,8 +182,6 @@ def _k_shell_no_carry(E, lanes, dtype="float32"):
             T.copy(out_ub, Y)
 
     return main
-
-
 def _k_two_carried(E=256, lanes=64):
     """Two buffers both read and written inside the shell: rejected."""
     P = (E + lanes - 1) // lanes * lanes
@@ -204,8 +202,6 @@ def _k_two_carried(E=256, lanes=64):
             T.copy(y_ub, Y)
 
     return main
-
-
 def _k_seed_not_adjacent(E=256, lanes=64):
     """Seed store exists but is not the statement right before the shell."""
     P = (E + lanes - 1) // lanes * lanes
@@ -226,8 +222,6 @@ def _k_seed_not_adjacent(E=256, lanes=64):
             T.copy(y_ub, Y)
 
     return main
-
-
 def _k_region_leak(E=256, lanes=64):
     """A second unit reads the carried buffer: region isolation violated."""
     P = (E + lanes - 1) // lanes * lanes
@@ -256,19 +250,18 @@ def _k_region_leak(E=256, lanes=64):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.pto
-def test_inside_serial_promotes_carry_to_vreg():
+def test_inside_serial_shell_is_preserved():
     E, lanes = 256, 64
     stages, error = _lower_capture(_k_newton_inside(E, lanes))
     assert error is None, f"the inside-serial form must lower, got: {error}"
 
     vec = str(stages["vectorize"])
-    # The carried value lives in a local.var vreg buffer, not in UB.
-    assert "y_ub_carry" in vec, "the carry must be promoted to a vreg buffer"
-    assert "local.var" in vec
-    # Seed store and in-shell stores are eliminated; exactly one vstore
-    # (the post-shell writeback) remains.
-    assert vec.count("vstore") == 1, (
-        f"expected exactly one writeback vstore, got {vec.count('vstore')}"
+    # No carry promotion any more: the carrier keeps round-tripping through UB
+    # and the ordering comes from the backend mem_bar (verify writes the value).
+    assert "_carry" not in vec, "the carry promotion is retired"
+    assert "y_ub" in vec, "the carrier must still be accessed by name"
+    assert vec.count("vstore") >= 2, (
+        "the seed and the in-shell update both stay UB stores"
     )
     # The shell is preserved as a scalar loop over _t.
     shells = _serial_shells_named(stages["vectorize"], "_t")
@@ -280,15 +273,14 @@ def test_inside_serial_promotes_carry_to_vreg():
 
 
 @pytest.mark.pto
-def test_inside_serial_tail_mask_with_carry():
-    E, lanes = 150, 128  # non-divisible: dynamic tail mask + carry
+def test_inside_serial_tail_mask_is_preserved():
+    E, lanes = 150, 128  # non-divisible: dynamic tail mask + carried shell
     stages, error = _lower_capture(_k_newton_inside(E, lanes))
-    assert error is None, f"the tail + carry form must lower, got: {error}"
+    assert error is None, f"the tail + carried shell must lower, got: {error}"
 
     vec = str(stages["vectorize"])
-    assert "y_ub_carry" in vec
+    assert "_carry" not in vec, "the carry promotion is retired"
     assert "remaining" in vec, "the tail path must keep its remaining counter"
-    assert vec.count("vstore") == 1
     assert _serial_shells_named(stages["vectorize"], "_t")
 
 
@@ -322,38 +314,14 @@ def test_runtime_bound_shell_is_admitted_and_preserved():
 
 
 @pytest.mark.pto
-def test_runtime_bound_shell_still_promotes_carry():
-    """A runtime trip count does not change the carry promotion decision."""
+def test_runtime_bound_carried_shell_is_preserved():
+    """A runtime trip count keeps the shell; the carrier stays in UB."""
     E, lanes = 256, 64
     stages, error = _lower_capture(_k_runtime_shell_carry(E, lanes))
     assert error is None, f"a runtime-bound carried shell must lower, got: {error}"
 
     vec = str(stages["vectorize"])
-    assert "y_ub_carry" in vec, "the carry must still be promoted to a vreg"
-    assert vec.count("vstore") == 1, (
-        f"expected exactly one writeback vstore, got {vec.count('vstore')}"
-    )
+    assert "_carry" not in vec, "the carry promotion is retired"
     shells = _serial_shells_named(stages["vectorize"], "_t")
     assert shells, "the runtime-bound shell must survive vectorization"
     assert not isinstance(shells[0].extent, tvm.tirx.IntImm)
-
-
-# ---------------------------------------------------------------------------
-# Negatives: order-unsafe shells are rejected, not silently mis-lowered
-# ---------------------------------------------------------------------------
-
-@pytest.mark.pto
-@pytest.mark.parametrize(
-    "builder,needle",
-    [
-        (_k_two_carried, "more than one buffer"),
-        (_k_seed_not_adjacent, "seed"),
-        (_k_region_leak, "only be accessed"),
-    ],
-)
-def test_unsafe_shells_are_rejected(builder, needle):
-    _, error = _lower_capture(builder(), expect_error=True)
-    assert error is not None
-    message = str(error)
-    assert "[VectorizeParallelToPTO] loop shell" in message
-    assert needle in message, f"expected {needle!r} in: {message}"

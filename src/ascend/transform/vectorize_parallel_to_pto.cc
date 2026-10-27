@@ -342,8 +342,9 @@ private:
     // inside one vecscope, so the ordering comes from the backend: ptoas
     // analyses intra-vecscope dependencies (loop-carried included) and inserts
     // pto.mem_bar. The previous "vecscope split" (one region per iteration) is
-    // retired; when the carried value can stay in a register, the per-unit
-    // carry promotion below avoids the UB round-trip altogether.
+    // retired: loop-carried accesses round-trip through UB and rely on the
+    // same barrier. When the value can stay in a register (`T.alloc_var`),
+    // the per-lane vreg promotion below avoids the round trip altogether.
     //
     // The block itself is rebuilt around the converted body: its alloc_buffers
     // declare the region-local UB buffers (`scores`, ...), so dropping the
@@ -354,7 +355,7 @@ private:
                   op->match_buffers, op->annotations);
   }
 
-  // Convert one SIMD_VF region body: mask plan, carry promotion, units.
+  // Convert one SIMD_VF region body: mask plan and units.
   Stmt ConvertRegionBody(const Stmt &region) {
     pto_analysis::PtoRegionScan scan = pto_analysis::ScanPtoRegion(region);
     ICHECK(!scan.units.empty())
@@ -477,17 +478,6 @@ private:
     return body;
   }
 
-  // ------------------------------------------------------------------
-  // Loop shells (constant-bound T.serial inside T.Parallel, admitted by
-  // Verify). AnalyzeLoopShell runs per unit before conversion. The shell
-  // itself is always preserved as a scalar loop; when the canonical
-  // carry pattern matches, the carried value is promoted to a local.var
-  // vreg buffer (the UB round-trip is not order-safe on the current
-  // PTOAS: no automatic mem_bar between the carried vstore and the next
-  // iteration's vload). A shell whose body both reads and writes a
-  // buffer through UB without matching the pattern would silently read
-  // stale values, so it is rejected instead.
-  // ------------------------------------------------------------------
   static void FlattenStmts(const Stmt &stmt, std::vector<Stmt> *out) {
     if (const auto *seq = stmt.as<SeqStmtNode>()) {
       for (const auto &s : seq->seq) {
@@ -498,261 +488,13 @@ private:
     out->push_back(stmt);
   }
 
-  class ShellAccessCollector : public StmtExprVisitor {
-  public:
-    struct Access {
-      const BufferNode *buf;
-      Array<PrimExpr> indices;
-      bool is_store;
-    };
-    std::vector<Access> accesses;
-    std::vector<const VarNode *> loop_vars;
-    void VisitStmt_(const BufferStoreNode *op) final {
-      accesses.push_back({op->buffer.get(), op->indices, true});
-      StmtExprVisitor::VisitStmt_(op);
-    }
-    void VisitExpr_(const BufferLoadNode *op) final {
-      accesses.push_back({op->buffer.get(), op->indices, false});
-      StmtExprVisitor::VisitExpr_(op);
-    }
-    void VisitStmt_(const ForNode *op) final {
-      loop_vars.push_back(op->loop_var.get());
-      StmtExprVisitor::VisitStmt_(op);
-    }
-  };
-
-  class BufferAccessCounter : public StmtExprVisitor {
-  public:
-    explicit BufferAccessCounter(const BufferNode *buf) : buf_(buf) {}
-    void VisitStmt_(const BufferStoreNode *op) final {
-      if (op->buffer.get() == buf_) {
-        ++count_;
-      }
-      StmtExprVisitor::VisitStmt_(op);
-    }
-    void VisitExpr_(const BufferLoadNode *op) final {
-      if (op->buffer.get() == buf_) {
-        ++count_;
-      }
-      StmtExprVisitor::VisitExpr_(op);
-    }
-    int count_ = 0;
-
-  private:
-    const BufferNode *buf_;
-  };
-
-  [[noreturn]] void ShellFail(const std::string &message) {
-    LOG(FATAL) << "[VectorizeParallelToPTO] loop shell: " << message;
-  }
-
-  bool IsCarryAccess(const Buffer &buf, const Array<PrimExpr> &indices) const {
-    if (!carry_src_.defined() || !buf->data.same_as(carry_src_->data)) {
-      return false;
-    }
-    if (carry_lane_var_match_) {
-      // Region-level promotion: every unit has its own Parallel loop var, so
-      // the carried access is "this buffer, indexed by a single lane Var".
-      return indices.size() == 1 && indices[0].as<VarNode>() != nullptr;
-    }
-    if (indices.size() != carry_indices_.size()) {
-      return false;
-    }
-    for (size_t i = 0; i < indices.size(); ++i) {
-      if (!ffi::StructuralEqual()(indices[i], carry_indices_[i])) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  void AnalyzeLoopShell(const Stmt &unit_body, const Stmt &region_body) {
-    carry_seed_ = nullptr;
-    carry_loop_ = nullptr;
-    carry_src_ = tirx::Buffer();
-    carry_vreg_ = tirx::Buffer();
-    carry_indices_ = Array<PrimExpr>();
-    carry_active_ = false;
-
-    std::vector<Stmt> stmts;
-    FlattenStmts(unit_body, &stmts);
-    const ForNode *shell = nullptr;
-    size_t shell_pos = 0;
-    for (size_t i = 0; i < stmts.size(); ++i) {
-      if (const auto *f = stmts[i].as<ForNode>()) {
-        if (f->kind == ForKind::kSerial) {
-          if (shell != nullptr) {
-            ShellFail("only one T.serial loop per T.Parallel unit is "
-                      "supported at this stage");
-          }
-          shell = f;
-          shell_pos = i;
-        }
-      }
-    }
-    if (shell == nullptr) {
-      return; // no shell in this unit
-    }
-
-    ShellAccessCollector collector;
-    collector(shell->body);
-    // Buffers the shell both reads and writes through memory — the
-    // cross-iteration dependencies.
-    std::unordered_map<const BufferNode *, std::pair<int, int>> counts;
-    for (const auto &acc : collector.accesses) {
-      // A per-lane scalar is a register, not a memory carry: its in-shell
-      // update is promoted to the vreg by ConvertBody, so it never needs a
-      // UB round-trip promotion (and must not be counted as the carried
-      // buffer, whose post-shell isolation check would then reject the
-      // legitimate reads of the final value).
-      if (pto_analysis::IsLaneScalarBuffer(GetRef<Buffer>(acc.buf))) {
-        continue;
-      }
-      auto &c = counts[acc.buf];
-      if (acc.is_store) {
-        ++c.second;
-      } else {
-        ++c.first;
-      }
-    }
-    const BufferNode *carried = nullptr;
-    for (const auto &kv : counts) {
-      if (kv.second.first > 0 && kv.second.second > 0) {
-        if (carried != nullptr) {
-          ShellFail("the T.serial loop reads and writes more than one "
-                    "buffer; only a single carried buffer is supported at "
-                    "this stage");
-        }
-        carried = kv.first;
-      }
-    }
-    if (carried == nullptr) {
-      // Shell without a memory-carried value: plain preservation has no
-      // cross-iteration write->read through UB to order.
-      return;
-    }
-
-    // Every access of the carried buffer inside the shell must use one
-    // index set (structurally equal, independent of every loop
-    // variable), with exactly one store.
-    std::vector<const ShellAccessCollector::Access *> carried_accesses;
-    for (const auto &acc : collector.accesses) {
-      if (acc.buf == carried) {
-        carried_accesses.push_back(&acc);
-      }
-    }
-    int carried_stores = 0;
-    for (const auto *acc : carried_accesses) {
-      if (acc->is_store) {
-        ++carried_stores;
-      }
-    }
-    if (carried_stores != 1) {
-      ShellFail("the carried buffer must have exactly one store inside the "
-                "T.serial loop");
-    }
-    const Array<PrimExpr> &ref = carried_accesses[0]->indices;
-    for (const auto *acc : carried_accesses) {
-      if (acc->indices.size() != ref.size()) {
-        ShellFail("all carried accesses must use the same index");
-      }
-      for (size_t i = 0; i < ref.size(); ++i) {
-        if (!ffi::StructuralEqual()(acc->indices[i], ref[i])) {
-          ShellFail("all carried accesses must use the same index");
-        }
-      }
-    }
-    std::vector<const VarNode *> loop_vars = collector.loop_vars;
-    loop_vars.push_back(shell->loop_var.get());
-    for (const auto &idx : ref) {
-      for (const VarNode *lv : loop_vars) {
-        if (tirx::UsesVar(idx, [lv](const VarNode *v) { return v == lv; })) {
-          ShellFail("the carried index must not depend on the loop "
-                    "variable");
-        }
-      }
-    }
-
-    // The seed: a store to the carried buffer, immediately before the
-    // shell, whose value does not read the carried buffer.
-    if (shell_pos == 0) {
-      ShellFail("the loop carry needs a seed store to the carried buffer "
-                "immediately before the T.serial loop");
-    }
-    const auto *seed = stmts[shell_pos - 1].as<BufferStoreNode>();
-    if (seed != nullptr && seed->predicate.defined()) {
-      ShellFail("the seed store of the carried buffer must be "
-                "unconditional; a conditional seed cannot be promoted to a "
-                "register and has no ordered UB form inside a vecscope");
-    }
-    if (seed == nullptr || seed->buffer.get() != carried ||
-        seed->indices.size() != ref.size()) {
-      ShellFail("the loop carry needs a seed store to the carried buffer "
-                "immediately before the T.serial loop");
-    }
-    for (size_t i = 0; i < ref.size(); ++i) {
-      if (!ffi::StructuralEqual()(seed->indices[i], ref[i])) {
-        ShellFail("the seed store must use the same index as the carried "
-                  "accesses");
-      }
-    }
-    class SeedReadsCarried : public StmtExprVisitor {
-    public:
-      explicit SeedReadsCarried(const BufferNode *buf) : buf_(buf) {}
-      void VisitExpr_(const BufferLoadNode *op) final {
-        if (op->buffer.get() == buf_) {
-          reads_ = true;
-        }
-        StmtExprVisitor::VisitExpr_(op);
-      }
-      bool reads_ = false;
-
-    private:
-      const BufferNode *buf_;
-    };
-    SeedReadsCarried seed_check(carried);
-    seed_check(seed->value);
-    if (seed_check.reads_) {
-      ShellFail("the seed value must not read the carried buffer");
-    }
-
-    // Isolation: the carried buffer must not be accessed anywhere else
-    // in the region (every other access would observe the eliminated
-    // round-trip). The pattern's own accesses are the seed plus the
-    // in-shell ones; the post-shell writeback is emitted, not counted.
-    BufferAccessCounter region_count(carried);
-    region_count(region_body);
-    if (region_count.count_ !=
-        static_cast<int>(carried_accesses.size()) + 1) {
-      ShellFail("the carried buffer must only be accessed by the seed "
-                "store and the T.serial loop in this SIMD_VF region");
-    }
-
-    carry_seed_ = seed;
-    carry_loop_ = shell;
-    carry_src_ = GetRef<Buffer>(carried);
-    carry_indices_ = ref;
-    carry_vreg_ = tirx::decl_buffer(
-        {IntImm(DataType::Int(32), 1)},
-        VectorDType(carried->dtype, lanes_),
-        std::string(carried->name) + "_carry", "local.var");
-  }
-
-  Stmt WrapCarryAlloc(Stmt s) {
-    if (carry_vreg_.defined()) {
-      return SeqStmt::Flatten(AllocBuffer(carry_vreg_), std::move(s));
-    }
-    return s;
-  }
-
   // ------------------------------------------------------------------
   // Per-lane scalar promotion (`T.alloc_var` in a Parallel unit)
   // ------------------------------------------------------------------
   // `T.alloc_var(dtype)` is a single-element `local.var` buffer. Every lane
   // owns its own copy, so the buffer is a per-lane register rather than a
   // lane-addressed memory object; Vectorize reads and writes it as a
-  // `local.var` vector (vreg) so the value stays in RF and a carried update
-  // inside a preserved shell becomes an ordinary SSA loop carry.
+  // `local.var` vector (vreg) so the value stays in RF.
   // Create (once per unit) the vreg backing a per-lane scalar.
   tirx::Buffer LaneScalarVreg(const Buffer &buffer) {
     auto it = lane_scalar_vregs_.find(buffer.get());
@@ -767,57 +509,17 @@ private:
     return vreg;
   }
 
-  // Declare the per-lane vregs and the shell carry vreg inside the unit but
-  // outside the shell, so a carried update binds to one SSA name.
-  Stmt WrapCarryAllocIfLocal(Stmt s) {
-    // Per-lane scalar vregs are declared at the same place as the carry vreg:
-    // inside the unit, outside the shell, so a carried update binds to one
-    // SSA name. Reversed so the first created vreg ends up outermost.
+  // Declare the per-lane vregs created for this unit inside it but outside
+  // its shell, so a carried update binds to one SSA name. Reversed so the
+  // first created vreg ends up outermost.
+  Stmt DeclareLaneScalarVregs(Stmt s) {
     for (auto it = lane_scalar_allocs_.rbegin(); it != lane_scalar_allocs_.rend();
          ++it) {
       s = SeqStmt::Flatten(AllocBuffer(*it), std::move(s));
     }
     lane_scalar_allocs_.clear();
-    return WrapCarryAlloc(std::move(s));
+    return s;
   }
-
-  // The shell's own stores were eliminated by promotion; publish the
-  // final carry value back to the source buffer once, after the shell.
-  Stmt EmitCarryWriteback() {
-    auto access = pto_analysis::AnalyzeBufferAccess(
-        carry_src_, carry_indices_, /*is_write=*/true, loop_var_,
-        CurrentMapping(), &analyzer_, bind_env_);
-    ICHECK(access.pattern == pto_analysis::AccessPattern::kContinuous)
-        << "[VectorizeParallelToPTO] internal error: the carry writeback "
-           "address is not continuous";
-    Array<PrimExpr> start_idx;
-    for (const auto &idx : access.start_indices) {
-      start_idx.push_back(
-          analyzer_.Simplify(BindChunkToQ(SubstituteLaneZero(idx))));
-    }
-    PrimExpr ptr =
-        Call(DataType::Handle(), tl::access_ptr(),
-             {BufferLoad(carry_src_, start_idx),
-              IntImm(DataType::Int(32), static_cast<int>(lanes_)),
-              IntImm(DataType::Int(32), 2)});
-    return Evaluate(Call(
-        DataType::Void(), VmiOp("vstore"),
-        {BufferLoad(carry_vreg_, {make_zero(DataType::Int(32))}), ptr,
-         IntImm(DataType::Int(32), 0), mask_var_}));
-  }
-
-  // ------------------------------------------------------------------
-  // Region-level carry promotion (serial loop WRAPPING Parallel units).
-  //
-  // Inside one vecscope a UB read-modify-write chain has no ordering
-  // point: every sync operation delimits a vecscope, so none can appear
-  // between two iterations. An accumulator updated that way keeps reading
-  // its seed or a partially updated value, and the outcome depends on the
-  // trip count and on backend scheduling. Promoting the accumulator to a
-  // local.var vreg makes the loop carry an SSA value (scf.for iter_args),
-  // so no memory ordering is needed at all.
-  //
-
 
   // ------------------------------------------------------------------
   // Per-unit conversion
@@ -891,15 +593,6 @@ private:
       mask_var_ = Var("mask", DataType::Bool(static_cast<int>(lanes_)));
     }
 
-    carry_lane_var_match_ = false;
-    // Loop shells: analyze the unit body for preserved serial loops before
-    // conversion -- set up carry promotion where the canonical pattern
-    // matches, and reject order-unsafe shapes.
-    AnalyzeLoopShell(
-        inner != nullptr ? static_cast<const Stmt &>(inner->body)
-                         : static_cast<const Stmt &>(loop->body),
-        region_body);
-
     // Convert the unit body statements in order. For a 2D unit this is
     // the innermost compute body; the outer (kept) coordinate is
     // re-emitted as a serial loop around the chunk loop.
@@ -939,7 +632,7 @@ private:
             ForKind::kSerial, chunk_body);
     if (inner == nullptr) {
       if (!has_tail) {
-        return WrapCarryAllocIfLocal(chunk_loop);
+        return DeclareLaneScalarVregs(chunk_loop);
       }
       // remaining lives across the whole chunk loop: declare it, set it
       // to E once before the loop.
@@ -948,7 +641,7 @@ private:
                       IntImm(DataType::Int(32),
                              static_cast<int64_t>(mapping.logical_extent)),
                       {make_zero(DataType::Int(32))});
-      return WrapCarryAllocIfLocal(SeqStmt::Flatten(
+      return DeclareLaneScalarVregs(SeqStmt::Flatten(
           AllocBuffer(remaining_buffer_), SeqStmt::Flatten(init, chunk_loop)));
     }
     // 2D: keep the non-vectorized coordinate as the outer
@@ -976,7 +669,7 @@ private:
     Stmt result =
         has_tail ? SeqStmt::Flatten(AllocBuffer(remaining_buffer_), kept_loop)
                  : kept_loop;
-    return WrapCarryAllocIfLocal(std::move(result));
+    return DeclareLaneScalarVregs(std::move(result));
   }
 
   // Substitute the analysis chunk var with the real loop var q (and keep
@@ -1112,69 +805,6 @@ private:
                                    {make_zero(DataType::Int(32))}));
         return;
       }
-      if (carry_seed_ != nullptr && store == carry_seed_) {
-        // Seed of the promoted carry: forward the value into the vreg
-        // buffer instead of storing to UB, so the shell's loads never
-        // see a round-trip.
-        Array<Stmt> pre;
-        PrimExpr value = ConvertExpr(store->value, &pre);
-        if (value.dtype().lanes() == 1) {
-          value = BroadcastToLanes("vbrc_val", value, &pre);
-        }
-        for (const auto &s : pre) {
-          out->push_back(s);
-        }
-        out->push_back(BufferStore(carry_vreg_, value,
-                                   {make_zero(DataType::Int(32))}));
-        return;
-      }
-      if (carry_active_ && IsCarryAccess(store->buffer, store->indices)) {
-        // Carry update inside the shell: write the vreg buffer instead
-        // of a vstore. Unwrap a trailing pure Bind so the emitted
-        // assignment keeps the direct `acc = f(acc, ...)` form the
-        // PTODSL rewriter turns into scf.for iter_args.
-        Array<Stmt> pre;
-        PrimExpr value = ConvertExpr(store->value, &pre);
-        if (const auto *var = value.as<VarNode>()) {
-          if (!pre.empty()) {
-            const Stmt &last = pre.back();
-            if (const auto *b = last.as<BindNode>()) {
-              if (b->var.get() == var) {
-                Array<Stmt> kept;
-                for (size_t i = 0; i + 1 < pre.size(); ++i) {
-                  kept.push_back(pre[i]);
-                }
-                pre = kept;
-                value = b->value;
-              }
-            }
-          }
-        }
-        if (value.dtype().lanes() == 1) {
-          // Region-level promotion: the seed unit stores a scalar constant
-          // into the vector carrier, so broadcast it first.
-          value = BroadcastToLanes("vbrc_val", value, &pre);
-        }
-        for (const auto &s : pred_pre) {
-          pre.push_back(s);
-        }
-        if (predicated) {
-          // A conditional carry update keeps the register value on the
-          // lanes the predicate does not select.
-          value = EmitBind(
-              "vsel",
-              Call(value.dtype(), VmiOp("vsel"),
-                   {pred_mask, value,
-                    BufferLoad(carry_vreg_, {make_zero(DataType::Int(32))})}),
-              &pre);
-        }
-        for (const auto &s : pre) {
-          out->push_back(s);
-        }
-        out->push_back(BufferStore(carry_vreg_, value,
-                                   {make_zero(DataType::Int(32))}));
-        return;
-      }
       Array<Stmt> pre;
       PrimExpr value = ConvertExpr(store->value, &pre);
       auto access = pto_analysis::AnalyzeBufferAccess(
@@ -1284,19 +914,11 @@ private:
       Array<Stmt> inner;
       Map<Var, PrimExpr> saved_env = bind_env_;
       Map<Var, Var> saved_map = value_map_;
-      bool saved_carry = carry_active_;
-      if (carry_loop_ != nullptr && loop == carry_loop_) {
-        carry_active_ = true;
-      }
       ConvertBody(loop->body, &inner);
-      carry_active_ = saved_carry;
       bind_env_ = std::move(saved_env);
       value_map_ = std::move(saved_map);
       out->push_back(For(loop->loop_var, loop->min, loop->extent,
                          ForKind::kSerial, SeqStmt::Flatten(inner)));
-      if (carry_loop_ != nullptr && loop == carry_loop_) {
-        out->push_back(EmitCarryWriteback());
-      }
       return;
     }
     LOG(FATAL) << "[VectorizeParallelToPTO] internal error: unsupported "
@@ -1324,10 +946,6 @@ private:
       if (pto_analysis::IsLaneScalarBuffer(load->buffer)) {
         return BufferLoad(LaneScalarVreg(load->buffer),
                           {make_zero(DataType::Int(32))});
-      }
-      if (carry_active_ && IsCarryAccess(load->buffer, load->indices)) {
-        // Promoted carry read: the value lives in the vreg buffer.
-        return BufferLoad(carry_vreg_, {make_zero(DataType::Int(32))});
       }
       auto access = pto_analysis::AnalyzeBufferAccess(
           load->buffer, load->indices, /*is_write=*/false, loop_var_,
@@ -1825,27 +1443,12 @@ private:
   /*! Per-unit scalar buffer holding `remaining` for a non-divisible
    * extent (invalid for divisible units). */
   tirx::Buffer remaining_buffer_{};
-  // Loop-shell carry promotion (AnalyzeLoopShell): when a unit's
-  // preserved serial shell matches the canonical carry pattern, the
-  // carried buffer's in-shell accesses are rewritten to this local.var
-  // vreg buffer, so the loop never round-trips through UB — the
-  // round-trip is not order-safe on the current PTOAS (no automatic
-  // mem_bar between the carried vstore and the next iteration's vload).
-  const BufferStoreNode *carry_seed_ = nullptr;
-  const ForNode *carry_loop_ = nullptr;
-  tirx::Buffer carry_src_{};
-  tirx::Buffer carry_vreg_{};
-  Array<PrimExpr> carry_indices_{};
-  bool carry_active_ = false;
-  // Region-level carry matches any single lane Var index (each unit has its
-  // own Parallel loop var), not one fixed expression.
-  bool carry_lane_var_match_ = false;
   // Per-lane scalar promotion (`T.alloc_var` inside a Parallel unit). The
   // single-element `local.var` buffer is a private register per lane, so each
   // whole-buffer access becomes a `local.var` vector (vreg) access: the seed
   // store broadcasts, later loads/stores reference the same vreg. Keyed by the
   // source buffer node; the vregs are declared at unit scope by
-  // WrapCarryAllocIfLocal.
+  // DeclareLaneScalarVregs.
   std::unordered_map<const BufferNode *, tirx::Buffer> lane_scalar_vregs_;
   std::vector<tirx::Buffer> lane_scalar_allocs_;
   int tmp_counter_ = 0;
