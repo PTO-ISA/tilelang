@@ -53,9 +53,13 @@ enum class AccessPattern {
   kContinuous,
   /*! Address independent of lane at the current program point. */
   kLaneUniform,
+  /*! Read-only, lane-indexed UB access lowered using byte offsets. */
+  kGather,
 };
 
 std::string AccessPatternToString(AccessPattern pattern);
+const char *IntegerVmiOpName(const std::string &name);
+bool IsPowerOfTwoDivisor(const PrimExpr &value);
 
 /*!
  * \brief Result of the shared single-access analysis.
@@ -237,6 +241,8 @@ enum class VectorCastOp {
   /*! Real non-integer conversion (f16/bf16/FP8 -> f32, f32 -> f16/bf16/FP8);
    * empty options still mean a conversion, never a no-op. */
   kNonIntegerConvert,
+  /*! Round to odd before BF16 -> FP4 to avoid double rounding. */
+  kFloat32ToOddBF16,
 };
 
 struct VectorCastStep {
@@ -257,6 +263,16 @@ struct VectorCastPlan {
 };
 
 using CastPlan = std::variant<ScalarCastPlan, VectorCastPlan>;
+
+// Maps a frontend boolean-combine op name (tirx./tir.bitwise_{and,or,not}
+// or tir.{And,Or,Not}) to the PTODSL bitwise vector op whose mask register
+// overload implements the boolean combine ("vand"/"vor"/"vnot"); returns
+// nullptr for any other name.
+const char *MaskLogicVmiOpName(const std::string &tir_op_name);
+
+// The tirx.* unary math ops with a VMI mapping (fabs/exp/log/sqrt):
+// returns the VMI op name, or nullptr for any other name.
+const char *VectorUnaryVmiOpName(const std::string &tirx_op_name);
 
 /*! Operation-level type support for the vector arithmetic emitted
  * here. VMI vmul only supports i16/i32/f16/bf16/f32
@@ -378,6 +394,17 @@ struct PtoRegionScan {
  * AttrStmt wrapper) for parallel units. One implementation shared by
  * Verify and Vectorize. */
 PtoRegionScan ScanPtoRegion(const Stmt &region);
+
+/*! A statement that carries no work: an Evaluate of an IntImm constant
+ * (e.g. a store simplified away into a constant), an empty SeqStmt, or a
+ * SeqStmt whose every element is itself a no-op. The shared contract for
+ * the "no operation" arm of a conditional branch under T.Parallel — the
+ * shape Legalize rewrites as "no else" (the masked-update Select form) and
+ * Verify admits as Select-rewritable. */
+bool IsNoOpStmt(const Stmt &stmt);
+
+// The SBlock name_hint marking a SimdVF vecscope region.
+inline constexpr const char *kSimdVfBlockName = "SIMD_VF";
 
 } // namespace pto
 } // namespace tl

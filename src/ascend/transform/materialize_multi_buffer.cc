@@ -41,6 +41,7 @@
 #include "./auto_schedule/scheduled_tir.h"
 #include "layout/layout.h"
 #include "op/builtin.h"
+#include "op/reduce.h"
 #include "transform/common/attr.h"
 
 namespace tvm {
@@ -218,19 +219,56 @@ private:
     return broadcast_storages_.count(buffer->data) != 0;
   }
 
-  PrimExpr VersionIndex(const MultiBufferInfo &info,
-                        const Buffer &versioned) const {
+  PrimExpr VersionIndex(const MultiBufferInfo &info, const Buffer &versioned) {
     if (broadcast_storages_.count(info.storage))
       return make_zero(versioned->shape[0].dtype());
     PrimExpr iteration =
         info.UsesCounter()
             ? PrimExpr(BufferLoad(info.counter, {IntImm(DataType::Int(32), 0)}))
             : CalculateIterationCount(info.owners.front().loop);
+    // A scheduled clock is scalar state owned by the multi-buffer protocol.
+    // Capture it before a Parallel VF so address analysis sees an SSA value,
+    // rather than an indirect load inside a per-lane address. Use the plan's
+    // storage identity, never a user-visible buffer naming convention.
+    if (in_parallel_vf_ && info.UsesCounter()) {
+      auto it = counter_snapshots_.find(info.counter->data);
+      if (it == counter_snapshots_.end()) {
+        Var snapshot(info.counter->name + "_snapshot", iteration.dtype());
+        snapshot_binds_.push_back(Bind(snapshot, iteration));
+        counter_snapshots_.Set(info.counter->data, snapshot);
+        iteration = snapshot;
+      } else {
+        iteration = (*it).second;
+      }
+    }
     PrimExpr version =
         indexmod(iteration, IntImm(iteration.dtype(), info.num_versions));
     DataType index_dtype = versioned->shape[0].dtype();
     return version.dtype() == index_dtype ? version
                                           : cast(index_dtype, version);
+  }
+
+  Stmt VisitStmt_(const SBlockNode *op) final {
+    if (op->name_hint != "SIMD_VF")
+      return StmtExprMutator::VisitStmt_(op);
+    bool has_parallel = false;
+    PostOrderVisit(op->body, [&](const ObjectRef &node) {
+      if (const auto *loop = node.as<ForNode>())
+        has_parallel |= loop->kind == ForKind::kParallel;
+    });
+    if (!has_parallel)
+      return StmtExprMutator::VisitStmt_(op);
+    ICHECK(!in_parallel_vf_) << "Nested Parallel SIMD_VF is not supported";
+    in_parallel_vf_ = true;
+    counter_snapshots_.clear();
+    snapshot_binds_.clear();
+    Stmt rewritten = StmtExprMutator::VisitStmt_(op);
+    in_parallel_vf_ = false;
+    snapshot_binds_.push_back(std::move(rewritten));
+    Stmt result = SeqStmt::Flatten(snapshot_binds_);
+    counter_snapshots_.clear();
+    snapshot_binds_.clear();
+    return result;
   }
 
   PrimExpr VisitExpr_(const BufferLoadNode *op) final {
@@ -268,6 +306,16 @@ private:
   }
 
   PrimExpr VisitExpr_(const CallNode *op) final {
+    if (op->op.same_as(ReduceOp::Get())) {
+      ReduceOp reduce(op->args, op->annotations);
+      const MultiBufferInfo *info = plan_.Find(reduce->src);
+      Call rewritten = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
+      if (info && info->NeedsVersionDimension()) {
+        auto *node = rewritten.CopyOnWrite();
+        node->args.Set(3, node->args[3] + 1);
+      }
+      return rewritten;
+    }
     static const Op &region_op = region();
     if (op->op.same_as(region_op) && op->args.size() >= 2) {
       if (const auto *load = op->args[0].as<BufferLoadNode>()) {
@@ -291,6 +339,9 @@ private:
   const MultiBufferPlan &plan_;
   VersionedBufferRegistry *buffers_;
   std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> broadcast_storages_;
+  bool in_parallel_vf_ = false;
+  Map<Var, Var> counter_snapshots_;
+  Array<Stmt> snapshot_binds_;
 };
 
 void RewriteGuards(IRStructure *node, MultiBufferAccessRewriter *rewriter) {

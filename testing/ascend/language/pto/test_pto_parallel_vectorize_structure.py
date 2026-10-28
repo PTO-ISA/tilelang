@@ -371,14 +371,18 @@ def test_real_stride_addresses_survive_vectorization():
 
 
 @pytest.mark.pto
-def test_explicit_padding_is_rejected_at_this_stage():
+def test_explicit_padding_legalizes_after_the_control_flow_stage():
+    """The explicit padding form
+    (``T.Parallel(P)`` with ``if i < E ... else ...``) is legalized
+    into the Select form by LegalizeParallelToPTO
+    and the else branch survives (the detailed assertions live in
+    ``test_simdvf_parallel_control_flow.py``)."""
+
     E, lanes = 150, 128
-    _, error = _lower_capture(_k_explicit_padding(E, lanes), expect_error=True)
-    assert error is not None, "an if-guarded T.Parallel must still be rejected at this stage"
-    message = str(error)
-    assert "VerifyParallelToPTO" in message or "conditional" in message or "unsupported" in message, (
-        f"expected the guard rejection diagnostic, got: {message}"
-    )
+    mod, error = _lower_capture(_k_explicit_padding(E, lanes))
+    assert error is None, f"the explicit padding form must legalize now, got: {error}"
+    calls = _vmi_calls(mod)
+    assert "tl.vmi.vsel" in calls, "the preserved else must lower to vsel"
 
 
 # ---------------------------------------------------------------------------
@@ -468,12 +472,10 @@ def _runtime_uniform_float_kernel(n, lanes):
 
 
 @pytest.mark.pto
-def test_verify_runtime_uniform_float_div_rejected():
-    with pytest.raises(
-        Exception,
-        match=r"runtime lane-uniform float computation.*scalar float ALU",
-    ):
-        _lower(_runtime_uniform_float_kernel(256, 128), target="pto")
+def test_verify_runtime_uniform_float_div_broadcast():
+    source = _lower(_runtime_uniform_float_kernel(256, 128), target="pto").kernel_source
+    assert "pto.vmi.vbrc(" in source
+    assert "pto.vmi.vdiv(" in source
 
 
 def _unary_kernel(n, lanes, kind):
@@ -558,9 +560,7 @@ def _chunk_uniform_float_kernel(n, lanes):
 
 
 @pytest.mark.pto
-def test_chunk_uniform_float_rejected():
-    with pytest.raises(
-        Exception,
-        match=r"runtime lane-uniform float computation.*scalar float ALU",
-    ):
-        _lower(_chunk_uniform_float_kernel(256, 128), target="pto")
+def test_chunk_uniform_float_broadcast():
+    source = _lower(_chunk_uniform_float_kernel(256, 128), target="pto").kernel_source
+    assert "pto.vmi.vbrc(" in source
+    assert "pto.vmi.vadd(" in source
