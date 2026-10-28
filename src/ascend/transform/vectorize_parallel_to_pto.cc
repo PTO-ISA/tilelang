@@ -52,6 +52,7 @@
 #include <vector>
 
 #include "parallel_to_pto_utils.h"
+#include "pto_simd_reduce.h"
 
 namespace tvm {
 namespace tl {
@@ -327,7 +328,17 @@ private:
     if (!scan.has_any_parallel) {
       // Pure hand-written VMI region (possibly with control flow): skipped
       // by both passes; no lanes annotation needed.
-      return StmtExprMutator::VisitStmt_(op);
+      int64_t lanes = 64;
+      if (auto value = op->annotations.Get("tl.simdvf_lanes")) {
+        if (auto imm = value.value().as<IntImmNode>())
+          lanes = imm->value;
+      }
+      Stmt body = pto_analysis::SimdReduceLowerer(lanes)(op->body);
+      if (body.same_as(op->body))
+        return GetRef<Stmt>(op);
+      SBlock block = GetRef<SBlock>(op);
+      block.CopyOnWrite()->body = body;
+      return block;
     }
     ICHECK(!scan.has_unsupported_wrapper)
         << "[VectorizeParallelToPTO] internal error: unsupported wrapper "
@@ -350,6 +361,8 @@ private:
     // declare the region-local UB buffers (`scores`, ...), so dropping the
     // block would leave those reads dangling.
     Stmt body = ConvertRegionBody(region);
+    body = pto_analysis::SimdReduceLowerer(
+        pto_analysis::InvertPtoLaneLayout(scan.units[0]).lanes)(body);
     return SBlock(op->iter_vars, op->reads, op->writes, op->name_hint,
                   std::move(body), op->init, op->alloc_buffers,
                   op->match_buffers, op->annotations);
@@ -389,20 +402,18 @@ private:
     Stmt new_region = region;
     if (any_divisible) {
       shared_mask_ = Var("mask", DataType::Bool(static_cast<int>(lanes)));
-      PrimExpr mask_value = Call(
-          DataType::Bool(static_cast<int>(lanes)), VmiOp("create_mask"),
-          {IntImm(DataType::Int(32), static_cast<int>(lanes))},
-          {{"size", IntImm(DataType::Int(32), static_cast<int>(lanes))}});
+      PrimExpr mask_value =
+          Call(DataType::Bool(static_cast<int>(lanes)), VmiOp("create_mask"),
+               {IntImm(DataType::Int(32), static_cast<int>(lanes))},
+               {{"size", IntImm(DataType::Int(32), static_cast<int>(lanes))}});
       // Define the shared mask inside the simdvf scope attr when the
       // region is wrapped by one: VPTO treats vecscope-region data as
       // region-local and rejects pset values crossing the boundary.
       const auto *scope_attr = new_region.as<AttrStmtNode>();
-      if (scope_attr != nullptr &&
-          scope_attr->attr_key == "tl.simdvf_scope") {
-        new_region = AttrStmt(scope_attr->node, scope_attr->attr_key,
-                              scope_attr->value,
-                              SeqStmt::Flatten(Bind(shared_mask_, mask_value),
-                                               scope_attr->body));
+      if (scope_attr != nullptr && scope_attr->attr_key == "tl.simdvf_scope") {
+        new_region = AttrStmt(
+            scope_attr->node, scope_attr->attr_key, scope_attr->value,
+            SeqStmt::Flatten(Bind(shared_mask_, mask_value), scope_attr->body));
       } else {
         new_region =
             SeqStmt::Flatten(Bind(shared_mask_, mask_value), new_region);
@@ -513,8 +524,8 @@ private:
   // its shell, so a carried update binds to one SSA name. Reversed so the
   // first created vreg ends up outermost.
   Stmt DeclareLaneScalarVregs(Stmt s) {
-    for (auto it = lane_scalar_allocs_.rbegin(); it != lane_scalar_allocs_.rend();
-         ++it) {
+    for (auto it = lane_scalar_allocs_.rbegin();
+         it != lane_scalar_allocs_.rend(); ++it) {
       s = SeqStmt::Flatten(AllocBuffer(*it), std::move(s));
     }
     lane_scalar_allocs_.clear();
@@ -536,6 +547,13 @@ private:
     tmp_counter_ = 0;
     lane_scalar_vregs_.clear();
     lane_scalar_allocs_.clear();
+    unit_lane_scalars_.clear();
+    PostOrderVisit(loop->body, [&](const ObjectRef &node) {
+      if (const auto *store = node.as<BufferStoreNode>()) {
+        if (pto_analysis::IsLaneScalarBuffer(store->buffer))
+          unit_lane_scalars_.insert(store->buffer.get());
+      }
+    });
     // Keep the complete mapping (2D fields included) for the
     // per-access analysis calls in ConvertBody.
     unit_mapping_ = mapping;
@@ -791,18 +809,18 @@ private:
           pre.push_back(s);
         }
         if (predicated) {
-          value = EmitBind(
-              "vsel",
-              Call(value.dtype(), VmiOp("vsel"),
-                   {pred_mask, value,
-                    BufferLoad(vreg, {make_zero(DataType::Int(32))})}),
-              &pre);
+          value =
+              EmitBind("vsel",
+                       Call(value.dtype(), VmiOp("vsel"),
+                            {pred_mask, value,
+                             BufferLoad(vreg, {make_zero(DataType::Int(32))})}),
+                       &pre);
         }
         for (const auto &s : pre) {
           out->push_back(s);
         }
-        out->push_back(BufferStore(vreg, value,
-                                   {make_zero(DataType::Int(32))}));
+        out->push_back(
+            BufferStore(vreg, value, {make_zero(DataType::Int(32))}));
         return;
       }
       Array<Stmt> pre;
@@ -830,15 +848,82 @@ private:
         // One-sided write: AND the predicate into the chunk's valid mask so
         // the lanes the source condition did not select stay untouched.
         PrimExpr store_mask = mask_var_;
+        if (store->buffer->dtype.is_float4_e2m1fn()) {
+          ICHECK(!predicated)
+              << "Packed FP4 stores require pair-aligned, unconditional lanes";
+          PrimExpr active =
+              min(IntImm(DataType::Int(32), lanes_),
+                  IntImm(DataType::Int(32), unit_mapping_.logical_extent) -
+                      chunk_var_ * IntImm(chunk_var_.dtype(), lanes_));
+          store_mask =
+              EmitBind("fp4_pairs",
+                       Call(DataType::Bool(lanes_ / 2), VmiOp("create_mask"),
+                            {floordiv(active, 2)},
+                            {{"size", IntImm(DataType::Int(32), lanes_ / 2)}}),
+                       &pre);
+        }
         if (predicated) {
-          store_mask = EmitBind(
-              "mand",
-              Call(DataType::Bool(static_cast<int>(lanes_)),
-                   VmiOp("vand"), {mask_var_, pred_mask}),
-              &pre);
+          store_mask = EmitBind("mand",
+                                Call(DataType::Bool(static_cast<int>(lanes_)),
+                                     VmiOp("vand"), {mask_var_, pred_mask}),
+                                &pre);
         }
         for (const auto &s : pre) {
           out->push_back(s);
+        }
+        if (!predicated && !unit_mapping_.is_2d &&
+            unit_mapping_.logical_extent == 1 &&
+            (value.dtype().element_of() == DataType::Float(32) ||
+             ((value.dtype().is_int() || value.dtype().is_uint()) &&
+              (value.dtype().bits() == 16 || value.dtype().bits() == 32)))) {
+          // A native one-lane value selects PTOAS point writeback, which
+          // requires element alignment rather than 32-byte block alignment.
+          DataType element = value.dtype().element_of();
+          if (element != DataType::Float(32) && element != DataType::Int(32)) {
+            // Reduction is only used to extract the single valid lane.
+            // Reinterpret u32 to retain all bits; widen 16-bit integers.
+            bool unsigned_widen = element.is_uint() && element.bits() == 16;
+            DataType wide_type = unsigned_widen ? DataType::UInt(32, lanes_)
+                                                : DataType::Int(32, lanes_);
+            Var wide("point_input", wide_type);
+            out->push_back(Bind(
+                wide,
+                Call(wide.dtype(),
+                     VmiOp(element.bits() == 32 ? "vinterpret_cast" : "vcvt"),
+                     {value},
+                     {{"to_dtype",
+                       StringImm(unsigned_widen ? "uint32" : "int32")}})));
+            value = wide;
+            if (unsigned_widen) {
+              Var signed_wide("point_signed", DataType::Int(32, lanes_));
+              out->push_back(
+                  Bind(signed_wide,
+                       Call(signed_wide.dtype(), VmiOp("vinterpret_cast"),
+                            {wide}, {{"to_dtype", StringImm("int32")}})));
+              value = signed_wide;
+            }
+          }
+          Var point("point", value.dtype().element_of());
+          out->push_back(Bind(
+              point, Call(point.dtype(), VmiOp("vcmax"), {value, store_mask})));
+          Var point_mask("point_mask", DataType::Bool());
+          out->push_back(
+              Bind(point_mask, Call(DataType::Bool(), VmiOp("create_mask"), {1},
+                                    {{"size", IntImm(DataType::Int(32), 1)}})));
+          PrimExpr result = point;
+          if (point.dtype() != element) {
+            Var narrow("point_result", element);
+            out->push_back(Bind(
+                narrow,
+                Call(element,
+                     VmiOp(element.bits() == 32 ? "vinterpret_cast" : "vcvt"),
+                     {point},
+                     {{"to_dtype", StringImm(TvmDtypeName(element))}})));
+            result = narrow;
+          }
+          out->push_back(Evaluate(Call(DataType::Void(), VmiOp("vstore"),
+                                       {result, ptr, 0, point_mask})));
+          return;
         }
         out->push_back(Evaluate(
             Call(DataType::Void(), VmiOp("vstore"),
@@ -943,13 +1028,70 @@ private:
   PrimExpr ConvertExpr(const PrimExpr &expr, Array<Stmt> *pre) {
     if (const auto *load = expr.as<BufferLoadNode>()) {
       // Per-lane scalar (T.alloc_var): read the vreg that carries its value.
-      if (pto_analysis::IsLaneScalarBuffer(load->buffer)) {
+      if (unit_lane_scalars_.count(load->buffer.get())) {
         return BufferLoad(LaneScalarVreg(load->buffer),
                           {make_zero(DataType::Int(32))});
+      }
+      if (pto_analysis::IsLaneScalarBuffer(load->buffer)) {
+        // An enclosing scalar variable is uniform, not an uninitialized
+        // per-lane register. Capture its current value at each occurrence.
+        PrimExpr scalar = EmitBind("sload", GetRef<PrimExpr>(load), pre);
+        return BroadcastToLanes("uniform", scalar, pre);
       }
       auto access = pto_analysis::AnalyzeBufferAccess(
           load->buffer, load->indices, /*is_write=*/false, loop_var_,
           CurrentMapping(), &analyzer_, bind_env_);
+      if (access.pattern == pto_analysis::AccessPattern::kGather) {
+        Array<PrimExpr> base_indices;
+        for (const auto &idx : access.indices_after_inverse) {
+          // Move uniform dimensions (including compiler-added version slots)
+          // into the pointer. Narrow gather indices then describe only the
+          // tile, rather than wrapping a large multi-buffer allocation.
+          const bool varying = tirx::UsesVar(
+              idx, [&](const VarNode *var) { return var == lane_var_.get(); });
+          base_indices.push_back(varying
+                                     ? make_zero(idx.dtype())
+                                     : analyzer_.Simplify(BindChunkToQ(idx)));
+        }
+        PrimExpr offset =
+            analyzer_.Simplify(load->buffer->ElemOffset(load->indices)[0] -
+                               load->buffer->ElemOffset(base_indices)[0]);
+        PrimExpr bytes = ConvertExpr(offset, pre);
+        if (bytes.dtype().lanes() == 1)
+          bytes = BroadcastToLanes("gather_offsets", bytes, pre);
+        if (load->dtype.bits() <= 16) {
+          bytes = EmitBind("gather_indices",
+                           Call(DataType::UInt(16, lanes_), VmiOp("vcvt"),
+                                {bytes}, {{"to_dtype", StringImm("uint16")}}),
+                           pre);
+        } else {
+          bytes = EmitBind("gather_indices",
+                           Call(DataType::UInt(32, lanes_),
+                                VmiOp("vinterpret_cast"), {bytes},
+                                {{"to_dtype", StringImm("uint32")}}),
+                           pre);
+        }
+        PrimExpr ptr = Call(DataType::Handle(), tl::access_ptr(),
+                            {BufferLoad(load->buffer, base_indices), 1, 1});
+        DataType gathered_type = load->dtype;
+        if (load->dtype.bits() == 8 &&
+            (load->dtype.is_int() || load->dtype.is_uint()))
+          gathered_type =
+              load->dtype.is_int() ? DataType::Int(16) : DataType::UInt(16);
+        PrimExpr gathered =
+            EmitBind("gather",
+                     Call(VectorDType(gathered_type, lanes_), VmiOp("vgather"),
+                          {ptr, 0, bytes, mask_var_}),
+                     pre);
+        if (gathered_type != load->dtype) {
+          gathered = EmitBind(
+              "gather_narrow",
+              Call(VectorDType(load->dtype, lanes_), VmiOp("vcvt"), {gathered},
+                   {{"to_dtype", StringImm(TvmDtypeName(load->dtype))}}),
+              pre);
+        }
+        return gathered;
+      }
       if (access.pattern == pto_analysis::AccessPattern::kContinuous) {
         Array<PrimExpr> start_idx;
         for (const auto &idx : access.start_indices) {
@@ -981,7 +1123,12 @@ private:
         indices.push_back(
             analyzer_.Simplify(BindChunkToQ(SubstituteLaneZero(idx))));
       }
-      return EmitBind("sload", BufferLoad(load->buffer, indices), pre);
+      PrimExpr scalar =
+          EmitBind("sload", BufferLoad(load->buffer, indices), pre);
+      if (pto_analysis::IsFloatFamily(load->dtype)) {
+        return BroadcastToLanes("uniform", scalar, pre);
+      }
+      return scalar;
     }
     if (const auto *var = expr.as<VarNode>()) {
       auto it = value_map_.find(GetRef<Var>(var));
@@ -998,6 +1145,9 @@ private:
                  {{"size",
                    IntImm(DataType::Int(32), static_cast<int>(lanes_))}}),
             pre);
+      }
+      if (pto_analysis::IsFloatFamily(var->dtype)) {
+        return BroadcastToLanes("uniform", GetRef<PrimExpr>(var), pre);
       }
       return GetRef<PrimExpr>(var);
     }
@@ -1016,6 +1166,28 @@ private:
     if (const auto *div = expr.as<DivNode>()) {
       return ConvertBinary(div->a, div->b, "vdiv", pre);
     }
+    if (const auto *div = expr.as<FloorDivNode>()) {
+      PrimExpr a = ConvertExpr(div->a, pre);
+      PrimExpr b = ConvertExpr(div->b, pre);
+      if (a.dtype().lanes() == 1 && b.dtype().lanes() == 1)
+        return floordiv(a, b);
+      ICHECK(pto_analysis::IsPowerOfTwoDivisor(div->b)) << expr;
+      int shift = 0;
+      for (int64_t n = div->b.as<IntImmNode>()->value; n > 1; n >>= 1)
+        ++shift;
+      return ConvertConvertedBinary(a, IntImm(a.dtype().element_of(), shift),
+                                    "vshr", pre);
+    }
+    if (const auto *mod = expr.as<FloorModNode>()) {
+      PrimExpr a = ConvertExpr(mod->a, pre);
+      PrimExpr b = ConvertExpr(mod->b, pre);
+      if (a.dtype().lanes() == 1 && b.dtype().lanes() == 1)
+        return floormod(a, b);
+      ICHECK(pto_analysis::IsPowerOfTwoDivisor(mod->b)) << expr;
+      return ConvertConvertedBinary(
+          a, IntImm(a.dtype().element_of(), mod->b.as<IntImmNode>()->value - 1),
+          "vand", pre);
+    }
     if (const auto *call = expr.as<CallNode>()) {
       // Lane-mask boolean combinations come first. They are not unary
       // math, so the strict unary-math mapping below must not see them
@@ -1024,6 +1196,21 @@ private:
       std::string name;
       if (const auto *op_node = call->op.as<OpNode>()) {
         name = op_node->name;
+      }
+      if (name == "tirx.reinterpret" || name == "tir.reinterpret") {
+        PrimExpr value = ConvertExpr(call->args[0], pre);
+        if (value.dtype().lanes() == 1)
+          value = BroadcastToLanes("bits", value, pre);
+        return EmitBind(
+            "bits",
+            Call(VectorDType(call->dtype, lanes_), VmiOp("vinterpret_cast"),
+                 {value}, {{"to_dtype", StringImm(TvmDtypeName(call->dtype))}}),
+            pre);
+      }
+      if (!call->dtype.is_bool()) {
+        if (const char *integer_op = pto_analysis::IntegerVmiOpName(name)) {
+          return ConvertBinary(call->args[0], call->args[1], integer_op, pre);
+        }
       }
       if (const char *mask_op = pto_analysis::MaskLogicVmiOpName(name)) {
         const bool is_not = std::string_view(mask_op) == "vnot";
@@ -1042,8 +1229,8 @@ private:
           << "[VectorizeParallelToPTO] internal error: non-Op call passed "
              "Verify: "
           << expr;
-      const char *unary = pto_analysis::VectorUnaryVmiOpName(
-          call_op.value()->name);
+      const char *unary =
+          pto_analysis::VectorUnaryVmiOpName(call_op.value()->name);
       ICHECK(unary != nullptr)
           << "[VectorizeParallelToPTO] internal error: call passed Verify "
              "without a VMI mapping: "
@@ -1105,7 +1292,45 @@ private:
         Map<String, ObjectRef> attrs;
         attrs.Set("to_dtype", StringImm(TvmDtypeName(step.to)));
         PrimExpr call;
-        if (step.op == pto_analysis::VectorCastOp::kIntegerReinterpret) {
+        if (step.op == pto_analysis::VectorCastOp::kFloat32ToOddBF16) {
+          DataType u32 = DataType::UInt(32, lanes_);
+          PrimExpr bits =
+              EmitBind("fp4_bits",
+                       Call(u32, VmiOp("vinterpret_cast"), {current},
+                            {{"to_dtype", StringImm("uint32")}}),
+                       pre);
+          PrimExpr shift =
+              BroadcastToLanes("shift", IntImm(DataType::UInt(32), 16), pre);
+          PrimExpr low_mask = BroadcastToLanes(
+              "low_mask", IntImm(DataType::UInt(32), 65535), pre);
+          PrimExpr zero =
+              BroadcastToLanes("zero", IntImm(DataType::UInt(32), 0), pre);
+          PrimExpr one =
+              BroadcastToLanes("one", IntImm(DataType::UInt(32), 1), pre);
+          PrimExpr high = EmitBind(
+              "high", Call(u32, VmiOp("vshr"), {bits, shift, mask_var_}), pre);
+          PrimExpr low = EmitBind(
+              "low", Call(u32, VmiOp("vand"), {bits, low_mask, mask_var_}),
+              pre);
+          PrimExpr sticky_mask =
+              EmitBind("sticky_mask",
+                       Call(DataType::Bool(lanes_), VmiOp("vcmp"),
+                            {low, zero, mask_var_, StringImm("ne")}),
+                       pre);
+          PrimExpr sticky =
+              EmitBind("sticky",
+                       Call(u32, VmiOp("vsel"), {sticky_mask, one, zero}), pre);
+          PrimExpr odd = EmitBind(
+              "odd", Call(u32, VmiOp("vor"), {high, sticky, mask_var_}), pre);
+          PrimExpr half =
+              EmitBind("odd16",
+                       Call(DataType::UInt(16, lanes_), VmiOp("vcvt"), {odd},
+                            {{"to_dtype", StringImm("uint16")},
+                             {"saturate", StringImm("NOSAT")}}),
+                       pre);
+          call = Call(VectorDType(step.to, lanes_), VmiOp("vinterpret_cast"),
+                      {half}, attrs);
+        } else if (step.op == pto_analysis::VectorCastOp::kIntegerReinterpret) {
           call = Call(VectorDType(step.to, lanes_), VmiOp("vinterpret_cast"),
                       {current}, attrs);
         } else {
@@ -1209,12 +1434,11 @@ private:
     DataType mask_ty = DataType::Bool(static_cast<int>(lanes_));
     PrimExpr as_int = Cast(DataType::Int(32), flag);
     PrimExpr broadcast = BroadcastToLanes("brc_flag", as_int, pre);
-    return EmitBind(
-        "vcmps",
-        Call(mask_ty, VmiOp("vcmps"),
-             {broadcast, IntImm(DataType::Int(32), 0), mask_var_,
-              StringImm("ne")}),
-        pre);
+    return EmitBind("vcmps",
+                    Call(mask_ty, VmiOp("vcmps"),
+                         {broadcast, IntImm(DataType::Int(32), 0), mask_var_,
+                          StringImm("ne")}),
+                    pre);
   }
 
   // Turn a value that may still be a scalar bool into a lane mask. Anything
@@ -1251,7 +1475,8 @@ private:
         << "[VectorizeParallelToPTO] unsupported store predicate: expected a "
            "lane mask, got `"
         << mask.dtype() << "` (`" << pred->GetTypeKey()
-        << "`). Rewrite the condition as a comparison, or make it lane-varying.";
+        << "`). Rewrite the condition as a comparison, or make it "
+           "lane-varying.";
     return mask;
   }
 
@@ -1277,11 +1502,10 @@ private:
     if (b.dtype().lanes() == 1) {
       b = BroadcastToLanes("brc", b, pre);
     }
-    return EmitBind(
-        "vcmp",
-        Call(DataType::Bool(static_cast<int>(lanes_)), VmiOp("vcmp"),
-             {a, b, mask_var_, StringImm(cmp)}),
-        pre);
+    return EmitBind("vcmp",
+                    Call(DataType::Bool(static_cast<int>(lanes_)),
+                         VmiOp("vcmp"), {a, b, mask_var_, StringImm(cmp)}),
+                    pre);
   }
 
   PrimExpr ConvertCompare(const PrimExpr &lhs, const PrimExpr &rhs,
@@ -1308,7 +1532,7 @@ private:
                [](const PrimExpr &a, const PrimExpr &b) { return a > b; }},
               {"ge",
                [](const PrimExpr &a, const PrimExpr &b) { return a >= b; }},
-          };
+      };
       auto it = kScalarCmpFold.find(cmp);
       if (it != kScalarCmpFold.end()) {
         return it->second(a, b);
@@ -1344,6 +1568,12 @@ private:
                          const std::string &vmi_name, Array<Stmt> *pre) {
     PrimExpr a = ConvertExpr(lhs, pre);
     PrimExpr b = ConvertExpr(rhs, pre);
+    return ConvertConvertedBinary(a, b, vmi_name, pre);
+  }
+
+  PrimExpr ConvertConvertedBinary(PrimExpr a, PrimExpr b,
+                                  const std::string &vmi_name,
+                                  Array<Stmt> *pre) {
     bool a_vec = a.dtype().lanes() > 1;
     bool b_vec = b.dtype().lanes() > 1;
     if (!a_vec && !b_vec) {
@@ -1358,7 +1588,17 @@ private:
                [](const PrimExpr &a, const PrimExpr &b) { return a * b; }},
               {"vdiv",
                [](const PrimExpr &a, const PrimExpr &b) { return div(a, b); }},
-          };
+              {"vand", [](const PrimExpr &a,
+                          const PrimExpr &b) { return bitwise_and(a, b); }},
+              {"vor", [](const PrimExpr &a,
+                         const PrimExpr &b) { return bitwise_or(a, b); }},
+              {"vxor", [](const PrimExpr &a,
+                          const PrimExpr &b) { return bitwise_xor(a, b); }},
+              {"vshl",
+               [](const PrimExpr &a, const PrimExpr &b) { return a << b; }},
+              {"vshr",
+               [](const PrimExpr &a, const PrimExpr &b) { return a >> b; }},
+      };
       auto it = kScalarBinaryFold.find(vmi_name);
       if (it != kScalarBinaryFold.end()) {
         return it->second(a, b);
@@ -1372,10 +1612,15 @@ private:
     } else if (!a_vec && b_vec) {
       a = BroadcastToLanes("brc", a, pre);
     }
-    return EmitBind(vmi_name,
-                    Call(VectorDType(a.dtype().element_of(), lanes_),
-                         VmiOp(vmi_name), {a, b, mask_var_}),
-                    pre);
+    return EmitBind(
+        vmi_name,
+        Call(VectorDType(a.dtype().element_of(), lanes_), VmiOp(vmi_name),
+             {a, b, mask_var_},
+             vmi_name == "vdiv" && a.dtype().element_of() == DataType::Float(32)
+                 ? Map<String, ObjectRef>{{"parallel_scalar_div",
+                                           IntImm(DataType::Int(32), 1)}}
+                 : Map<String, ObjectRef>{}),
+        pre);
   }
 
   // TVM dtype name identical to Python str(dtype) (vmi.py ABI):
@@ -1451,6 +1696,7 @@ private:
   // DeclareLaneScalarVregs.
   std::unordered_map<const BufferNode *, tirx::Buffer> lane_scalar_vregs_;
   std::vector<tirx::Buffer> lane_scalar_allocs_;
+  std::unordered_set<const BufferNode *> unit_lane_scalars_;
   int tmp_counter_ = 0;
   Map<Var, PrimExpr> bind_env_; // analysis env: original var -> def expr
   Map<Var, Var> value_map_;     // value env: original var -> converted var
@@ -1483,4 +1729,3 @@ TVM_FFI_STATIC_INIT_BLOCK() {
 
 } // namespace tl
 } // namespace tvm
-

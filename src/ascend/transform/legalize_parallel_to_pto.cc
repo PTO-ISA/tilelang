@@ -228,9 +228,12 @@ public:
     if (in_parallel_) {
       if (const auto *op_node = op->op.as<OpNode>()) {
         const std::string &name = op_node->name;
+        if (name == "tirx.if_then_else" || name == "tir.if_then_else") {
+          return Select(VisitExpr(op->args[0]), VisitExpr(op->args[1]),
+                        VisitExpr(op->args[2]));
+        }
         if (name == "tl.infinity" || name == "tir.infinity") {
-          return FloatImm(op->dtype,
-                          std::numeric_limits<double>::infinity());
+          return FloatImm(op->dtype, std::numeric_limits<double>::infinity());
         }
       }
     }
@@ -255,6 +258,42 @@ private:
 
   Stmt RewriteParallelIf(const PrimExpr &condition, const Stmt &then_case,
                          const Optional<Stmt> &else_case) {
+    bool has_bind = false;
+    auto find_bind = [&](const ObjectRef &node) {
+      has_bind |= node.as<BindNode>() != nullptr;
+    };
+    PostOrderVisit(then_case, find_bind);
+    if (else_case.defined())
+      PostOrderVisit(else_case.value(), find_bind);
+    if (has_bind) {
+      // Keep immutable temporaries at their original memory observation
+      // point. Inlining their RHS into later stores could read overwritten
+      // data; hoisting all binds could move a load before its producer.
+      Var predicate("branch_predicate", DataType::Bool());
+      Array<Stmt> ordered{Bind(predicate, VisitExpr(condition))};
+      std::function<void(const Stmt &, const PrimExpr &)> append =
+          [&](const Stmt &stmt, const PrimExpr &pred) {
+            if (const auto *seq = stmt.as<SeqStmtNode>()) {
+              for (const Stmt &sub : seq->seq)
+                append(sub, pred);
+            } else if (stmt.as<BindNode>()) {
+              ordered.push_back(stmt);
+            } else if (const auto *store = stmt.as<BufferStoreNode>()) {
+              PrimExpr combined = store->predicate.defined()
+                                      ? And(pred, store->predicate.value())
+                                      : pred;
+              ordered.push_back(BufferStore(store->buffer, store->value,
+                                            store->indices, combined));
+            } else if (!pto::IsNoOpStmt(stmt)) {
+              Fail("unsupported statement in branch containing a scalar "
+                   "temporary");
+            }
+          };
+      append(then_case, predicate);
+      if (else_case.defined())
+        append(else_case.value(), Not(predicate));
+      return SeqStmt::Flatten(ordered);
+    }
     std::vector<const BufferStoreNode *> then_stores;
     std::vector<const BufferStoreNode *> else_stores;
     // Shape admission, not "the arm writes something": `rewritable` is true
@@ -375,17 +414,18 @@ private:
 
     const bool arms_predicated = [&] {
       for (const BufferStoreNode *s : then_stores) {
-        if (s->predicate.defined()) return true;
+        if (s->predicate.defined())
+          return true;
       }
       for (const BufferStoreNode *s : else_stores) {
-        if (s->predicate.defined()) return true;
+        if (s->predicate.defined())
+          return true;
       }
       return false;
     }();
 
     const bool arms_ordered = has_intra_arm_dependency(then_stores) ||
                               has_intra_arm_dependency(else_stores);
-
 
     if (then_noop) {
       for (const BufferStoreNode *el : else_stores) {

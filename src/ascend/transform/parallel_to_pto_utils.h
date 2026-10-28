@@ -53,9 +53,13 @@ enum class AccessPattern {
   kContinuous,
   /*! Address independent of lane at the current program point. */
   kLaneUniform,
+  /*! Read-only, lane-indexed UB access lowered using byte offsets. */
+  kGather,
 };
 
 std::string AccessPatternToString(AccessPattern pattern);
+const char *IntegerVmiOpName(const std::string &name);
+bool IsPowerOfTwoDivisor(const PrimExpr &value);
 
 /*!
  * \brief Result of the shared single-access analysis.
@@ -237,6 +241,8 @@ enum class VectorCastOp {
   /*! Real non-integer conversion (f16/bf16/FP8 -> f32, f32 -> f16/bf16/FP8);
    * empty options still mean a conversion, never a no-op. */
   kNonIntegerConvert,
+  /*! Round to odd before BF16 -> FP4 to avoid double rounding. */
+  kFloat32ToOddBF16,
 };
 
 struct VectorCastStep {

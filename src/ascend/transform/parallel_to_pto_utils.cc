@@ -32,9 +32,30 @@ std::string AccessPatternToString(AccessPattern pattern) {
     return "continuous";
   case AccessPattern::kLaneUniform:
     return "lane-uniform";
+  case AccessPattern::kGather:
+    return "gather";
   default:
     return "unknown";
   }
+}
+
+bool IsPowerOfTwoDivisor(const PrimExpr &value) {
+  const auto *imm = value.as<IntImmNode>();
+  return imm && imm->value > 0 && (imm->value & (imm->value - 1)) == 0;
+}
+
+const char *IntegerVmiOpName(const std::string &name) {
+  if (name == "tirx.bitwise_and" || name == "tir.bitwise_and")
+    return "vand";
+  if (name == "tirx.bitwise_or" || name == "tir.bitwise_or")
+    return "vor";
+  if (name == "tirx.bitwise_xor" || name == "tir.bitwise_xor")
+    return "vxor";
+  if (name == "tirx.shift_left" || name == "tir.shift_left")
+    return "vshl";
+  if (name == "tirx.shift_right" || name == "tir.shift_right")
+    return "vshr";
+  return nullptr;
 }
 
 // SubstituteVar, ResolveIndexAliases and IsSupportedAddressExpr moved to
@@ -53,14 +74,10 @@ const char *MaskLogicVmiOpName(const std::string &tir_op_name) {
   // spellings); Vectorize rewrites them to the PTODSL bitwise vector ops,
   // whose mask register overload implements the boolean combine.
   static const std::pair<const char *, const char *> kMaskLogicTable[] = {
-      {"tirx.bitwise_and", "vand"},
-      {"tir.bitwise_and", "vand"},
-      {"tir.And", "vand"},
-      {"tirx.bitwise_or", "vor"},
-      {"tir.bitwise_or", "vor"},
-      {"tir.Or", "vor"},
-      {"tirx.bitwise_not", "vnot"},
-      {"tir.bitwise_not", "vnot"},
+      {"tirx.bitwise_and", "vand"}, {"tir.bitwise_and", "vand"},
+      {"tir.And", "vand"},          {"tirx.bitwise_or", "vor"},
+      {"tir.bitwise_or", "vor"},    {"tir.Or", "vor"},
+      {"tirx.bitwise_not", "vnot"}, {"tir.bitwise_not", "vnot"},
       {"tir.Not", "vnot"},
   };
   for (const auto &entry : kMaskLogicTable) {
@@ -547,6 +564,12 @@ MemoryAccess AnalyzeBufferAccess(const Buffer &buffer,
     PrimExpr identity =
         access.data_offset - (access.start_offset + mapping.lane_var);
     if (proof.CanProveEqual(identity, make_zero(identity.dtype()))) {
+      if (buffer->dtype.is_float4_e2m1fn() &&
+          (mapping.logical_extent % 2 != 0 ||
+           !proof.CanProveEqual(floormod(access.start_offset, 2), 0))) {
+        throw PtoAnalysisError("packed FP4 accesses require even logical "
+                               "extents and pair-aligned starting offsets");
+      }
       access.pattern = AccessPattern::kContinuous;
       return access;
     }
@@ -560,11 +583,21 @@ MemoryAccess AnalyzeBufferAccess(const Buffer &buffer,
         proof.Simplify(SubstituteVar(access.data_offset, mapping.lane_var.get(),
                                      make_zero(access.data_offset.dtype())));
     if (proof.CanProveEqual(access.data_offset, at_zero)) {
-      access.pattern = AccessPattern::kLaneUniform;
+      // A one-element Parallel has exactly one valid lane. Its tail mask
+      // provides single-writer semantics even after Simplify folds i to 0.
+      access.pattern = is_write && !mapping.is_2d && mapping.logical_extent == 1
+                           ? AccessPattern::kContinuous
+                           : AccessPattern::kLaneUniform;
       return access;
     }
   }
 
+  if (!is_write && buffer->dtype.bits() >= 8) {
+    // Address aliases were already checked above: no memory values are
+    // re-evaluated. Keep stores restricted to unique continuous addresses.
+    access.pattern = AccessPattern::kGather;
+    return access;
+  }
   std::ostringstream oss;
   oss << "buffer `" << buffer->name
       << "`: cannot prove the address is continuous "
@@ -574,6 +607,8 @@ MemoryAccess AnalyzeBufferAccess(const Buffer &buffer,
 }
 
 bool IsSupportedElementDType(DataType dtype) {
+  if (dtype.lanes() == 1 && dtype.is_float4_e2m1fn())
+    return true;
   // No packed sub-byte element types (FP4 etc.), no
   // buffer-element dtypes that already carry vector lanes, and no FP64
   // (the current PTO codegen has no FP64 scalar-type mapping).
@@ -652,8 +687,20 @@ public:
     }
   }
   void VisitExpr_(const ModNode *) final { MarkUnsupported("Mod"); }
-  void VisitExpr_(const FloorDivNode *) final { MarkUnsupported("FloorDiv"); }
-  void VisitExpr_(const FloorModNode *) final { MarkUnsupported("FloorMod"); }
+  void VisitExpr_(const FloorDivNode *op) final {
+    if (!IsPowerOfTwoDivisor(op->b)) {
+      MarkUnsupported("FloorDiv requires a positive power-of-two divisor");
+      return;
+    }
+    ExprVisitor::VisitExpr_(op);
+  }
+  void VisitExpr_(const FloorModNode *op) final {
+    if (!IsPowerOfTwoDivisor(op->b)) {
+      MarkUnsupported("FloorMod requires a positive power-of-two divisor");
+      return;
+    }
+    ExprVisitor::VisitExpr_(op);
+  }
   // Min/Max are admitted here — Verify runs before
   // LegalizeParallelToPTO, which rewrites them into the Select form before
   // VectorizeParallelToPTO consumes the unit.
@@ -678,6 +725,30 @@ public:
   void VisitExpr_(const CallNode *op) final {
     if (auto call_op = op->op.as<Op>()) {
       const std::string &name = call_op.value()->name;
+      if (name == "tirx.if_then_else" || name == "tir.if_then_else") {
+        for (const auto &arg : op->args)
+          VisitExpr(arg);
+        return;
+      }
+      if ((name == "tirx.reinterpret" || name == "tir.reinterpret") &&
+          op->args.size() == 1 &&
+          op->dtype.bits() == op->args[0].dtype().bits() &&
+          op->dtype.bits() == 32) {
+        VisitExpr(op->args[0]);
+        return;
+      }
+      if (IntegerVmiOpName(name) && !op->dtype.is_bool()) {
+        if (op->args.size() != 2 ||
+            !(op->dtype.is_int() || op->dtype.is_uint()) ||
+            (op->dtype.bits() != 16 && op->dtype.bits() != 32)) {
+          MarkUnsupported("integer bitwise operation requires "
+                          "int16/uint16/int32/uint32 operands");
+          return;
+        }
+        for (const auto &arg : op->args)
+          VisitExpr(arg);
+        return;
+      }
       // TileLang `a & b` / `a | b` / `~a` on bool predicates arrive as
       // tirx.bitwise_* (not And/Or/Not nodes). Verify admits them; Vectorize
       // rewrites them to vand/vor/vnot (the shared MaskLogicVmiOpName
@@ -968,6 +1039,10 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
       // dimension is a uniform scalar at the program point.
       return LaneUse::kUniform;
     }
+    if (ctx->classified.count(GetRef<Var>(var))) {
+      return ctx->classified[GetRef<Var>(var)]->value == 0 ? LaneUse::kUniform
+                                                           : LaneUse::kVarying;
+    }
     if (ctx->bind_env.count(GetRef<Var>(var))) {
       // Use the recorded classification of the bind (SSA identity).
       if (ctx->classified.count(GetRef<Var>(var))) {
@@ -1021,7 +1096,8 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
         }
         return LaneUse::kUnknown;
       }
-      return LaneUse::kUniform;
+      return !metadata_mode && IsFloatFamily(var->dtype) ? LaneUse::kVarying
+                                                         : LaneUse::kUniform;
     }
     if (reason != nullptr) {
       std::ostringstream oss;
@@ -1034,12 +1110,16 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
     return LaneUse::kUnknown;
   }
   if (const auto *load = expr.as<BufferLoadNode>()) {
+    if (IsLaneScalarBuffer(load->buffer)) {
+      return LaneUse::kVarying;
+    }
     try {
       auto access = AnalyzeBufferAccess(
           load->buffer, load->indices, /*is_write=*/false, ctx->loop_var,
           ctx->mapping, ctx->analyzer, ctx->bind_env);
       if (access.pattern == AccessPattern::kLaneUniform) {
-        return LaneUse::kUniform;
+        return !metadata_mode && IsFloatFamily(load->dtype) ? LaneUse::kVarying
+                                                            : LaneUse::kUniform;
       }
       return LaneUse::kVarying;
     } catch (const PtoAnalysisError &err) {
@@ -1089,11 +1169,11 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
   } else if (const auto *fdiv = expr.as<FloorDivNode>()) {
     a = &fdiv->a;
     b = &fdiv->b;
-    known_op = metadata_mode;
+    known_op = metadata_mode || IsPowerOfTwoDivisor(fdiv->b);
   } else if (const auto *fmod = expr.as<FloorModNode>()) {
     a = &fmod->a;
     b = &fmod->b;
-    known_op = metadata_mode;
+    known_op = metadata_mode || IsPowerOfTwoDivisor(fmod->b);
   } else if (const auto *minn = expr.as<MinNode>()) {
     // Min/Max classify like the comparisons in value mode too;
     // LegalizeParallelToPTO rewrites them into Select before Vectorize.
@@ -1161,7 +1241,9 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
     auto is_mask_logic = [&](const std::string &n) {
       return MaskLogicVmiOpName(n) != nullptr;
     };
-    if (is_mask_logic(name)) {
+    if (is_mask_logic(name) || IntegerVmiOpName(name) ||
+        name == "tirx.reinterpret" || name == "tir.reinterpret" ||
+        name == "tirx.if_then_else" || name == "tir.if_then_else") {
       if (call->args.empty()) {
         if (reason)
           *reason = "empty mask-logic call";
@@ -1594,6 +1676,31 @@ PlanVectorValueCast(const CastNode *cast, const CastContext &context,
   }
   const bool from_fp8 = IsSupportedFloat8(from);
   const bool to_fp8 = IsSupportedFloat8(to);
+  if (from.is_float4_e2m1fn() || to.is_float4_e2m1fn()) {
+    if (attrs.has_sat || (attrs.has_round_mode && round_token != "R"))
+      return reject(pair + ": packed FP4 supports round-to-nearest without "
+                           "saturation attributes");
+    VectorCastPlan plan;
+    if (to.is_float4_e2m1fn()) {
+      if (from == DataType::Float(32)) {
+        plan.steps.push_back({VectorCastOp::kFloat32ToOddBF16, from,
+                              DataType::BFloat(16), "", ""});
+      } else if (!from.is_bfloat16()) {
+        return reject(pair +
+                      ": packed FP4 conversion requires float32 or bfloat16");
+      }
+      plan.steps.push_back({VectorCastOp::kNonIntegerConvert,
+                            DataType::BFloat(16), to, "R", ""});
+    } else {
+      if (!(to == DataType::Float(32) || to.is_bfloat16()) ||
+          attrs.has_round_key)
+        return reject(pair + ": packed FP4 widening supports float32/bfloat16 "
+                             "without rounding attributes");
+      plan.steps.push_back(
+          {VectorCastOp::kNonIntegerConvert, from, to, "", ""});
+    }
+    return CastPlan{plan};
+  }
   if (from_fp8 || to_fp8) {
     if (from_fp8 && to_fp8) {
       return reject(pair + ": conversions between the two FP8 types are not "
@@ -1718,7 +1825,14 @@ Optional<CastPlan> PlanValueCast(const CastNode *cast,
   if (from.lanes() != 1 || to.lanes() != 1) {
     return reject(pair + ": value casts require lane-1 element operands");
   }
-  if (!IsSupportedElementDType(from) || !IsSupportedElementDType(to)) {
+  const bool scalar_integer_cast =
+      context.value_kind == CastValueKind::kScalar &&
+      (from.is_int() || from.is_uint()) && (to.is_int() || to.is_uint()) &&
+      (from.bits() == 8 || from.bits() == 16 || from.bits() == 32 ||
+       from.bits() == 64) &&
+      (to.bits() == 8 || to.bits() == 16 || to.bits() == 32 || to.bits() == 64);
+  if ((!IsSupportedElementDType(from) || !IsSupportedElementDType(to)) &&
+      !scalar_integer_cast) {
     return reject(pair + " is outside the supported element dtype set");
   }
 

@@ -33,6 +33,7 @@
 
 #include "../../transform/common/attr.h"
 #include "parallel_to_pto_utils.h"
+#include "pto_simd_reduce.h"
 
 namespace tvm {
 namespace tl {
@@ -62,6 +63,19 @@ public:
     }
     for (const auto &kv : f->buffer_map) {
       defs_.insert(kv.second->data.get());
+      // Symbolic buffer dimensions/strides are implicit PrimFunc parameters,
+      // just like explicit scalar arguments. They are legal uniform captures.
+      auto define_symbols = [&](const PrimExpr &expr) {
+        PostOrderVisit(expr, [&](const ObjectRef &node) {
+          if (const auto *var = node.as<VarNode>())
+            defs_.insert(var);
+        });
+      };
+      for (const PrimExpr &extent : kv.second->shape)
+        define_symbols(extent);
+      for (const PrimExpr &stride : kv.second->strides)
+        define_symbols(stride);
+      define_symbols(kv.second->elem_offset);
     }
     CollectVolatileAllocs(f->body);
     VisitStmt(f->body);
@@ -178,7 +192,12 @@ private:
               "inside a converting SIMD_VF block");
         }
         if (name == "tl.tileop.reduce") {
-          parent_->Fail("expression", "cross-lane reduce is not supported");
+          if (inside_parallel_unit()) {
+            parent_->Fail(
+                "expression",
+                "a collective reduce must be between T.Parallel units");
+          }
+          pto_analysis::ParseSimdReduce(op);
         }
       }
       StmtExprVisitor::VisitExpr_(op);
@@ -287,7 +306,8 @@ private:
         if (!pto_analysis::IsLaneScalarBuffer(buffer) ||
             !inside_parallel_unit()) {
           std::ostringstream oss;
-          oss << "buffer `" << buffer->name << "` has scope `local.var`; only "
+          oss << "buffer `" << buffer->name
+              << "` has scope `local.var`; only "
                  "a single-element local.var inside a converting T.Parallel "
                  "unit (T.alloc_var) is supported";
           parent_->Fail("memory access", oss.str());
@@ -441,10 +461,16 @@ private:
       // or a nested conditional whose destinations are lane-varying
       // (lane-uniform stores stay rejected by the store check).
       CheckComputeValue(op->condition, "if condition");
+      Map<Var, PrimExpr> saved_env = bind_env_;
+      Map<Var, Integer> saved_classified = classified_;
       CheckConditionalBranch(op->then_case, "then");
+      bind_env_ = saved_env;
+      classified_ = saved_classified;
       if (op->else_case.defined()) {
         CheckConditionalBranch(op->else_case.value(), "else");
       }
+      bind_env_ = saved_env;
+      classified_ = saved_classified;
     }
     void VisitStmt_(const WhileNode *) final {
       parent_->Fail("loop structure",
@@ -455,9 +481,8 @@ private:
     // stays per call site so the existing diagnostics are preserved
     // verbatim.
     void RejectInsideUnit(const std::string &subject, const char *verb) {
-      parent_->Fail("loop structure",
-                    subject + " inside T.Parallel " + verb +
-                        " not yet supported");
+      parent_->Fail("loop structure", subject + " inside T.Parallel " + verb +
+                                          " not yet supported");
     }
     void VisitStmt_(const SBlockNode *) final {
       RejectInsideUnit("nested blocks", "are");
@@ -555,6 +580,10 @@ private:
     // SeqStmt of those, or a nested conditional (which recurses through the
     // same checks).
     void CheckConditionalBranch(const Stmt &stmt, const char *which) {
+      if (const auto *bind = stmt.as<BindNode>()) {
+        VisitStmt_(bind);
+        return;
+      }
       if (const auto *seq = stmt.as<SeqStmtNode>()) {
         for (const Stmt &sub : seq->seq) {
           CheckConditionalBranch(sub, which);
@@ -695,8 +724,7 @@ private:
       PrimExpr b;
     };
 
-    static std::optional<BinaryOperands> GetBinaryOperands(
-        const PrimExpr &e) {
+    static std::optional<BinaryOperands> GetBinaryOperands(const PrimExpr &e) {
       if (const auto *n = e.as<AddNode>()) {
         return BinaryOperands{"vadd", n->dtype, n->a, n->b};
       }
@@ -997,7 +1025,9 @@ private:
             buffer, indices, is_write, loop_var_, mapping_, &analyzer_,
             bind_env_);
         if (access.pattern != pto_analysis::AccessPattern::kContinuous &&
-            access.pattern != pto_analysis::AccessPattern::kLaneUniform) {
+            access.pattern != pto_analysis::AccessPattern::kLaneUniform &&
+            !(access.pattern == pto_analysis::AccessPattern::kGather &&
+              !is_write)) {
           std::ostringstream oss;
           oss << "buffer `" << buffer->name << "` access pattern "
               << pto_analysis::AccessPatternToString(access.pattern)

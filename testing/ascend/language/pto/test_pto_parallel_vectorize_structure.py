@@ -472,12 +472,10 @@ def _runtime_uniform_float_kernel(n, lanes):
 
 
 @pytest.mark.pto
-def test_verify_runtime_uniform_float_div_rejected():
-    with pytest.raises(
-        Exception,
-        match=r"runtime lane-uniform float computation.*scalar float ALU",
-    ):
-        _lower(_runtime_uniform_float_kernel(256, 128), target="pto")
+def test_verify_runtime_uniform_float_div_broadcast():
+    source = _lower(_runtime_uniform_float_kernel(256, 128), target="pto").kernel_source
+    assert "pto.vmi.vbrc(" in source
+    assert "pto.vmi.vdiv(" in source
 
 
 def _unary_kernel(n, lanes, kind):
@@ -562,9 +560,7 @@ def _chunk_uniform_float_kernel(n, lanes):
 
 
 @pytest.mark.pto
-def test_chunk_uniform_float_rejected():
-    with pytest.raises(
-        Exception,
-        match=r"runtime lane-uniform float computation.*scalar float ALU",
-    ):
-        _lower(_chunk_uniform_float_kernel(256, 128), target="pto")
+def test_chunk_uniform_float_broadcast():
+    source = _lower(_chunk_uniform_float_kernel(256, 128), target="pto").kernel_source
+    assert "pto.vmi.vbrc(" in source
+    assert "pto.vmi.vadd(" in source

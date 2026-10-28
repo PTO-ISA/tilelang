@@ -1197,7 +1197,7 @@ int PtoRequiredVectorDim(const For &root, const Var &iv, const Var &jv,
       const bool uniform = probe.CanProveEqual(
           off,
           probe.Simplify(pto::SubstituteVar(off, lane.get(), make_zero(dt))));
-      if (!continuous && !(uniform && !access.is_write)) {
+      if (!continuous && access.is_write) {
         std::ostringstream oss;
         oss << "buffer `" << access.buffer->name << "` ("
             << (access.is_write ? "store" : "load")
