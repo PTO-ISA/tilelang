@@ -570,7 +570,17 @@ private:
     With<ConstraintContext> ctx1(analyzer_, op->loop_var >= op->min);
     With<ConstraintContext> ctx2(analyzer_,
                                  op->loop_var < op->min + op->extent);
-    return Parent::VisitStmt_(op);
+    parallel_depth_ += op->kind == ForKind::kParallel;
+    Stmt result = Parent::VisitStmt_(op);
+    parallel_depth_ -= op->kind == ForKind::kParallel;
+    return result;
+  }
+
+  Stmt VisitStmt_(const SBlockNode *op) override {
+    simd_depth_ += op->name_hint == "SIMD_VF";
+    Stmt result = Parent::VisitStmt_(op);
+    simd_depth_ -= op->name_hint == "SIMD_VF";
+    return result;
   }
 
   bool CanInlineBind(const BindNode *op) {
@@ -583,7 +593,7 @@ private:
     // Won't face the deep expression explosion problem as in Let expression.
     // attempt to inline as much as possible if the value integer type(can be
     // index).
-    if (!op->value.dtype().is_int())
+    if (!op->value.dtype().is_int() || op->value.dtype().lanes() != 1)
       return false;
     return SideEffect(op->value) <= CallEffectKind::kPure;
   }
@@ -634,6 +644,13 @@ private:
     }
 
     bool can_inline = CanInlineBind(op);
+    if (can_inline && simd_depth_ > 0 && parallel_depth_ > 0) {
+      // Limit expanded per-element compute values, without changing the
+      // scalar scheduling aliases needed by auto-schedule and address passes.
+      size_t nodes = 0;
+      PostOrderVisit(value, [&](const ObjectRef &) { ++nodes; });
+      can_inline = nodes <= 16;
+    }
     if (can_inline) {
       analyzer_->Bind(op->var, value);
     } else if (SideEffect(op->value) <= CallEffectKind::kPure) {
@@ -761,6 +778,8 @@ private:
     }
   }
 
+  int simd_depth_ = 0;
+  int parallel_depth_ = 0;
   SimplifyConfig config_;
   std::optional<ControlFlowGraph> touch_pattern_;
 

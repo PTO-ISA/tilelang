@@ -5517,10 +5517,15 @@ void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
   kwargs.reserve(op->annotations.size());
   for (const auto &[key, value] : op->annotations) {
     std::string key_str = key;
-    if (key_str == "loc" || key_str == "ip") {
+    if (key_str == "loc" || key_str == "ip" ||
+        key_str == "parallel_scalar_div") {
       continue;
     }
     kwargs.emplace_back(std::move(key_str), value);
+  }
+  if (op_name == "tl.vmi.vdiv" &&
+      op->annotations.count("parallel_scalar_div") && !enable_fast_math_) {
+    kwargs.emplace_back("precision", StringImm("precision_0ulp_ftz_true"));
   }
   std::sort(kwargs.begin(), kwargs.end(), [](const auto &lhs, const auto &rhs) {
     return lhs.first < rhs.first;
@@ -5690,8 +5695,7 @@ void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
       os << ", ";
     }
     os << key << "=";
-    if (op_name == "tl.vmi.vcvt" && key == "to_dtype" &&
-               op->dtype.is_int()) {
+    if (op_name == "tl.vmi.vcvt" && key == "to_dtype" && op->dtype.is_int()) {
       os << PtoSignedIntegerTypeName(op->dtype.element_of());
     } else if (op_name == "tl.vmi.vload" && key == "size" &&
                op->dtype.element_of().is_float4_e2m1fn()) {
@@ -5907,14 +5911,35 @@ void CodeGenTileLangPTO::VisitExpr_(const CallNode *op,
     const char *pto_atomic_op =
         is_atomic_add ? "atomic_add"
                       : (is_atomic_max ? "atomic_max" : "atomic_min");
-    os << "pto." << pto_atomic_op << "(" << PrintExpr_(op->args[0]) << ", "
-       << PrintExpr_(op->args[1]);
+    const bool integer_atomic = dtype.is_int() || dtype.is_uint();
+    if (integer_atomic)
+      os << "pto.cast(";
+    os << "pto." << pto_atomic_op << "(";
+    if (integer_atomic) {
+      // PTOAS atomic values are signless. Keep the authored address space and
+      // restore signedness on the returned old value.
+      const VarNode *buffer_var = nullptr;
+      PrimExpr index;
+      DataType pointer_dtype;
+      std::string scope;
+      GetCopyEndpoint_(op->args[0], "PTO atomic destination", &buffer_var,
+                       &index, &pointer_dtype, &scope);
+      const char *space = scope == "global" ? "gm" : "ub";
+      ICHECK(scope == "global" || scope == "shared" || scope == "shared.dyn");
+      os << "pto.castptr(" << PrintExpr_(op->args[0]) << ", pto.ptr(pto.i"
+         << dtype.bits() << ", \"" << space << "\")), pto.cast("
+         << PrintExpr_(op->args[1]) << ", pto.i" << dtype.bits() << ")";
+    } else {
+      os << PrintExpr_(op->args[0]) << ", " << PrintExpr_(op->args[1]);
+    }
     // Only integer atomic_min/atomic_max need signedness
     if (!is_atomic_add && (dtype.is_int() || dtype.is_uint())) {
       os << ", signedness=\"" << (dtype.is_uint() ? "unsigned" : "signed")
          << "\"";
     }
     os << ")";
+    if (integer_atomic)
+      os << ", " << ScalarType(dtype) << ")";
     return;
   }
 

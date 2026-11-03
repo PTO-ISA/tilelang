@@ -559,15 +559,15 @@ def test_lane_uniform_fp8_conversion_is_rejected():
 # ---------------------------------------------------------------------------
 # E. Scalar paths and literal boundaries (existing semantics)
 # ---------------------------------------------------------------------------
-def test_scalar_float_widening_stays_scalar():
+def test_scalar_float_widening_broadcasts_before_cast():
     source = _lower_source(_ann_kernel("float16", "float32", 128, {}, uniform=True))
-    assert _cast_lines(source) == []
+    assert len(_cast_lines(source)) == 1
     assert "vbrc" in source
 
 
-def test_scalar_float_narrowing_stays_scalar():
+def test_scalar_float_narrowing_broadcasts_before_cast():
     source = _lower_source(_ann_kernel("float32", "float16", 128, {}, uniform=True))
-    assert _cast_lines(source) == []
+    assert len(_cast_lines(source)) == 1
     assert "vbrc" in source
 
 
