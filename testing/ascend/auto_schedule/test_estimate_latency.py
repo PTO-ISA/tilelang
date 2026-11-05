@@ -518,5 +518,56 @@ def test_task_cost_arguments_are_validated():
         ascend_transform.EstimateLatency()(_materialize_schedule_units(_bind_target(_make_program(latency=0))))
 
 
+@pytest.mark.parametrize("target_name", ["pto", "ascend"])
+@pytest.mark.parametrize("ambient_target", [None, "pto", "ascend"])
+@pytest.mark.parametrize("clear", [False, True])
+def test_reduce_destination_read_cost_is_target_isolated(target_name, ambient_target, clear):
+    from contextlib import nullcontext
+
+    from tvm import tirx
+
+    from testing.ascend._ir import kernel, region
+    from testing.ascend.auto_schedule._scheduled_ir import unit
+    from tilelang.ascend.target import normalize_ascend_target, normalize_pto_target
+
+    def target(name):
+        return normalize_pto_target("pto") if name == "pto" else normalize_ascend_target("ascend")
+
+    source = tirx.decl_buffer((1, 4096), "float32", name="source", scope="shared.dyn")
+    destination = tirx.decl_buffer((4096,), "float32", name="destination", scope="shared.dyn")
+
+    def estimate(destination_access):
+        # The frontend emits a write region for clear=False. An explicitly
+        # read/write region is semantically equivalent and serves as a control.
+        reduce = tirx.Evaluate(
+            tirx.Call(
+                "handle",
+                tvm.ir.Op.get("tl.tileop.reduce"),
+                [
+                    region(source, 1),
+                    region(destination, destination_access),
+                    tirx.StringImm("sum"),
+                    tirx.IntImm("int32", 0),
+                    tirx.IntImm("bool", clear),
+                ],
+            )
+        )
+        vf = tirx.SBlock([], [], [], "SIMD_VF", reduce)
+        before = kernel(unit(vf), buffers=[source, destination])
+        before = tvm.IRModule({gvar: func.with_attr("target", target(target_name)) for gvar, func in before.functions.items()})
+        after = ascend_transform.EstimateLatency()(before)
+        return _collect_task_metadata(after)
+
+    with target(ambient_target) if ambient_target else nullcontext():
+        before_target = tvm.target.Target.current(allow_none=True)
+        implicit_read, explicit_read = estimate(2), estimate(3)
+        if target_name == "pto" and not clear:
+            assert implicit_read == explicit_read
+        else:
+            assert implicit_read["latency"][0] < explicit_read["latency"][0]
+            assert implicit_read["ii"][0] < explicit_read["ii"][0]
+        assert tvm.target.Target.current(allow_none=True) == before_target
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

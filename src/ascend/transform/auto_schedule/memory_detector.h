@@ -28,6 +28,7 @@
 #include "ascend/op/copy.h"
 #include "ascend/op/oob_padding.h"
 #include "ascend/op/utils.h"
+#include "ascend/target_utils.h"
 #include "op/builtin.h"
 #include "op/gemm.h"
 #include "op/gemm_blockscaled.h"
@@ -1315,7 +1316,9 @@ private:
           if (const auto *clear = op->args[4].as<IntImmNode>())
             reads_destination = clear->value == 0;
         }
-        if (mode_ == AccessMode::kPhysical && reads_destination)
+        Target target = Target::Current(true);
+        if (reads_destination && (mode_ == AccessMode::kPhysical ||
+                                  (target.defined() && TargetIsPTO(target))))
           RecordBufferRegion(NormalizeToBufferRegion(op->args[1]), true);
       }
       return;
