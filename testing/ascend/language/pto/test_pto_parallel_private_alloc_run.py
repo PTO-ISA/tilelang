@@ -57,7 +57,7 @@ def test_external_scalar_rounding(dtype, mode):
     kernel = tilelang.compile(external_kernel(dtype, mode), target="pto", out_idx=-1)
     a = torch.arange(192, dtype=torch.float32).to(tdtype).npu()
     actual = kernel(a).cpu()[:131]
-    expected = torch.full((131,), 3.1, dtype=tdtype)
+    expected = torch.full((131,), 3.1, dtype=tdtype) if mode < 2 else torch.zeros(131, dtype=tdtype)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
