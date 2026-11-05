@@ -46,6 +46,8 @@ namespace {
 class VerifyParallelToPTOImpl : public StmtExprVisitor {
 public:
   void Verify(const PrimFunc &f) {
+    storage_.Build(f->body);
+    storage_.ValidateOwnerUses(f->body);
     // The definition environment starts at function entry with
     // the params and the buffer data pointers. Every other definition is
     // registered at its lexical position during the traversal below and
@@ -61,6 +63,9 @@ public:
   }
 
 private:
+  pto::ParallelStorageQuery storage_;
+  For current_unit_;
+
   // Function-level pre-scan for AllocBuffer nodes carrying the
   // tirx.volatile annotation. Presence of the annotation marks the
   // allocation volatile (PTO codegen semantics:
@@ -262,7 +267,8 @@ private:
       }
       // Only UB accesses are currently supported. local /
       // local.fragment / shared.l1 (L1) and other scopes are rejected.
-      if (scope != "shared" && scope != "shared.dyn") {
+      if (scope != "shared" && scope != "shared.dyn" && scope != "local" &&
+          scope != "local.var") {
         std::ostringstream oss;
         oss << "buffer `" << buffer->name << "` has scope `" << scope
             << "`; only UB (shared/shared.dyn) accesses are supported";
@@ -385,7 +391,13 @@ private:
                     "nested blocks inside T.Parallel are not yet "
                     "supported");
     }
-    void VisitStmt_(const AllocBufferNode *) final {
+    void VisitStmt_(const AllocBufferNode *op) final {
+      if (parent_->storage_.Classify(op->buffer, parent_->current_unit_) ==
+          pto::StorageClass::kPrivate) {
+        parent_->storage_.CheckStorageV1(op->buffer);
+        external_defs_.insert(op->buffer->data.get());
+        return;
+      }
       parent_->Fail("loop structure",
                     "buffer allocation inside T.Parallel is not yet "
                     "supported");
@@ -447,7 +459,14 @@ private:
       // The store value runs the shared compute-value
       // admission (whitelist, cast plans, op types, references, lane
       // classification).
-      CheckComputeValue(op->value, "store value");
+      auto rhs_use = CheckComputeValue(op->value, "store value");
+      auto kind =
+          parent_->storage_.Classify(op->buffer, parent_->current_unit_);
+      if (rhs_use == pto_analysis::LaneUse::kUniform &&
+          (kind == pto::StorageClass::kPrivate ||
+           kind == pto::StorageClass::kUB))
+        pto_analysis::CheckBroadcastDType(
+            op->value.dtype(), "store to " + std::string(op->buffer->name));
       // Store indices get the same unified reference check — the
       // address continuity proof can cancel a common ghost offset and
       // must not double as a definition check.
@@ -469,6 +488,8 @@ private:
     // definition environment, classification cache and guards.
     pto_analysis::LaneUseContext MakeLaneUseContext() {
       pto_analysis::LaneUseContext ctx;
+      ctx.storage = &parent_->storage_;
+      ctx.unit = parent_->current_unit_;
       ctx.loop_var = loop_var_;
       ctx.serial_var = serial_var_;
       ctx.mapping = mapping_;
@@ -699,6 +720,10 @@ private:
         parent_->Fail("dtype", oss.str());
       }
       if (vector_op) {
+        if (a == pto_analysis::LaneUse::kUniform)
+          pto_analysis::CheckBroadcastDType(lhs.dtype(), op_name);
+        if (b == pto_analysis::LaneUse::kUniform)
+          pto_analysis::CheckBroadcastDType(rhs.dtype(), op_name);
         // The node emits a VMI op: apply the operation matrix.
         if (!pto_analysis::IsSupportedVectorBinaryOp(op_name, dtype)) {
           std::ostringstream oss;
@@ -812,6 +837,15 @@ private:
           parent_->Fail("memory access", oss.str());
         }
       }
+      auto kind = parent_->storage_.Classify(buffer, parent_->current_unit_);
+      if (kind == pto::StorageClass::kPrivate ||
+          kind == pto::StorageClass::kExternal) {
+        parent_->storage_.ResolveSlot(buffer, indices, &analyzer_, bind_env_);
+        if (is_write && kind == pto::StorageClass::kExternal)
+          parent_->Fail("memory access", "external ordinary storage write: " +
+                                             std::string(buffer->name));
+        return;
+      }
       try {
         auto access = pto_analysis::AnalyzeBufferAccess(
             buffer, indices, is_write, loop_var_, mapping_, &analyzer_,
@@ -825,8 +859,9 @@ private:
           parent_->Fail("memory access", oss.str());
         }
         if (access.pattern == pto_analysis::AccessPattern::kLaneUniform &&
-            is_write) {
-          // Lane-uniform is only a load pattern.
+            is_write && mapping_.logical_extent != 1) {
+          // Only singleton units can store a uniform address: their generated
+          // tail mask enables exactly lane zero.
           std::ostringstream oss;
           oss << "buffer `" << buffer->name
               << "`: lane-uniform stores are not yet supported";
@@ -1011,6 +1046,26 @@ private:
   // Per-unit checks (structure, ranges, layout)
   // ------------------------------------------------------------------
   void VerifyUnit(const For &unit, int64_t lanes, size_t unit_index) {
+    current_unit_ = unit;
+    for (const Buffer &buffer : storage_.PrivateAllocations(unit)) {
+      storage_.CheckStorageV1(buffer);
+      ICHECK(pto_analysis::IsSupportedElementDType(buffer->dtype) &&
+             !buffer->dtype.is_bool())
+          << "PTO Parallel unsupported private allocation dtype "
+          << buffer->dtype << " for " << buffer->name;
+      if (buffer.scope() == "local.var")
+        pto_analysis::CheckBroadcastDType(buffer->dtype,
+                                          "default zero initialization of " +
+                                              std::string(buffer->name));
+      Buffer promoted = buffer;
+      promoted.CopyOnWrite()->dtype = buffer->dtype.with_lanes(lanes);
+      if (buffer.scope() == "local.var")
+        vmi::ValidateDataSlot(promoted.get(),
+                              "PTO Parallel private allocation");
+      else
+        vmi::ValidateDataArray(promoted.get(),
+                               "PTO Parallel private allocation");
+    }
     // Full per-unit context for diagnostics.
     {
       std::ostringstream oss;
