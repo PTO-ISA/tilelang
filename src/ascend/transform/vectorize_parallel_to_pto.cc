@@ -251,8 +251,30 @@ public:
     for (const Var &parameter : f->params) {
       mutator.parameters_.insert(parameter);
     }
+    mutator.storage_.Build(f->body);
+    mutator.storage_.ValidateOwnerUses(f->body);
     PrimFuncNode *fptr = f.CopyOnWrite();
     fptr->body = mutator.VisitStmt(f->body);
+    class RemoveOld : public StmtMutator {
+    public:
+      explicit RemoveOld(const pto::ParallelStorageQuery &q) : q(q) {}
+      Stmt VisitStmt_(const SBlockNode *op) final {
+        SBlock b = Downcast<SBlock>(StmtMutator::VisitStmt_(op));
+        Array<Buffer> kept;
+        for (const Buffer &buf : b->alloc_buffers)
+          if (!q.IsPrivate(buf->data))
+            kept.push_back(buf);
+        b.CopyOnWrite()->alloc_buffers = kept;
+        return b;
+      }
+      Stmt VisitStmt_(const AllocBufferNode *op) final {
+        if (q.IsPrivate(op->buffer->data))
+          return Evaluate(0);
+        return GetRef<Stmt>(op);
+      }
+      const pto::ParallelStorageQuery &q;
+    };
+    fptr->body = RemoveOld(mutator.storage_)(fptr->body);
     return GetRef<PrimFunc>(fptr);
   }
 
@@ -762,7 +784,14 @@ private:
     }
     if (const auto *for_node = body.as<ForNode>()) {
       if (for_node == target.get()) {
-        return ConvertUnit(target, mapping);
+        Stmt converted = ConvertUnit(target, mapping);
+        Array<Stmt> declarations;
+        for (const Buffer &old : storage_.PrivateAllocations(target)) {
+          declarations.push_back(AllocBuffer(promoted_.at(old->data),
+              {{attr::kVmiAllocKind, String(old.scope() == "local.var" ? "data" : "data_array")}}));
+        }
+        declarations.push_back(converted);
+        return SeqStmt::Flatten(declarations);
       }
       Stmt nb = ReplaceStmt(for_node->body, target, mapping);
       if (nb.same_as(for_node->body)) {
@@ -820,6 +849,18 @@ private:
     // The inverse mapping comes from the region entry: it is the shared
     // source of truth for lanes, the mask plan and the body conversion
     // (see InvertPtoLaneLayout).
+    // Reset per-unit conversion state.
+    current_unit_ = loop;
+    promoted_.clear();
+    for (const Buffer &old : storage_.PrivateAllocations(loop)) {
+      storage_.CheckStorageV1(old);
+      Buffer b = decl_buffer(old->shape, old->dtype.with_lanes(mapping.lanes),
+                             old->name + "_v", old.scope());
+      auto *w = b.CopyOnWrite();
+      w->strides = old->strides;
+      w->elem_offset = old->elem_offset;
+      promoted_.emplace(old->data, b);
+    }
     bind_env_.clear();
     value_map_.clear();
     tmp_counter_ = 0;
@@ -866,6 +907,13 @@ private:
     }
 
     Array<Stmt> statements;
+    for (const Buffer &old : storage_.PrivateAllocations(loop)) {
+      if (old.scope() == "local.var") {
+        pto_analysis::CheckBroadcastDType(old->dtype, "default zero initialization of " + std::string(old->name));
+        PrimExpr zero = BroadcastValue(make_zero(old->dtype), &statements);
+        statements.push_back(BufferStore(promoted_.at(old->data), zero, {make_zero(DataType::Int(32))}));
+      }
+    }
     const Stmt &source = inner.defined() ? inner.value()->body : loop->body;
     ConvertBody(source, &statements);
     Stmt converted = DeadBindElim()(SeqStmt::Flatten(statements));
@@ -1133,7 +1181,22 @@ private:
   // ------------------------------------------------------------------
   // Statement conversion (pre-binds first, then the statement)
   // ------------------------------------------------------------------
+  PrimExpr BroadcastValue(const PrimExpr &value, Array<Stmt> *pre) {
+    pto_analysis::CheckBroadcastDType(value.dtype(),
+                                      "Parallel scalar assignment");
+    return EmitBind("broadcast",
+                    Call(VectorDType(value.dtype(), lanes_), VmiOp("vbrc"),
+                         {value},
+                         {{"size", IntImm(DataType::Int(32), lanes_)}}),
+                    pre);
+  }
+
   void ConvertBody(const Stmt &body, Array<Stmt> *out) {
+    if (const auto *alloc = body.as<AllocBufferNode>()) {
+      ICHECK(storage_.Classify(alloc->buffer, current_unit_) ==
+             pto::StorageClass::kPrivate);
+      return;
+    }
     if (const auto *seq = body.as<SeqStmtNode>()) {
       for (const auto &s : seq->seq) {
         ConvertBody(s, out);
@@ -1164,6 +1227,23 @@ private:
              "VerifyParallelToPTO";
       Array<Stmt> pre;
       PrimExpr value = ConvertExpr(store->value, &pre);
+      auto kind = storage_.Classify(store->buffer, current_unit_);
+      if (kind == pto::StorageClass::kPrivate) {
+        auto slot = storage_.ResolveSlot(store->buffer, store->indices,
+                                         &analyzer_, bind_env_);
+        Buffer target = promoted_.at(store->buffer->data);
+        if (value.dtype().lanes() == 1)
+          value = BroadcastValue(value, &pre);
+        ICHECK(value.dtype() == target->dtype)
+            << "PTO private Store dtype/lanes mismatch";
+        for (const Stmt &stmt : pre)
+          out->push_back(stmt);
+        out->push_back(
+            BufferStore(target, value, {IntImm(DataType::Int(32), slot.slot)}));
+        return;
+      }
+      ICHECK(kind != pto::StorageClass::kExternal)
+          << "PTO external ordinary storage write";
       auto access = pto_analysis::AnalyzeBufferAccess(
           store->buffer, store->indices, /*is_write=*/true, loop_var_,
           CurrentMapping(), &analyzer_, bind_env_);
@@ -1284,6 +1364,18 @@ private:
   // ------------------------------------------------------------------
   PrimExpr ConvertExpr(const PrimExpr &expr, Array<Stmt> *pre) {
     if (const auto *load = expr.as<BufferLoadNode>()) {
+      auto kind = storage_.Classify(load->buffer, current_unit_);
+      if (kind == pto::StorageClass::kPrivate ||
+          kind == pto::StorageClass::kExternal) {
+        auto slot = storage_.ResolveSlot(load->buffer, load->indices,
+                                         &analyzer_, bind_env_);
+        Buffer buffer = kind == pto::StorageClass::kPrivate
+                            ? promoted_.at(load->buffer->data)
+                            : storage_.Allocation(load->buffer->data);
+        return EmitBind(
+            "local_snapshot",
+            BufferLoad(buffer, {IntImm(DataType::Int(32), slot.slot)}), pre);
+      }
       auto access = pto_analysis::AnalyzeBufferAccess(
           load->buffer, load->indices, /*is_write=*/false, loop_var_,
           CurrentMapping(), &analyzer_, bind_env_);
@@ -1794,6 +1886,9 @@ private:
     return result;
   }
 
+  pto::ParallelStorageQuery storage_;
+  For current_unit_;
+  std::unordered_map<Var, Buffer, ObjectPtrHash, ObjectPtrEqual> promoted_;
   arith::Analyzer analyzer_;
   Var shared_mask_; // one full mask per VF, shared by all units
 
