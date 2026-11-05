@@ -65,8 +65,11 @@ def external_kernel(dtype="float32", mode=0):
                 elif mode == 1:
                     value = T.Cast(dtype, 3.1)
                     bias[0] = value
-                else:
+                elif mode == 2:
                     bias[0] = a[0]
+                else:
+                    value = a[0]
+                    bias[0] = value + T.Cast(dtype, 0.1)
                 for i in T.Parallel(131):
                     tmp = T.alloc_local((1,), dtype)
                     tmp[0] = bias[0]
@@ -136,7 +139,7 @@ def test_private_2d_layout(column):
 
 
 @pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
-@pytest.mark.parametrize("mode", [0, 1, 2])
+@pytest.mark.parametrize("mode", [0, 1, 2, 3])
 def test_external_array_keeps_scalar_type(dtype, mode):
     source = _lower(external_kernel(dtype, mode)).kernel_source
     assert "bias[0] = pto." in source
@@ -234,9 +237,9 @@ def test_owner_survives_early_unroll():
     mod = ascend.UnrollLoopSkipVF()(tvm.IRModule({"main": program}))
     roots = [x for x in nodes(mod, tvm.tirx.For) if KEY in x.annotations]
     assert len(roots) == 2
-    datas = [x.annotations[KEY][0] for x in roots]
-    assert not datas[0].same_as(datas[1])
-    for root, data in zip(roots, datas):
+    owned_data = [x.annotations[KEY][0] for x in roots]
+    assert not owned_data[0].same_as(owned_data[1])
+    for root, data in zip(roots, owned_data):
         loads = [x for x in nodes(root.body, tvm.tirx.BufferLoad) if x.buffer.scope() == "local"]
         stores = [x for x in nodes(root.body, tvm.tirx.BufferStore) if x.buffer.scope() == "local"]
         assert loads and stores
