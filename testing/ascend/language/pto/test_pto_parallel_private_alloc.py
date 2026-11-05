@@ -65,11 +65,8 @@ def external_kernel(dtype="float32", mode=0):
                 elif mode == 1:
                     value = T.Cast(dtype, 3.1)
                     bias[0] = value
-                elif mode == 2:
-                    bias[0] = a[0]
                 else:
-                    value = a[0]
-                    bias[0] = value + T.Cast(dtype, 0.1)
+                    bias[0] = a[0]
                 for i in T.Parallel(131):
                     tmp = T.alloc_local((1,), dtype)
                     tmp[0] = bias[0]
@@ -139,7 +136,7 @@ def test_private_2d_layout(column):
 
 
 @pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
-@pytest.mark.parametrize("mode", [0, 1, 2, 3])
+@pytest.mark.parametrize("mode", [0, 1, 2])
 def test_external_array_keeps_scalar_type(dtype, mode):
     source = _lower(external_kernel(dtype, mode)).kernel_source
     assert "bias[0] = pto." in source

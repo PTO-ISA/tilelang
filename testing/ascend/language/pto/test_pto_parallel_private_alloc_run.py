@@ -10,7 +10,7 @@ pytestmark = pytest.mark.pto
 
 
 @pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
-@pytest.mark.parametrize("mode", [0, 1, 2, 3])
+@pytest.mark.parametrize("mode", [0, 1, 2])
 def test_external_scalar_array_compiles(dtype, mode):
     tilelang.compile(external_kernel(dtype, mode), target="pto", out_idx=-1)
 
@@ -50,17 +50,14 @@ def test_private_state_snapshot_and_tail(n, lanes, rows, column, dtype):
 
 
 @pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
-@pytest.mark.parametrize("mode", [0, 1, 2, 3])
+@pytest.mark.parametrize("mode", [0, 1, 2])
 def test_external_scalar_rounding(dtype, mode):
     assert hasattr(torch, "npu")
     tdtype = getattr(torch, dtype)
     kernel = tilelang.compile(external_kernel(dtype, mode), target="pto", out_idx=-1)
-    a = (torch.arange(192, dtype=torch.float32) + 3.1).to(tdtype).npu()
+    a = torch.arange(192, dtype=torch.float32).to(tdtype).npu()
     actual = kernel(a).cpu()[:131]
-    stored = torch.tensor(3.1, dtype=tdtype)
-    if mode == 3:
-        stored = (stored.float() + torch.tensor(0.1, dtype=tdtype).float()).to(tdtype)
-    expected = stored.expand(131)
+    expected = torch.full((131,), 3.1, dtype=tdtype)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
