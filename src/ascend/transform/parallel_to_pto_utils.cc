@@ -524,6 +524,18 @@ MemoryAccess AnalyzeBufferAccess(const Buffer &buffer,
   throw PtoAnalysisError(oss.str());
 }
 
+void CheckBroadcastDType(DataType dtype, const std::string &context) {
+  bool supported =
+      dtype.lanes() == 1 &&
+      (((dtype.is_int() || dtype.is_uint()) &&
+        (dtype.bits() == 8 || dtype.bits() == 16 || dtype.bits() == 32)) ||
+       dtype == DataType::Float(16) || dtype == DataType::Float(32) ||
+       dtype == DataType::BFloat(16));
+  ICHECK(supported)
+      << "PTO Parallel unsupported scalar-to-vector broadcast dtype " << dtype
+      << " for " << context;
+}
+
 bool IsSupportedElementDType(DataType dtype) {
   // No packed sub-byte element types (FP4 etc.), no
   // buffer-element dtypes that already carry vector lanes, and no FP64
@@ -948,6 +960,16 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
     return LaneUse::kUnknown;
   }
   if (const auto *load = expr.as<BufferLoadNode>()) {
+    if (ctx->storage) {
+      auto kind = ctx->storage->Classify(load->buffer, ctx->unit);
+      if (kind == pto::StorageClass::kPrivate ||
+          kind == pto::StorageClass::kExternal) {
+        ctx->storage->ResolveSlot(load->buffer, load->indices, ctx->analyzer,
+                                  ctx->bind_env);
+        return kind == pto::StorageClass::kPrivate ? LaneUse::kVarying
+                                                   : LaneUse::kUniform;
+      }
+    }
     try {
       auto access = AnalyzeBufferAccess(
           load->buffer, load->indices, /*is_write=*/false, ctx->loop_var,

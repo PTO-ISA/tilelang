@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+from typing import overload
+
 from tvm import arith
 
 from tilelang._typing import DType, ShapeType
-from tilelang.language.allocate import _with_span
+from tilelang.language.allocate import (
+    _with_span,
+    alloc_var as _common_alloc_var,
+    alloc_local as _common_alloc_local,
+)
+from tilelang import _ffi_api
 from tvm import DataType
 from tvm.script import tirx as T
-from tvm.tirx import IntImm
+from tvm.tirx import IntImm, PrimExpr
 from tvm.tirx.buffer import Buffer
 from tvm.tirx.script.builder.ir import sblock_attr
 
@@ -174,3 +181,28 @@ __all__ = [
     "alloc_l0b_sf",
     "alloc_l0c",
 ]
+
+
+@overload
+def alloc_var(dtype: DType, init: PrimExpr | int | float, scope: str = "local.var") -> Buffer: ...
+
+
+@overload
+def alloc_var(dtype: DType, scope: str = "local.var", *, init: PrimExpr | int | float | None = None) -> Buffer: ...
+
+
+def alloc_var(dtype: DType, *args, scope: str = "local.var", init: PrimExpr | int | float | None = None) -> Buffer:
+    """Allocate an ordinary scalar, preserving its Parallel lexical owner."""
+    buf = _common_alloc_var(dtype, *args, scope=scope, init=init)
+    _ffi_api.RegisterParallelOrdinaryAllocation(buf)
+    return buf
+
+
+def alloc_local(shape: ShapeType, dtype: DType, scope="local") -> Buffer:
+    """Allocate ordinary local storage, preserving its Parallel lexical owner."""
+    buf = _common_alloc_local(shape, dtype, scope=scope)
+    _ffi_api.RegisterParallelOrdinaryAllocation(buf)
+    return buf
+
+
+__all__ += ["alloc_var", "alloc_local"]

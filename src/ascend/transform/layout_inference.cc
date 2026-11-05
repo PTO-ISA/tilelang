@@ -609,8 +609,8 @@ public:
 
     for (const auto &unit : pto_parallel_units_) {
       ICHECK(!pto_loop_layouts_.count(unit.root));
-      Fragment layout =
-          pto::InferPtoParallelLayout(unit.root, unit.lane_bounds);
+      Fragment layout = pto::InferPtoParallelLayout(unit.root, unit.lane_bounds,
+                                                    pto_storage_);
       pto_loop_layouts_.Set(unit.root, layout);
     }
 
@@ -738,6 +738,8 @@ public:
             pto_simd_parallel_roots};
   }
 
+  pto::ParallelStorageQuery pto_storage_;
+
   void Collect(const PrimFunc &f) {
     l0_sf_bindings_ = CollectL0SFBindings(f->body);
     for (const auto &[_, buffer] : f->buffer_map) {
@@ -756,6 +758,8 @@ public:
     // Shared C++ decision point: "pto" in keys selects the PTO codegen and
     // the SIMD_VF lane layout path (see tilelang/ascend/target.py).
     target_is_pto_ = TargetIsPTO(target_);
+    if (target_is_pto_)
+      pto_storage_.Build(f->body);
     this->operator()(f->body);
     // Compute floating fragment buffers after collection
     ComputeFloatingFragmentBuffers(f->body);

@@ -15,6 +15,7 @@
 #include <tvm/tirx/expr.h>
 #include <tvm/tirx/stmt.h>
 
+#include "ascend/pto_parallel_storage.h"
 #include "layout/layout.h"
 
 namespace tvm {
@@ -42,8 +43,8 @@ namespace pto {
  * modified; only the Fragment input extent of the vectorized dimension is
  * padded when the logical extent is not a multiple of L.
  */
-Fragment InferPtoParallelLayout(const tirx::For &root,
-                                const Range &lane_bounds);
+Fragment InferPtoParallelLayout(const tirx::For &root, const Range &lane_bounds,
+                                const ParallelStorageQuery &storage);
 
 } // namespace pto
 } // namespace tl
