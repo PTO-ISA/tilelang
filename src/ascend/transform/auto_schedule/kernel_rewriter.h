@@ -25,11 +25,13 @@
 #pragma once
 
 #include <functional>
+#include <optional>
 #include <utility>
 #include <vector>
 
 #include <tvm/ffi/optional.h>
 #include <tvm/runtime/logging.h>
+#include <tvm/target/target.h>
 #include <tvm/tirx/function.h>
 #include <tvm/tirx/stmt.h>
 #include <tvm/tirx/stmt_functor.h>
@@ -140,6 +142,10 @@ private:
 inline PrimFunc RewriteTilelangKernels(PrimFunc func, const char *pass_name,
                                        const TilelangKernelRewrite &rewrite,
                                        bool require_kernel) {
+  std::optional<With<Target>> target_scope;
+  if (auto target = func->GetAttr<Target>(tvm::attr::kTarget)) {
+    target_scope.emplace(target.value());
+  }
   std::vector<TilelangKernelContext> kernel_contexts =
       kernel_rewriter_detail::TilelangKernelContextCollector::Collect(
           func->body);
