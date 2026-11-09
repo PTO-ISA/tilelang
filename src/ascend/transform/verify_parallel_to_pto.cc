@@ -1152,7 +1152,13 @@ private:
     if (op->kind != ForKind::kParallel) {
       std::set<const VarNode *> saved = defs_;
       defs_.insert(op->loop_var.get());
+      // An enclosing loop range is a fact a predicate inside a nested
+      // converting region may rest on (`j < 8`), so it travels with the
+      // traversal and is handed to the region's admission walk.
+      outer_ranges_.push_back(
+          {op->loop_var, Range::FromMinExtent(op->min, op->extent)});
       StmtExprVisitor::VisitStmt_(op);
+      outer_ranges_.pop_back();
       defs_ = std::move(saved);
       return;
     }
@@ -1189,6 +1195,13 @@ private:
     // so any view declared over it is rejected by CheckScope. Plain PTO
     // functions without a converting region keep their behaviour.
     defs_.insert(op->var.get());
+    // A Bind that stays valid around the converting region is a shared fact for
+    // its predicates (the same safety rule the region walk applies: a snapshot
+    // over memory must stay opaque).
+    if (!op->value.dtype().is_handle() &&
+        pto_analysis::IsSafelyReevaluableValue(op->value)) {
+      outer_binds_.Set(op->var, op->value);
+    }
     StmtExprVisitor::VisitStmt_(op);
   }
 
@@ -1470,16 +1483,71 @@ private:
   void AdmitPredicates(const Stmt &body) {
     class Admission : public StmtExprVisitor {
      public:
-      Admission(VerifyParallelToPTOImpl *parent, std::set<const VarNode *> defs)
-          : parent_(parent), defs_(std::move(defs)) {}
+      Admission(VerifyParallelToPTOImpl *parent, std::set<const VarNode *> defs,
+                const Map<Var, PrimExpr> &outer_env,
+                const std::vector<std::pair<Var, Range>> &outer_ranges)
+          : parent_(parent), defs_(std::move(defs)), env_(outer_env) {
+        for (const auto &entry : outer_ranges) {
+          analyzer_.Bind(entry.first, entry.second, /*allow_override=*/true);
+        }
+      }
+
+      // Every scope owner saves and restores BOTH halves of the fact context.
+      // Restoring only `defs_` would leave a branch-local Bind value visible
+      // after its scope ends, so a later predicate could be proven from a value
+      // that is not in scope.
+      void EnterScope(std::set<const VarNode *> *saved_defs,
+                      Map<Var, PrimExpr> *saved_env) {
+        *saved_defs = defs_;
+        *saved_env = env_;
+      }
+      void LeaveScope(std::set<const VarNode *> *saved_defs,
+                      Map<Var, PrimExpr> *saved_env) {
+        defs_ = std::move(*saved_defs);
+        env_ = std::move(*saved_env);
+      }
 
       void VisitStmt_(const ForNode *op) final {
         analyzer_.Bind(op->loop_var, Range::FromMinExtent(op->min, op->extent),
                        /*allow_override=*/true);
-        std::set<const VarNode *> saved = defs_;
+        std::set<const VarNode *> saved_defs;
+        Map<Var, PrimExpr> saved_env;
+        EnterScope(&saved_defs, &saved_env);
         defs_.insert(op->loop_var.get());
         StmtExprVisitor::VisitStmt_(op);
-        defs_ = std::move(saved);
+        LeaveScope(&saved_defs, &saved_env);
+      }
+      void VisitStmt_(const IfThenElseNode *op) final {
+        VisitExpr(op->condition);
+        {
+          std::set<const VarNode *> saved_defs;
+          Map<Var, PrimExpr> saved_env;
+          EnterScope(&saved_defs, &saved_env);
+          VisitStmt(op->then_case);
+          LeaveScope(&saved_defs, &saved_env);
+        }
+        if (op->else_case.defined()) {
+          std::set<const VarNode *> saved_defs;
+          Map<Var, PrimExpr> saved_env;
+          EnterScope(&saved_defs, &saved_env);
+          VisitStmt(op->else_case.value());
+          LeaveScope(&saved_defs, &saved_env);
+        }
+      }
+      void VisitStmt_(const WhileNode *op) final {
+        VisitExpr(op->condition);
+        std::set<const VarNode *> saved_defs;
+        Map<Var, PrimExpr> saved_env;
+        EnterScope(&saved_defs, &saved_env);
+        StmtExprVisitor::VisitStmt_(op);
+        LeaveScope(&saved_defs, &saved_env);
+      }
+      void VisitStmt_(const AttrStmtNode *op) final {
+        std::set<const VarNode *> saved_defs;
+        Map<Var, PrimExpr> saved_env;
+        EnterScope(&saved_defs, &saved_env);
+        StmtExprVisitor::VisitStmt_(op);
+        LeaveScope(&saved_defs, &saved_env);
       }
       void VisitStmt_(const SBlockNode *op) final {
         VisitScopedBlock(op->iter_vars, op->alloc_buffers, op->body);
@@ -1490,10 +1558,14 @@ private:
       }
       void VisitStmt_(const BindNode *op) final {
         StmtExprVisitor::VisitStmt_(op);
-        if (!op->value.dtype().is_handle()) {
+        defs_.insert(op->var.get());
+        // A Bind is an SSA snapshot. Only a value that cannot observe state may
+        // be re-expanded in a predicate; `old = a[i]` must stay opaque, or
+        // `old == a[i]` after a store would be proven from a re-read.
+        if (!op->value.dtype().is_handle() &&
+            pto_analysis::IsSafelyReevaluableValue(op->value)) {
           env_.Set(op->var, op->value);
         }
-        defs_.insert(op->var.get());
       }
       void VisitStmt_(const AllocBufferNode *op) final {
         defs_.insert(op->buffer->data.get());
@@ -1522,7 +1594,9 @@ private:
       void VisitScopedBlock(const Array<IterVar> &iter_vars,
                             const Array<Buffer> &alloc_buffers,
                             const Stmt &body) {
-        std::set<const VarNode *> saved = defs_;
+        std::set<const VarNode *> saved_defs;
+        Map<Var, PrimExpr> saved_env;
+        EnterScope(&saved_defs, &saved_env);
         for (const IterVar &iv : iter_vars) {
           defs_.insert(iv->var.get());
         }
@@ -1530,7 +1604,7 @@ private:
           defs_.insert(buffer->data.get());
         }
         StmtExprVisitor::VisitStmt(body);
-        defs_ = std::move(saved);
+        LeaveScope(&saved_defs, &saved_env);
       }
 
       void Admit(const Optional<PrimExpr> &predicate, const String &name) {
@@ -1581,8 +1655,10 @@ private:
       std::set<const VarNode *> defs_;
     };
     // Seed with the definition snapshot at the region's lexical position
-    // (parameters, enclosing block variables, allocations before the region).
-    Admission admission(this, defs_);
+    // (parameters, enclosing block variables, allocations before the region)
+    // and the facts that stay valid across it: enclosing loop ranges and the
+    // scalar Binds defined outside this region.
+    Admission admission(this, defs_, outer_binds_, outer_ranges_);
     admission(body);
   }
 
@@ -1749,6 +1825,11 @@ private:
   // over one of these pointers is a view the lane analysis cannot follow, so
   // every access to it is rejected (see CheckScope).
   std::set<const VarNode *> handle_bind_targets_;
+  // Facts that stay valid around a converting region and must reach its
+  // predicate admission: scalar Binds defined outside it and the enclosing loop
+  // ranges. Restricted to safely re-evaluable Binds, like the region walk.
+  Map<Var, PrimExpr> outer_binds_;
+  std::vector<std::pair<Var, Range>> outer_ranges_;
   // Data Vars of AllocBuffers annotated tirx.volatile (collected
   // function-wide by CollectVolatileAllocs; identity-matched at every
   // access inside a converting region).

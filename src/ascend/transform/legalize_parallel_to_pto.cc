@@ -143,14 +143,7 @@ public:
       // outside it is rewritten.
       return StmtExprMutator::VisitStmt_(op);
     }
-    // Predicates are part of the admission contract, not of the rewrite: a
-    // provably-true predicate limits nothing, so it is cleared here for the
-    // whole converting region -- the unit and its region-level siblings -- before
-    // any control flow is folded. Folding builds new stores without the field, so
-    // clearing must happen first; doing it afterwards would silently drop an
-    // unproven predicate and turn a conditional access into an unconditional one.
-    // A hand-written VMI region (SIMD_VF without a Parallel unit) is out of
-    // this pass's contract; only a region that carries a unit is normalized.
+    // Clearing must precede the fold: folding builds stores without the field.
     Stmt normalized =
         HasParallelUnit(op->body) ? NormalizePredicates(op->body) : op->body;
     // No region-level gate: every rewrite below is gated on `in_parallel_`, so
@@ -187,16 +180,51 @@ public:
      public:
       explicit Normalizer(ControlFlowMutator *parent) : parent_(parent) {}
 
+      // Facts are scoped exactly like WalkRegion / the unit visitor: restoring
+      // only the definition set would leave a branch-local Bind value usable
+      // after its scope ends.
+      void EnterScope(Map<Var, PrimExpr> *saved) {
+        *saved = parent_->predicate_env_;
+      }
+      void LeaveScope(Map<Var, PrimExpr> *saved) {
+        parent_->predicate_env_ = std::move(*saved);
+      }
       Stmt VisitStmt_(const ForNode *op) final {
         parent_->predicate_analyzer_.Bind(
             op->loop_var, Range::FromMinExtent(op->min, op->extent),
             /*allow_override=*/true);
-        return StmtExprMutator::VisitStmt_(op);
+        Map<Var, PrimExpr> saved;
+        EnterScope(&saved);
+        Stmt result = StmtExprMutator::VisitStmt_(op);
+        LeaveScope(&saved);
+        return result;
+      }
+      Stmt VisitStmt_(const IfThenElseNode *op) final {
+        Map<Var, PrimExpr> saved;
+        EnterScope(&saved);
+        Stmt result = StmtExprMutator::VisitStmt_(op);
+        LeaveScope(&saved);
+        return result;
+      }
+      Stmt VisitStmt_(const WhileNode *op) final {
+        Map<Var, PrimExpr> saved;
+        EnterScope(&saved);
+        Stmt result = StmtExprMutator::VisitStmt_(op);
+        LeaveScope(&saved);
+        return result;
+      }
+      Stmt VisitStmt_(const AttrStmtNode *op) final {
+        Map<Var, PrimExpr> saved;
+        EnterScope(&saved);
+        Stmt result = StmtExprMutator::VisitStmt_(op);
+        LeaveScope(&saved);
+        return result;
       }
       Stmt VisitStmt_(const BindNode *op) final {
         Stmt result = StmtExprMutator::VisitStmt_(op);
         if (const auto *bind = result.as<BindNode>()) {
-          if (!bind->value.dtype().is_handle()) {
+          if (!bind->value.dtype().is_handle() &&
+              pto::IsSafelyReevaluableValue(bind->value)) {
             parent_->predicate_env_.Set(bind->var, bind->value);
           }
         }
@@ -225,6 +253,13 @@ public:
      private:
       ControlFlowMutator *parent_;
     };
+    // Seed the proof context with the facts that stay valid around this
+    // region: enclosing loop ranges and the scalar Binds defined outside it.
+    for (const auto &entry : outer_ranges_) {
+      predicate_analyzer_.Bind(entry.first, entry.second,
+                               /*allow_override=*/true);
+    }
+    predicate_env_ = outer_binds_;
     Normalizer normalizer(this);
     return normalizer(body);
   }
@@ -242,7 +277,13 @@ public:
 
   Stmt VisitStmt_(const ForNode *op) final {
     if (!in_simd_vf_ || op->kind != ForKind::kParallel) {
-      return StmtExprMutator::VisitStmt_(op);
+      // An enclosing loop range is a fact a predicate inside a nested
+      // converting region may rest on; keep it for that region's normaliser.
+      outer_ranges_.push_back(
+          {op->loop_var, Range::FromMinExtent(op->min, op->extent)});
+      Stmt result = StmtExprMutator::VisitStmt_(op);
+      outer_ranges_.pop_back();
+      return result;
     }
 
     Var saved_var = parallel_var_;
@@ -281,6 +322,17 @@ public:
     parallel_var_ = saved_var;
     in_parallel_ = saved_in;
     return loop;
+  }
+
+  Stmt VisitStmt_(const BindNode *op) final {
+    Stmt result = StmtExprMutator::VisitStmt_(op);
+    if (const auto *bind = result.as<BindNode>()) {
+      if (!bind->value.dtype().is_handle() &&
+          pto::IsSafelyReevaluableValue(bind->value)) {
+        outer_binds_.Set(bind->var, bind->value);
+      }
+    }
+    return result;
   }
 
   Stmt VisitStmt_(const IfThenElseNode *op) final {
@@ -375,8 +427,10 @@ public:
         !ffi::StructuralEqual()(lhs_buffer->shape, rhs_buffer->shape)) {
       return false;
     }
+    // Compare the destination as a value
+    arith::Analyzer analyzer;
     for (size_t i = 0; i < lhs_indices.size(); ++i) {
-      if (!ffi::StructuralEqual()(lhs_indices[i], rhs_indices[i])) {
+      if (!analyzer.CanProveEqual(lhs_indices[i], rhs_indices[i])) {
         return false;
       }
     }
@@ -788,16 +842,17 @@ public:
   // Verify used to admit the predicate.
   arith::Analyzer predicate_analyzer_;
   Map<Var, PrimExpr> predicate_env_;
+  // Facts that stay valid around a converting region: enclosing loop ranges and
+  // safely re-evaluable scalar Binds defined outside it.
+  Map<Var, PrimExpr> outer_binds_;
+  std::vector<std::pair<Var, Range>> outer_ranges_;
 };
 
 PrimFunc LowerControlFlow(PrimFunc f) {
   auto *n = f.CopyOnWrite();
   ControlFlowMutator mutator;
   // Storage origins are collected before the fold so the ordering analysis can
-  // tell two independent allocations apart from two views of one storage. The
-  // parameter side needs the ABI's alias contract: at this stage
-  // SplitHostDevice has not run, so a missing `tir.noalias` means two
-  // parameters may still be one storage (see MayConflictStorage).
+  // tell two independent allocations apart from two views of one storage.
   const bool no_alias = [&] {
     auto attr = n->GetAttr<Integer>(tirx::attr::kNoAlias);
     return attr.defined() && attr.value()->value != 0;

@@ -1006,27 +1006,17 @@ private:
     }
     if (const auto *sel = expr.as<SelectNode>()) {
 
-      // A Select takes one of two representations. When the condition and
-      // both arms are lane-uniform, the value stays scalar: a scalar Select
-      // is valid PTODSL (codegen emits pto.select), and keeping it scalar
-      // preserves the scalar-domain dtype contract Verify admitted --
-      // Legalize's Min/Max rewrite produces exactly this shape, and the
-      // scalar domain covers arithmetic whose VMI counterpart does not
-      // exist (e.g. int8 multiply). When any part varies per lane, PTODSL
-      // has no vector predicate, so the condition becomes a lane mask (the
-      // compare is redone in the vector domain, all-true or all-false for a
-      // lane-uniform test), a scalar arm is broadcast, and the Select
-      // lowers to one vsel.
-      // Convert once: a relation, an And/Or/Not combination and a `Bind` var
-      // all take the same path, and a fully lane-uniform condition stays
-      // scalar (a mask consumer lifts it at the use site).
+      // Select has two lowerings. When the condition and both arms are
+      // lane-uniform it stays a scalar Select (codegen emits pto.select), which
+      // keeps scalar-only operations such as int8 multiply legal. Otherwise the
+      // condition becomes a lane mask, scalar arms are broadcast, and it lowers
+      // to one vsel.
       PrimExpr cond = ConvertExpr(sel->condition, pre);
       PrimExpr tval = ConvertExpr(sel->true_value, pre);
       PrimExpr fval = ConvertExpr(sel->false_value, pre);
       if (IsScalarBool(cond) && tval.dtype().lanes() == 1 &&
           fval.dtype().lanes() == 1) {
-        // Fully lane-uniform: the scalar Select survives; a later vector
-        // consumer broadcasts it at the combination point.
+        // A vector consumer broadcasts this at the combination point.
         return Select(cond, tval, fval);
       }
       if (IsScalarBool(cond)) {
@@ -1123,12 +1113,7 @@ private:
 
   // One dispatch for every boolean combination, over operands that were each
   // converted exactly once. Verify admits the scalar domain, so a fully
-  // lane-uniform combination must stay scalar: VMI has no one-bit element, and
-  // forcing a mask would promote a scalar-domain value (an int8 Select arm, for
-  // instance) into a vreg whose arithmetic has no VMI counterpart. As soon as
-  // one operand is a lane mask the result is a mask, so scalar bool operands
-  // are lifted first. The decision reads the converted representation because
-  // a `Bind` var declared bool may already denote a mask.
+  // lane-uniform combination must stay scalar.
   PrimExpr CombineBool(
       const PrimExpr &a, const PrimExpr &b,
       const std::function<PrimExpr(const PrimExpr &, const PrimExpr &)>

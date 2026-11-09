@@ -2496,3 +2496,211 @@ def test_predicate_with_an_external_call_is_rejected():
     _, error = _lower_capture(func, expect_error=True)
     assert error is not None, "an external call in a predicate must be rejected"
     assert "unsupported Call" in str(error), f"unexpected diagnostic: {error}"
+
+
+# ---------------------------------------------------------------------------
+# A Bind is an SSA snapshot: a bind over memory must stay opaque in a proof
+# ---------------------------------------------------------------------------
+
+
+def _ub_buffers(func):
+    """(load buffer, store buffer) of the first UB access pair in the body."""
+    state = {}
+
+    def visit(node):
+        if (
+            isinstance(node, tvm.tirx.BufferLoad)
+            and node.buffer.scope() in ("shared", "shared.dyn")
+            and "load" not in state
+        ):
+            state["load"] = node.buffer
+        if (
+            isinstance(node, tvm.tirx.BufferStore)
+            and node.buffer.scope() in ("shared", "shared.dyn")
+            and "store" not in state
+        ):
+            state["store"] = node.buffer
+
+    tvm.tirx.stmt_functor.post_order_visit(func.body, visit)
+    return state.get("load"), state.get("store")
+
+
+def _prepend_to_vf(func, make_stmts):
+    """Prepend statements to the SIMD_VF body (region-level position)."""
+
+    def post(node):
+        if isinstance(node, tvm.tirx.SBlock) and node.name_hint == "SIMD_VF":
+            extra = make_stmts()
+            body = node.body
+            new_body = (
+                tvm.tirx.SeqStmt(extra + list(body.seq))
+                if isinstance(body, tvm.tirx.SeqStmt)
+                else tvm.tirx.SeqStmt(extra + [body])
+            )
+            return tvm.tirx.SBlock(
+                node.iter_vars,
+                node.reads,
+                node.writes,
+                node.name_hint,
+                new_body,
+                init=node.init,
+                alloc_buffers=node.alloc_buffers,
+                match_buffers=node.match_buffers,
+                annotations=node.annotations,
+            )
+        return None
+
+    body = tvm.tirx.stmt_functor.ir_transform(
+        func.body, None, post, ["tirx.SBlock"]
+    )
+    return func.with_body(body)
+
+
+def _snapshot_predicate_scene(func, snapshot_value, predicate_from_snapshot):
+    """`old = <read>; buf[0] = 0; Evaluate(load(predicate = f(old)))`."""
+    load_buf, store_buf = _ub_buffers(func)
+    if store_buf is None:
+        store_buf = load_buf
+    index = tvm.tirx.IntImm("int32", 0)
+
+    def make_stmts():
+        old = tvm.tirx.Var("old_snapshot", snapshot_value.dtype)
+        return [
+            tvm.tirx.Bind(old, snapshot_value),
+            tvm.tirx.BufferStore(store_buf, tvm.tirx.const(0.0, "float32"), [index]),
+            tvm.tirx.Evaluate(
+                tvm.tirx.BufferLoad(
+                    load_buf,
+                    [index],
+                    predicate=predicate_from_snapshot(old),
+                )
+            ),
+        ]
+
+    return _prepend_to_vf(func, make_stmts)
+
+
+def test_value_snapshot_before_a_write_is_not_provable():
+    """`old == a[0]` reads memory again: the snapshot must not be re-expanded."""
+    func = _k_plain_two_stores()
+    load_buf, _ = _ub_buffers(func)
+    index = tvm.tirx.IntImm("int32", 0)
+    scene = _snapshot_predicate_scene(
+        func,
+        tvm.tirx.BufferLoad(load_buf, [index]),
+        lambda old: tvm.tirx.EQ(old, tvm.tirx.BufferLoad(load_buf, [index])),
+    )
+    _, error = _lower_capture(scene, expect_error=True)
+    assert error is not None, (
+        "a comparison against a value snapshot must not be proven from a re-read"
+    )
+    assert "not provably true" in str(error), f"unexpected diagnostic: {error}"
+
+
+def test_bool_snapshot_before_a_write_is_not_provable():
+    """The bool form: `old_flag = a[0] > 0` must stay an opaque snapshot too."""
+    func = _k_plain_two_stores()
+    load_buf, _ = _ub_buffers(func)
+    index = tvm.tirx.IntImm("int32", 0)
+    scene = _snapshot_predicate_scene(
+        func,
+        tvm.tirx.GT(tvm.tirx.BufferLoad(load_buf, [index]), tvm.tirx.const(0.0, "float32")),
+        lambda old: old,
+    )
+    _, error = _lower_capture(scene, expect_error=True)
+    assert error is not None, "a bool snapshot must not be re-read as its source"
+    assert "not provably true" in str(error), f"unexpected diagnostic: {error}"
+
+
+# ---------------------------------------------------------------------------
+# Fact scoping: a branch-local Bind must not survive its branch
+# ---------------------------------------------------------------------------
+
+
+def test_branch_local_bind_does_not_escape_its_scope():
+    """`if ...: proof = True` then a predicate outside the branch uses `proof`."""
+    func = _k_plain_two_stores()
+    load_buf, _ = _ub_buffers(func)
+    index = tvm.tirx.IntImm("int32", 0)
+    # A constant condition would be folded away before Verify; use the kernel
+    # parameter so the branch really exists at the admission walk.
+    param = func.params[0]
+    state = {}
+
+    def make_stmts():
+        proof = tvm.tirx.Var("branch_proof", "bool")
+        state["proof"] = proof
+        branch = tvm.tirx.IfThenElse(
+            tvm.tirx.GT(param, tvm.tirx.IntImm("int32", 0)),
+            tvm.tirx.Bind(proof, tvm.tirx.const(True, "bool")),
+            None,
+        )
+        return [
+            branch,
+            tvm.tirx.Evaluate(
+                tvm.tirx.BufferLoad(load_buf, [index], predicate=proof)
+            ),
+        ]
+
+    scene = _prepend_to_vf(func, make_stmts)
+    _, error = _lower_capture(scene, expect_error=True)
+    assert error is not None, "a branch-local Bind must not be visible after the branch"
+    assert "not defined in the lexical scope" in str(error), (
+        f"unexpected diagnostic: {error}"
+    )
+
+
+def _k_bind_before_vf(E=256, lanes=64):
+    @T.prim_func
+    def main(A: T.Tensor((E,), "float32"), Y: T.Tensor((E,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((E,), "float32")
+            y = T.alloc_shared((E,), "float32")
+            T.copy(A, a)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(E):
+                    y[i] = a[i] + T.float32(1.0)
+            T.copy(y, Y)
+
+    return main
+
+
+@pytest.mark.pto
+def test_bind_defined_before_the_region_stays_a_fact_inside_it():
+    """A Bind/loop range valid around the VF must be usable inside it."""
+    func = _k_bind_before_vf()
+    load_buf, _ = _ub_buffers(func)
+    index = tvm.tirx.IntImm("int32", 0)
+    proof = tvm.tirx.Var("outer_proof", "bool")
+
+    # Insert `proof = True` as a sibling *before* the SIMD_VF block.
+    def prepend_before_vf(node):
+        if isinstance(node, tvm.tirx.SeqStmt) and any(
+            isinstance(child, tvm.tirx.SBlock) and child.name_hint == "SIMD_VF"
+            for child in node.seq
+        ):
+            return tvm.tirx.SeqStmt(
+                [tvm.tirx.Bind(proof, tvm.tirx.const(True, "bool"))] + list(node.seq)
+            )
+        return None
+
+    body = tvm.tirx.stmt_functor.ir_transform(
+        func.body, None, prepend_before_vf, ["tirx.SeqStmt"]
+    )
+    func = func.with_body(body)
+
+    scene = _append_region_level_access(
+        func,
+        "load",
+        lambda: proof,
+    )
+    stages, error = _lower_capture(scene)
+    assert error is None, f"an outer-VF Bind must remain a fact, got: {error}"
+    predicated = [
+        node
+        for node in _collect(
+            stages["legalize"], lambda n: isinstance(n, tvm.tirx.BufferLoad)
+        )
+        if node.predicate is not None
+    ]
+    assert not predicated, "Legalize must clear the outer-VF-backed predicate"

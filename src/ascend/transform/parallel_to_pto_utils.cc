@@ -581,9 +581,7 @@ bool IsPairableDestination(const Array<PrimExpr> &indices, const Var &vector_var
   // The last index must be `vector_var + constant`: a unit-coefficient
   // affine form keeps the pad's read-back per-lane (each lane reads exactly
   // its own element) and stays inside AnalyzeBufferAccess's kContinuous
-  // contract. Simplify-based rather than structural so `i + 8`, `8 + i` and
-  // `i * 1` are all accepted, while `2 * i` (offset simplifies to `i`) is
-  // rejected.
+  // contract.
   arith::Analyzer analyzer;
   PrimExpr offset = analyzer.Simplify(indices.back() - vector_var);
   if (!offset.as<IntImmNode>()) {
@@ -1838,12 +1836,22 @@ const RelationalKind *RelationalByName(const char *cmp) {
   return nullptr;
 }
 
-// ---------------------------------------------------------------------------
-// Branch-rewrite helpers shared by Verify / Legalize / Vectorize
-// ---------------------------------------------------------------------------
-// Collect a flat list of BufferStores from a stmt (single store or Seq of
-// stores). Nested Seq allowed; anything that is neither store nor no-op aborts
-// collection.
+bool IsSafelyReevaluableValue(const PrimExpr &value) {
+  class Checker : public tirx::ExprVisitor {
+   public:
+    bool safe = true;
+
+    // A load observes memory; re-expanding the bind would re-read it at a later
+    // program point. A call may read hidden state or have an effect. Neither is
+    // substitutable, so the bind var stays an opaque SSA snapshot.
+    void VisitExpr_(const tirx::BufferLoadNode *) final { safe = false; }
+    void VisitExpr_(const tirx::CallNode *) final { safe = false; }
+  };
+  Checker checker;
+  checker(value);
+  return checker.safe;
+}
+
 bool IsProvablyTruePredicate(const PrimExpr &predicate,
                              arith::Analyzer *analyzer,
                              const Map<Var, PrimExpr> &bind_env) {
@@ -1873,10 +1881,10 @@ bool IsProvablyTruePredicate(const PrimExpr &predicate,
       value = std::move(next);
     }
   }
-  const PrimExpr folded = analyzer->Simplify(value);
-  // CanProve covers the constant case and the range facts bound into the
-  // analyzer (a loop bound makes `_t < extent` provable, for instance).
-  return analyzer->CanProve(folded);
+  // No explicit Simplify here: CanProve folds the expression itself, and what
+  // decides a range-only predicate is the facts bound into the analyzer (a loop
+  // bound makes `_t < extent` provable), not an extra rewrite.
+  return analyzer->CanProve(value);
 }
 
 // Handle-valued Binds: `Bind(q, A.data)` makes q a pointer the lane analysis
@@ -1928,10 +1936,6 @@ StorageOrigins CollectStorageOrigins(const Stmt &body,
   class Collector : public tirx::StmtExprVisitor {
    public:
     explicit Collector(StorageOrigins *out) : out_(out) {}
-    // An allocation normally lives in the block's `alloc_buffers` field, not in
-    // a statement, so the block is the primary source. The same visit also
-    // picks up a `tl.non_restrict_params` written as a block annotation: the
-    // hoisting pass that turns it into a function attribute runs later.
     void VisitStmt_(const tirx::SBlockNode *op) final {
       for (const Buffer &buffer : op->alloc_buffers) {
         out_->allocations.insert(buffer->data.get());
@@ -1948,7 +1952,7 @@ StorageOrigins CollectStorageOrigins(const Stmt &body,
       }
       tirx::StmtExprVisitor::VisitStmt_(op);
     }
-    // `T.alloc_buffer`-style statements outside a block still allocate.
+
     void VisitStmt_(const tirx::AllocBufferNode *op) final {
       out_->allocations.insert(op->buffer->data.get());
       tirx::StmtExprVisitor::VisitStmt_(op);
@@ -1996,12 +2000,6 @@ bool MayConflictStorage(const BufferNode *lhs, const BufferNode *rhs,
   return true;
 }
 
-// ---------------------------------------------------------------------------
-// Branch-rewrite helpers shared by Verify / Legalize / Vectorize
-// ---------------------------------------------------------------------------
-// Collect a flat list of BufferStores from a stmt (single store or Seq of
-// stores). Nested Seq allowed; anything that is neither store nor no-op aborts
-// collection.
 bool CollectStores(const Stmt &stmt,
                    std::vector<const BufferStoreNode *> *out) {
   if (const auto *store = stmt.as<BufferStoreNode>()) {
