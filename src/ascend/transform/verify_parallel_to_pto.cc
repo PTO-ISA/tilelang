@@ -265,13 +265,16 @@ private:
             << buffer->name << "` has scope global); stage through UB first";
         parent_->Fail("memory access", oss.str());
       }
-      // Only UB accesses are currently supported. local /
-      // local.fragment / shared.l1 (L1) and other scopes are rejected.
+      // Support UB and ordinary local storage under the private / external
+      // read-only contracts checked below. local.fragment, shared.l1 (L1)
+      // and other scopes are rejected.
       if (scope != "shared" && scope != "shared.dyn" && scope != "local" &&
           scope != "local.var") {
         std::ostringstream oss;
         oss << "buffer `" << buffer->name << "` has scope `" << scope
-            << "`; only UB (shared/shared.dyn) accesses are supported";
+            << "`; supported scopes are UB (shared/shared.dyn) and ordinary "
+               "local storage (local/local.var), subject to private or "
+               "external read-only storage contracts";
         parent_->Fail("memory access", oss.str());
       }
       if (!pto_analysis::IsSupportedElementDType(buffer->dtype)) {
