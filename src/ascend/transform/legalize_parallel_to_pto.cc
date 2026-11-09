@@ -286,30 +286,7 @@ public:
       return result;
     }
 
-    Var saved_var = parallel_var_;
     bool saved_in = in_parallel_;
-    if (!in_parallel_) {
-      // Unit entry. Verify picks the vectorized coordinate through the layout
-      // annotation and checks a conditional store's last index against it;
-      // this pass must judge the same index against that variable too, not
-      // against the syntactically innermost loop of a 2D nest (an
-      // outer-vectorized 2D unit would otherwise reject a destination Verify
-      // accepts). Verify's acceptance implies this inversion succeeds, so a
-      // failure here means the inter-pass contract is broken and is reported
-      // instead of papered over with a default variable.
-      const pto::PtoInverseMapping mapping = [&] {
-        try {
-          return pto::InvertPtoLaneLayout(GetRef<For>(op));
-        } catch (const pto::PtoAnalysisError &err) {
-          Fail(std::string("layout: ") + err.what());
-          return pto::PtoInverseMapping{};
-        }
-      }();
-      parallel_var_ = mapping.is_2d
-                          ? (mapping.select_inner ? mapping.inner_var
-                                                  : mapping.outer_var)
-                          : op->loop_var;
-    }
     in_parallel_ = true;
 
     Stmt body = StmtExprMutator::VisitStmt(op->body);
@@ -319,7 +296,6 @@ public:
       loop.CopyOnWrite()->body = body;
     }
 
-    parallel_var_ = saved_var;
     in_parallel_ = saved_in;
     return loop;
   }
@@ -437,16 +413,6 @@ public:
     return true;
   }
 
-  // Lane-private address: leading indices free of the T.Parallel variable,
-  // and the last index equal to it up to a constant offset. The offset
-  // keeps every lane reading exactly its own element, so the pad read-back stays
-  // well-defined; the shifted window's allocation and 32-byte alignment are the
-  // caller's and codegen legality's contracts. The form check is shared with
-  // Verify's CheckPairedDestination so the two passes cannot drift apart (the 2D
-  // lane-variable divergence was exactly such a drift).
-  bool IsPerLaneAddress(const Array<PrimExpr> &indices) const {
-    return pto::IsPairableDestination(indices, parallel_var_);
-  }
   static bool CollectPlanTasks(const Stmt &stmt, std::vector<PlanTask> *out) {
     if (const auto *seq = stmt.as<SeqStmtNode>()) {
       for (const Stmt &s : seq->seq) {
@@ -528,21 +494,6 @@ public:
     }
     if (then_stores.empty() && else_stores.empty()) {
       return false;
-    }
-
-    // A missing arm reads the destination back, so every store destination must
-    // be lane-private. Condition Binds have no destination and need no such check.
-    for (const PlanTask &task : then_stores) {
-      if (task.store != nullptr &&
-          !IsPerLaneAddress(task.store->indices)) {
-        return false;
-      }
-    }
-    for (const PlanTask &task : else_stores) {
-      if (task.store != nullptr &&
-          !IsPerLaneAddress(task.store->indices)) {
-        return false;
-      }
     }
 
     const size_t n = then_stores.size();
@@ -832,7 +783,6 @@ public:
   }
   bool in_simd_vf_ = false;
   bool in_parallel_ = false;
-  Var parallel_var_;
   int condition_serial_ = 0;
   // Storage origins: which data Vars are real allocations and which are
   // parameters, plus the parameter no-alias facts.

@@ -464,6 +464,33 @@ private:
       if (op->step.defined()) {
         CheckDefinedVars(op->step.value());
       }
+      // A bound that mentions no lane variable is not automatically supported:
+      // the shell is copied into the vectorized loop header, so an opaque call
+      // would run once per chunk instead of once per source iteration and its
+      // result and side effects are unproven. Classify the bounds with the
+      // analysis the metadata positions use: supported uniform scalars (kernel
+      // parameters, outer serial variables, the 2D kept coordinate) stay
+      // admitted, anything varying or unknown is rejected here.
+      {
+        pto_analysis::LaneUseContext ctx = MakeLaneUseContext();
+        const auto admit_bound = [&](const PrimExpr &bound, const char *which) {
+          std::string why;
+          pto_analysis::LaneUse use =
+              pto_analysis::AnalyzeLaneUseMeta(bound, &ctx, &why);
+          if (use == pto_analysis::LaneUse::kUniform) {
+            return;
+          }
+          std::ostringstream oss;
+          oss << "T.serial shell " << which
+              << " must be a lane-uniform scalar expression";
+          if (!why.empty()) {
+            oss << " (" << why << ")";
+          }
+          parent_->Fail("loop structure", oss.str());
+        };
+        admit_bound(op->min, "lower bound");
+        admit_bound(op->extent, "extent");
+      }
       defined_loop_vars_.insert(op->loop_var.get());
       // The range is a fact, not an assumption: a predicate like `_t < extent`
       // is provably true here, and the same fact is bound in Legalize before it
@@ -621,10 +648,11 @@ private:
         return;
       }
       if (const auto *store = stmt.as<BufferStoreNode>()) {
-        // Run the access checks first: a lane-uniform destination keeps its
-        // own diagnostic, the pairing contract only covers per-lane stores.
+        // The access check is the whole admission here: a destination that is
+        // continuous under the layout (start + lane over the full chunk) is
+        // per-lane and can be paired; anything else -- interleaved, lane-uniform
+        // or data-dependent -- is rejected by it with a precise diagnostic.
         VisitStmt_(store);
-        CheckPairedDestination(store);
         return;
       }
       if (pto_analysis::IsNoOpStmt(stmt)) {
@@ -636,27 +664,6 @@ private:
              "conditionals or no-ops (the Select-rewritable shape); other "
              "statements are not supported at this stage";
       parent_->Fail("loop structure", oss.str());
-    }
-
-    // A conditional store becomes one arm of a value choice, so
-    // LegalizeParallelToPTO pairs the two arms by destination address. That
-    // works for the per-lane form -- leading indices free of the
-    // T.Parallel variable and the last index equal to it up to a constant
-    // offset -- so
-    // every other address shape is rejected here instead of failing late in
-    // Legalize with a misleading "both arms must write the same destination"
-    // error. The shifted window's 32-byte alignment is codegen legality's
-    // contract (VerifyPTOCodegenLegality), not this rule's.
-    void CheckPairedDestination(const BufferStoreNode *store) {
-      if (!pto_analysis::IsPairableDestination(store->indices, loop_var_)) {
-        std::ostringstream oss;
-        oss << "buffer `" << store->buffer->name
-            << "` is written inside a T.Parallel conditional with an address the "
-               "value-choice rewrite cannot pair: the leading indices must not "
-               "reference the T.Parallel variable and the last index must be "
-               "the T.Parallel variable up to a constant offset";
-        parent_->Fail("memory access", oss.str());
-      }
     }
 
     // The unified reference check. One StmtExprVisitor

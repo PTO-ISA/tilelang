@@ -2709,3 +2709,48 @@ def test_bind_defined_before_the_region_stays_a_fact_inside_it():
         if node.predicate is not None
     ]
     assert not predicated, "Legalize must clear the outer-VF-backed predicate"
+
+
+def _k_runtime_offset_destination(E=256, lanes=64, width=512):
+    """A conditional destination shifted by a *runtime* uniform offset."""
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((E,), "float32"),
+        K: T.int32,
+        Y: T.Tensor((width,), "float32"),
+    ):
+        with T.Kernel(1):
+            a = T.alloc_shared((E,), "float32")
+            y = T.alloc_shared((width,), "float32")
+            T.copy(A, a)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(E):
+                    if a[i] > T.float32(0.0):
+                        y[i + 8 * K] = a[i]
+            T.copy(y, Y)
+
+    return main
+
+
+@pytest.mark.pto
+def test_runtime_uniform_offset_destination_folds():
+    """A uniform-but-runtime destination offset is still per-lane and pairable.
+
+    `i + 8 * K` keeps the lane coefficient at 1, so the access is continuous and
+    the read-back stays per-lane; only the offset is unknown at compile time. The
+    admission is the continuity proof, not a constant-offset form rule.
+    """
+    stages, error = _lower_capture(_k_runtime_offset_destination())
+    assert error is None, f"a runtime uniform offset must lower, got: {error}"
+
+    legalized = stages["legalize"]
+    assert legalized is not None
+    branches = [
+        node
+        for node in _collect(legalized, lambda n: isinstance(n, tvm.tirx.IfThenElse))
+    ]
+    assert not branches, "the conditional must be folded into a value choice"
+    assert "vsel" in str(stages["vectorize"]), (
+        "the folded store must lower to a lane-wise select"
+    )

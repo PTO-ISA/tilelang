@@ -177,20 +177,6 @@ MemoryAccess AnalyzeBufferAccess(const Buffer &buffer,
                                  arith::Analyzer *analyzer,
                                  const Map<Var, PrimExpr> &bind_env = {});
 
-/*! The destination form a conditional store must satisfy to be pairable
- * into one value choice: leading indices free of the vectorized variable,
- * and the last index equal to the vectorized variable up to a constant
- * offset.
- * The offset may be negative -- the shifted window is the caller's
- * allocation contract, exactly as for unconditional stores, and the
- * 32-byte alignment of the shifted window is
- * VerifyPTOCodegenLegality's contract, not this form's.
- * Continuity itself is AnalyzeBufferAccess's proof (VerifyAccess runs it
- * before the pairing rule); this form additionally keeps the pairing and
- * the pad read-back well-defined. \p vector_var is the layout-selected
- * vectorized variable of the unit. */
-bool IsPairableDestination(const Array<PrimExpr> &indices, const Var &vector_var);
-
 /*! Check whether a dtype is supported by the unified element
  * addressing convention: the buffer element dtype itself must not carry
  * vector lanes and must not be a packed sub-byte type (FP4 etc.).

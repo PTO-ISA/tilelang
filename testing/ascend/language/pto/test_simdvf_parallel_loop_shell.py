@@ -296,3 +296,67 @@ def test_undefined_variable_in_shell_bounds_is_rejected():
     assert "never defined" in str(error), (
         f"expected the undefined-variable diagnostic, got: {error}"
     )
+
+
+@contextmanager
+def _opaque_extent_hook():
+    """Replace the admitted serial shell's extent with an opaque extern call.
+
+    The frontend cannot express such a bound, so the hook rewrites the module
+    right before ``VerifyParallelToPTO`` runs. Everything else is untouched.
+    """
+    opaque = tvm.tirx.call_extern("int32", "pr11_trip_count")
+    original = ascend_transform.VerifyParallelToPTO
+
+    def factory():
+        real = original()
+
+        def run(mod):
+            def post(node):
+                if (
+                    isinstance(node, tvm.tirx.For)
+                    and node.kind == tvm.tirx.ForKind.SERIAL
+                ):
+                    return tvm.tirx.For(
+                        node.loop_var,
+                        node.min,
+                        opaque,
+                        node.kind,
+                        node.body,
+                        node.thread_binding,
+                        node.annotations,
+                    )
+                return None
+
+            functions = {
+                name: func.with_body(
+                    tvm.tirx.stmt_functor.ir_transform(func.body, None, post)
+                )
+                for name, func in mod.functions.items()
+            }
+            return real(tvm.IRModule(functions, mod.attrs))
+
+        return run
+
+    ascend_transform.VerifyParallelToPTO = factory
+    try:
+        yield
+    finally:
+        ascend_transform.VerifyParallelToPTO = original
+
+
+@pytest.mark.pto
+def test_opaque_call_in_shell_bounds_is_rejected():
+    """A bound that mentions no lane variable is not automatically supported.
+
+    The shell is copied into the vectorized loop header, so an opaque call would
+    run once per chunk instead of once per source iteration and neither its
+    result nor its side effects are proven.
+    """
+    E, lanes = 256, 64
+    with _opaque_extent_hook():
+        _, error = _lower_capture(_k_shell_no_carry(E, lanes), expect_error=True)
+    assert error is not None, "an opaque call as a shell bound must be rejected"
+    assert "lane-uniform scalar" in str(error), (
+        f"expected the lane-uniform bound diagnostic, got: {error}"
+    )
