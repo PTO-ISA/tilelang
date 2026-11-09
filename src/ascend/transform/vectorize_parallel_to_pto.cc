@@ -1872,6 +1872,7 @@ private:
   // Broadcast a lane-uniform scalar to the current lane count (vbrc).
   PrimExpr BroadcastToLanes(const char *tag, const PrimExpr &scalar,
                             Array<Stmt> *pre) {
+    pto_analysis::CheckBroadcastDType(scalar.dtype(), tag);
     return EmitBind(
         tag,
         Call(VectorDType(scalar.dtype(), lanes_), VmiOp("vbrc"), {scalar},
