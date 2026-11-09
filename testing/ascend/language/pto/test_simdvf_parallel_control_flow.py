@@ -332,6 +332,7 @@ def test_conditional_arm_that_reads_its_own_write_keeps_arm_order():
     assert len(_selects(legalized)) >= 2, "every store needs its own value choice"
 
 
+@pytest.mark.pto
 def test_minmax_legalizes_without_residual_max_min_nodes():
     E, lanes = 150, 128
     stages, _ = _lower_capture(_k_minmax(E, lanes))
@@ -765,6 +766,7 @@ def test_conditional_arm_with_read_then_write_keeps_arm_order():
     assert all(st.predicate is None for st in stores), "no store may stay predicated"
 
 
+@pytest.mark.pto
 def test_war_with_unequal_arms_pairs_by_address():
     """A WAR inside the then arm must not force the arms apart when the else arm
     writes fewer destinations: the reorder step already found an emission order
@@ -2580,6 +2582,7 @@ def _snapshot_predicate_scene(func, snapshot_value, predicate_from_snapshot):
     return _prepend_to_vf(func, make_stmts)
 
 
+@pytest.mark.pto
 def test_value_snapshot_before_a_write_is_not_provable():
     """`old == a[0]` reads memory again: the snapshot must not be re-expanded."""
     func = _k_plain_two_stores()
@@ -2597,6 +2600,7 @@ def test_value_snapshot_before_a_write_is_not_provable():
     assert "not provably true" in str(error), f"unexpected diagnostic: {error}"
 
 
+@pytest.mark.pto
 def test_bool_snapshot_before_a_write_is_not_provable():
     """The bool form: `old_flag = a[0] > 0` must stay an opaque snapshot too."""
     func = _k_plain_two_stores()
@@ -2617,6 +2621,7 @@ def test_bool_snapshot_before_a_write_is_not_provable():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.pto
 def test_branch_local_bind_does_not_escape_its_scope():
     """`if ...: proof = True` then a predicate outside the branch uses `proof`."""
     func = _k_plain_two_stores()
