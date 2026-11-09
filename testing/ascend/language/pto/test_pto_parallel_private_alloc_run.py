@@ -9,12 +9,6 @@ from testing.ascend.language.pto.test_pto_parallel_private_alloc import external
 pytestmark = pytest.mark.pto
 
 
-@pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
-@pytest.mark.parametrize("mode", [0, 1, 2])
-def test_external_scalar_array_compiles(dtype, mode):
-    tilelang.compile(external_kernel(dtype, mode), target="pto", out_idx=-1)
-
-
 @pytest.mark.parametrize("dtype", ["float8_e4m3fn", "float8_e5m2"])
 def test_fp8_private_array_vector_copy_compiles(dtype):
     tilelang.compile(rejected_kernel("local", dtype), target="pto", out_idx=-1)

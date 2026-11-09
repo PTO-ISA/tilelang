@@ -90,6 +90,30 @@ Parallel verification adds no definite-initialization rejection. This does
 defined result. Initialize every `alloc_local` slot before reading it; this
 implementation introduces neither an undef value nor automatic zero filling.
 
+## Integration with Parallel control flow
+
+Internal control flow remains outside this change. The control-flow proposal
+in [PR #11](https://github.com/PTO-ISA/tilelang/pull/11), reviewed at
+`0ae08678d01410c5f8d625af631d860b57176880`, does not automatically enable
+conditional private-slot writes: its scope checks admit only UB, and its
+conditional destination pairing requires a lane-dependent address. A private
+slot such as `tmp[0]` has a constant index but represents independent lane state.
+
+Integration must use `ParallelStorageQuery` in both verification and branch
+legalization to recognize private destinations by allocation and slot, while
+continuing to reject writes to external ordinary storage. The query must refer
+to the current loop tree after legalization, preserving allocation ownership.
+Scalar arms introduced by Select lowering must also use `CheckBroadcastDType`.
+
+The control-flow legalizer fills a missing store arm with a read of the old
+destination. For a private slot this must read its previous vector value;
+`alloc_local` must already be initialized on that path. Integration tests need
+two-arm assignments, one-arm updates, read-modify-write and a bound old value
+used after a conditional overwrite, including multiple chunks and tails.
+Branch-local declarations and Bind statements also need explicit admission in
+the branch legalizer; this change does not promise support for them. These are
+integration requirements, not completed combined-backend validation.
+
 ## Validation
 
 Host tests in `testing/ascend/language/pto/test_pto_parallel_private_alloc.py`
