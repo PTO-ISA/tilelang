@@ -29,8 +29,9 @@ Covered here:
 * scoped Analyzer facts: loop ranges and non-zero loop mins;
 * the final-pipeline integration: the pass sees the final merged UB arena,
   descriptor and version-slot addresses; compact ``(3,131)`` FP16/FP32 and
-  flat/column-offset stores fail before codegen; padded, row-0-only, tail
-  and dynamic-offset controls pass; the point-writeback reductions, the
+  flat stores select an alternate axis; one-dimensional column-offset stores
+  fail before codegen; padded, row-0-only, tail and dynamic-offset controls
+  pass; the point-writeback reductions, the
   buffer-version layout and a non-32B-aligned FP16/FP32 load with a
   physically padded source feeding an aligned store compile and run on the
   device with numeric checks; dynamic-mask and single-active stores are
@@ -744,19 +745,30 @@ def _dynamic_offset_kernel(mult):
 
 
 class TestFinalPipeline:
-    @pytest.mark.parametrize("dtype", ["float32", "float16"])
+    @pytest.mark.parametrize(
+        ("kernel", "shape", "dtype"),
+        [
+            pytest.param(_parallel_kernel("float32", 3, 131), (3, 131), torch.float32, id="compact-fp32"),
+            pytest.param(_parallel_kernel("float16", 3, 131), (3, 131), torch.float16, id="compact-fp16"),
+            pytest.param(_flat_kernel(), (3 * 131,), torch.float32, id="flat-fp32"),
+        ],
+    )
     @pytest.mark.pto
-    def test_compact_three_by_131_fails_before_codegen(self, dtype):
-        text = _lower_expect_error(_parallel_kernel(dtype, 3, 131))
-        assert "ordinary masked vstore" in text
-        assert "required alignment=32" in text
-        assert "root=" in text
-        assert "normalized byte offset=" in text
-
-    @pytest.mark.pto
-    def test_flat_same_address_fails(self):
-        text = _lower_expect_error(_flat_kernel())
-        assert "cannot prove destination alignment" in text
+    def test_compact_rows_use_scatter(self, kernel, shape, dtype):
+        mod = _lower_capture(kernel)
+        mem_ops = []
+        tirx.stmt_functor.post_order_visit(
+            mod["main_kernel"].body,
+            lambda node: mem_ops.append(node.op) if isinstance(node, tirx.Call) else None,
+        )
+        assert _OP_VSCATTER in mem_ops
+        assert _OP_VSTORE not in mem_ops
+        _require_npu_runtime()
+        compiled = tilelang.compile(kernel, target="pto", out_idx=-1)
+        values = (torch.arange(3 * 131, dtype=torch.float32) % 41 - 20).reshape(shape).to(dtype)
+        output = compiled(values.to("npu"))
+        torch.npu.synchronize()
+        torch.testing.assert_close(output.cpu(), values + 3, rtol=0, atol=0)
 
     @pytest.mark.pto
     def test_nonzero_column_offset_fails(self):
