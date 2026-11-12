@@ -190,6 +190,7 @@ MemoryAccess AnalyzeBufferAccess(const Buffer &buffer,
  * two dtypes listed in IsSupportedFloat8 take part in the FP8 conversion
  * matrix. */
 bool IsSupportedElementDType(DataType dtype);
+void CheckBroadcastDType(DataType dtype, const std::string &context);
 
 /*! The two FP8 element types the conversion matrix supports: float8_e4m3fn and
  * float8_e5m2. Deliberately narrower than the codegen's FP8 name mapping:
@@ -290,6 +291,8 @@ std::string LaneUseToString(LaneUse use);
  * (params / buffer data pointers / outer-scope definitions), and the
  * recursion guards of the classification walk. */
 struct LaneUseContext {
+  const pto::ParallelStorageQuery *storage = nullptr;
+  For unit;
   Var loop_var;
   /*! In a 2D unit the coordinate of the non-vectorized dimension
    * is a uniform scalar at the program point. Unset for 1D. */
@@ -310,7 +313,8 @@ struct LaneUseContext {
 
 /*! Classify \p expr bottom-up. Constants and *known*
  * external scalar vars are Uniform; the loop var as a value is Varying;
- * BufferLoad goes through AnalyzeBufferAccess (uniform load -> Uniform,
+ * Ordinary private BufferLoads are Varying and external scalar slots are
+ * Uniform; UB loads use AnalyzeBufferAccess (uniform -> Uniform,
  * continuous -> Varying); Add/Mul/Cast propagate operands; original Bind
  * vars use their recorded classification (on-demand analysis is guarded
  * by the visiting set and budget; cycles and exhaustion -> Unknown).

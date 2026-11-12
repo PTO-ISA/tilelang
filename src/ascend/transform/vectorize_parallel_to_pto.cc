@@ -239,8 +239,30 @@ class VectorizeParallelToPTOImpl : public StmtExprMutator {
 public:
   static PrimFunc Substitute(PrimFunc f) {
     VectorizeParallelToPTOImpl mutator;
+    mutator.storage_.Build(f->body);
+    mutator.storage_.ValidateOwnerUses(f->body);
     PrimFuncNode *fptr = f.CopyOnWrite();
     fptr->body = mutator.VisitStmt(f->body);
+    class RemoveOld : public StmtMutator {
+    public:
+      explicit RemoveOld(const pto::ParallelStorageQuery &q) : q(q) {}
+      Stmt VisitStmt_(const SBlockNode *op) final {
+        SBlock b = Downcast<SBlock>(StmtMutator::VisitStmt_(op));
+        Array<Buffer> kept;
+        for (const Buffer &buf : b->alloc_buffers)
+          if (!q.IsPrivate(buf->data))
+            kept.push_back(buf);
+        b.CopyOnWrite()->alloc_buffers = kept;
+        return b;
+      }
+      Stmt VisitStmt_(const AllocBufferNode *op) final {
+        if (q.IsPrivate(op->buffer->data))
+          return Evaluate(0);
+        return GetRef<Stmt>(op);
+      }
+      const pto::ParallelStorageQuery &q;
+    };
+    fptr->body = RemoveOld(mutator.storage_)(fptr->body);
     return GetRef<PrimFunc>(fptr);
   }
 
@@ -332,6 +354,16 @@ private:
       // emitted, is visible to every unit.
       for (size_t i = 0; i < scan.units.size(); ++i) {
         Stmt converted = ConvertUnit(scan.units[i], mappings[i]);
+        Array<Stmt> declarations;
+        for (const Buffer &old : storage_.PrivateAllocations(scan.units[i])) {
+          Buffer promoted = promoted_.at(old->data);
+          declarations.push_back(AllocBuffer(
+              promoted,
+              {{attr::kVmiAllocKind,
+                String(old.scope() == "local.var" ? "data" : "data_array")}}));
+        }
+        declarations.push_back(converted);
+        converted = SeqStmt::Flatten(declarations);
         new_region = ReplaceStmt(new_region, scan.units[i], converted);
       }
       new_body = new_region;
@@ -412,6 +444,17 @@ private:
     // source of truth for lanes, the mask plan and the body conversion
     // (see InvertPtoLaneLayout).
     // Reset per-unit conversion state.
+    current_unit_ = loop;
+    promoted_.clear();
+    for (const Buffer &old : storage_.PrivateAllocations(loop)) {
+      storage_.CheckStorageV1(old);
+      Buffer b = decl_buffer(old->shape, old->dtype.with_lanes(mapping.lanes),
+                             old->name + "_v", old.scope());
+      auto *w = b.CopyOnWrite();
+      w->strides = old->strides;
+      w->elem_offset = old->elem_offset;
+      promoted_.emplace(old->data, b);
+    }
     bind_env_.clear();
     value_map_.clear();
     tmp_counter_ = 0;
@@ -476,6 +519,16 @@ private:
     // the innermost compute body; the outer (kept) coordinate is
     // re-emitted as a serial loop around the chunk loop.
     Array<Stmt> unit_stmts;
+    for (const Buffer &old : storage_.PrivateAllocations(loop)) {
+      if (old.scope() == "local.var") {
+        pto_analysis::CheckBroadcastDType(old->dtype,
+                                          "default zero initialization of " +
+                                              std::string(old->name));
+        PrimExpr zero = BroadcastValue(make_zero(old->dtype), &unit_stmts);
+        unit_stmts.push_back(BufferStore(promoted_.at(old->data), zero,
+                                         {make_zero(DataType::Int(32))}));
+      }
+    }
     ConvertBody(inner != nullptr ? static_cast<const Stmt &>(inner->body)
                                  : static_cast<const Stmt &>(loop->body),
                 &unit_stmts);
@@ -623,7 +676,22 @@ private:
   // ------------------------------------------------------------------
   // Statement conversion (pre-binds first, then the statement)
   // ------------------------------------------------------------------
+  PrimExpr BroadcastValue(const PrimExpr &value, Array<Stmt> *pre) {
+    pto_analysis::CheckBroadcastDType(value.dtype(),
+                                      "Parallel scalar assignment");
+    return EmitBind("broadcast",
+                    Call(VectorDType(value.dtype(), lanes_), VmiOp("vbrc"),
+                         {value},
+                         {{"size", IntImm(DataType::Int(32), lanes_)}}),
+                    pre);
+  }
+
   void ConvertBody(const Stmt &body, Array<Stmt> *out) {
+    if (const auto *alloc = body.as<AllocBufferNode>()) {
+      ICHECK(storage_.Classify(alloc->buffer, current_unit_) ==
+             pto::StorageClass::kPrivate);
+      return;
+    }
     if (const auto *seq = body.as<SeqStmtNode>()) {
       for (const auto &s : seq->seq) {
         ConvertBody(s, out);
@@ -647,11 +715,31 @@ private:
     if (const auto *store = body.as<BufferStoreNode>()) {
       Array<Stmt> pre;
       PrimExpr value = ConvertExpr(store->value, &pre);
+      auto kind = storage_.Classify(store->buffer, current_unit_);
+      if (kind == pto::StorageClass::kPrivate) {
+        auto slot = storage_.ResolveSlot(store->buffer, store->indices,
+                                         &analyzer_, bind_env_);
+        Buffer target = promoted_.at(store->buffer->data);
+        if (value.dtype().lanes() == 1)
+          value = BroadcastValue(value, &pre);
+        ICHECK(value.dtype() == target->dtype)
+            << "PTO private Store dtype/lanes mismatch";
+        for (const Stmt &stmt : pre)
+          out->push_back(stmt);
+        out->push_back(
+            BufferStore(target, value, {IntImm(DataType::Int(32), slot.slot)}));
+        return;
+      }
+      ICHECK(kind != pto::StorageClass::kExternal)
+          << "PTO external ordinary storage write";
       auto access = pto_analysis::AnalyzeBufferAccess(
           store->buffer, store->indices, /*is_write=*/true, loop_var_,
           CurrentMapping(), &analyzer_, bind_env_);
-      if (access.pattern == pto_analysis::AccessPattern::kContinuous) {
+      if (access.pattern == pto_analysis::AccessPattern::kContinuous ||
+          (access.pattern == pto_analysis::AccessPattern::kLaneUniform &&
+           unit_mapping_.logical_extent == 1)) {
         if (value.dtype().lanes() == 1) {
+          pto_analysis::CheckBroadcastDType(value.dtype(), "UB vector store");
           value = EmitBind(
               "vbrc_val",
               Call(VectorDType(value.dtype(), lanes_), VmiOp("vbrc"), {value},
@@ -754,6 +842,18 @@ private:
   // ------------------------------------------------------------------
   PrimExpr ConvertExpr(const PrimExpr &expr, Array<Stmt> *pre) {
     if (const auto *load = expr.as<BufferLoadNode>()) {
+      auto kind = storage_.Classify(load->buffer, current_unit_);
+      if (kind == pto::StorageClass::kPrivate ||
+          kind == pto::StorageClass::kExternal) {
+        auto slot = storage_.ResolveSlot(load->buffer, load->indices,
+                                         &analyzer_, bind_env_);
+        Buffer buffer = kind == pto::StorageClass::kPrivate
+                            ? promoted_.at(load->buffer->data)
+                            : storage_.Allocation(load->buffer->data);
+        return EmitBind(
+            "local_snapshot",
+            BufferLoad(buffer, {IntImm(DataType::Int(32), slot.slot)}), pre);
+      }
       auto access = pto_analysis::AnalyzeBufferAccess(
           load->buffer, load->indices, /*is_write=*/false, loop_var_,
           CurrentMapping(), &analyzer_, bind_env_);
@@ -951,12 +1051,14 @@ private:
                     << vmi_name;
     }
     if (a_vec && !b_vec) {
+      pto_analysis::CheckBroadcastDType(b.dtype(), "binary operand");
       b = EmitBind(
           "brc",
           Call(VectorDType(b.dtype(), lanes_), VmiOp("vbrc"), {b},
                {{"size", IntImm(DataType::Int(32), static_cast<int>(lanes_))}}),
           pre);
     } else if (!a_vec && b_vec) {
+      pto_analysis::CheckBroadcastDType(a.dtype(), "binary operand");
       a = EmitBind(
           "brc",
           Call(VectorDType(a.dtype(), lanes_), VmiOp("vbrc"), {a},
@@ -1005,6 +1107,9 @@ private:
     return result;
   }
 
+  pto::ParallelStorageQuery storage_;
+  For current_unit_;
+  std::unordered_map<Var, Buffer, ObjectPtrHash, ObjectPtrEqual> promoted_;
   arith::Analyzer analyzer_;
   Var shared_mask_; // one full mask per VF, shared by all units
 

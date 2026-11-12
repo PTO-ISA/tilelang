@@ -9,6 +9,8 @@ from tilelang.language.common import __all__ as _COMMON_ALL
 # bool buffers in the requested scope, without CUDA's static-scope hack.
 from .allocate import (  # noqa: F401
     alloc_shared,
+    alloc_var,
+    alloc_local,
     alloc_l1,
     alloc_ss,
     alloc_l0a,
@@ -44,7 +46,7 @@ from .reduce_op import (  # noqa: F401
 
 # Ascend owns the unroll-factor knob: the Ascend codegen lowers the
 # "pragma_unroll_factor" annotation to `#pragma unroll N`.
-from .loop import unroll  # noqa: F401
+from .loop import Parallel, unroll  # noqa: F401
 
 # Ascend owns its launch and its thread-scope accessors. These deliberately
 # shadow the common surface imported above: `T.Kernel` here is the 1-D NPU core

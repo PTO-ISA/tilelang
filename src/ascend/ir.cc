@@ -21,9 +21,11 @@
 
 #include "ir.h"
 
+#include "ascend/transform/attr.h"
 #include <tvm/ffi/reflection/creator.h>
 #include <tvm/script/ir_builder/tir/ir.h>
 #include <tvm/tirx/stmt.h>
+#include <tvm/tirx/stmt_functor.h>
 
 #include "support/check.h"
 #include "transform/common/attr.h"
@@ -253,8 +255,38 @@ SimtVFFrame SimtVF(const Array<PrimExpr> &thread_extents, int64_t vf_latency,
   return SimtVFFrame(n);
 }
 
+// Frontend-only metadata rewrite: do not depend on PTO pass objects here,
+// since this translation unit is also built with USE_ASCEND=OFF.
+class PrivateAllocationAnnotator : public tirx::StmtMutator {
+public:
+  explicit PrivateAllocationAnnotator(const Map<Var, Array<Var>> &candidates)
+      : candidates_(candidates) {}
+  tirx::Stmt VisitStmt_(const tirx::ForNode *op) final {
+    if (op->kind != tirx::ForKind::kParallel)
+      return tirx::StmtMutator::VisitStmt_(op);
+    const tirx::ForNode *inner = op;
+    while (const auto *next = inner->body.as<tirx::ForNode>()) {
+      if (next->kind != tirx::ForKind::kParallel)
+        break;
+      inner = next;
+    }
+    tirx::For result = GetRef<tirx::For>(op);
+    auto it = candidates_.find(inner->loop_var);
+    if (it != candidates_.end()) {
+      result.CopyOnWrite()->annotations.Set(attr::kParallelPrivateAllocs,
+                                            (*it).second);
+    }
+    return result;
+  }
+
+private:
+  const Map<Var, Array<Var>> &candidates_;
+};
+
 class SimdVFFrameNode : public TIRFrameNode {
 public:
+  Map<Var, Integer> registered_parallel_vars_;
+  Map<Var, Array<Var>> private_candidates_;
   size_t parent_alloc_count_{0};
   int64_t vf_latency_{0};
   int64_t source_index_{0};
@@ -280,6 +312,7 @@ public:
     auto stolen_bufs = StealAllocBuffers(parent_alloc_count_);
 
     Stmt body = tvm::tirx::SeqStmt::Flatten(stmts);
+    body = PrivateAllocationAnnotator(private_candidates_)(body);
 
     // SimdVF scope marker: placed inside the Block body so that
     // fragment allocations (stolen into alloc_buffers) stay inside
@@ -329,6 +362,48 @@ public:
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NOTNULLABLE(SimdVFFrame, TIRFrame,
                                                 SimdVFFrameNode);
 };
+
+// The state belongs to the nearest active VF, never to the Python module.
+SimdVFFrameNode *CurrentSimdVF() {
+  auto builder = script::ir_builder::IRBuilder::Current();
+  for (auto it = builder->frames.rbegin(); it != builder->frames.rend(); ++it) {
+    if (const auto *vf = (*it).as<SimdVFFrameNode>())
+      return const_cast<SimdVFFrameNode *>(vf);
+  }
+  return nullptr;
+}
+
+void RegisterParallelFrame(ForFrame frame) {
+  if (auto *vf = CurrentSimdVF()) {
+    ICHECK(!frame->vars.empty());
+    vf->registered_parallel_vars_.Set(frame->vars.back(), Integer(1));
+  }
+}
+
+void RegisterParallelOrdinaryAllocation(tirx::Buffer buffer) {
+  auto *vf = CurrentSimdVF();
+  if (!vf)
+    return;
+  auto builder = script::ir_builder::IRBuilder::Current();
+  for (auto it = builder->frames.rbegin(); it != builder->frames.rend(); ++it) {
+    if ((*it).as<SimdVFFrameNode>())
+      break;
+    if (const auto *loop = (*it).as<ForFrameNode>()) {
+      if (loop->vars.empty())
+        continue;
+      Var key = loop->vars.back();
+      if (!vf->registered_parallel_vars_.count(key))
+        continue;
+      Array<Var> candidates;
+      auto found = vf->private_candidates_.find(key);
+      if (found != vf->private_candidates_.end())
+        candidates = (*found).second;
+      candidates.push_back(buffer->data);
+      vf->private_candidates_.Set(key, candidates);
+      return;
+    }
+  }
+}
 
 // Shared validation for the lane count. The Python frontend checks the same
 // set before calling; this is the backstop for hand-written TIR and other
@@ -487,6 +562,10 @@ VectorFrame Vector(int vector_count) {
 // tilelang.ascend.language.frame binds the four frame object types at import
 // time, so they have to exist even in a build without the Ascend backend.
 TVM_FFI_STATIC_INIT_BLOCK() {
+  tvm::ffi::reflection::GlobalDef()
+      .def("tl.RegisterParallelFrame", RegisterParallelFrame)
+      .def("tl.RegisterParallelOrdinaryAllocation",
+           RegisterParallelOrdinaryAllocation);
   namespace refl = reflection;
   refl::GlobalDef()
       .def("tl.SimtVF", SimtVF)
