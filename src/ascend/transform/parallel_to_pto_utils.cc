@@ -1013,6 +1013,17 @@ public:
   void VisitExpr_(const CallNode *op) final {
     if (auto call_op = op->op.as<Op>()) {
       const std::string &name = call_op.value()->name;
+      if (name == "tirx.fma") {
+        if (op->args.size() != 3U || op->dtype != DataType::Float(32) ||
+            op->args[0].dtype() != op->dtype ||
+            op->args[1].dtype() != op->dtype ||
+            op->args[2].dtype() != op->dtype) {
+          unsupported = "tirx.fma requires three float32 operands";
+          return;
+        }
+        ExprVisitor::VisitExpr_(op);
+        return;
+      }
       // Hardware-backed unary math. fabs/exp/log/sqrt map to the VMI
       // vabs/vexp/vln/vsqrt instructions; the dtype matrix mirrors the
       // ISA documentation (see IsSupportedVectorUnaryOp).
@@ -1408,6 +1419,15 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
       if (name == "tirx.fabs" || name == "tirx.exp" || name == "tirx.log" ||
           name == "tirx.sqrt") {
         return AnalyzeLaneUseImpl(call->args[0], ctx, reason, metadata_mode);
+      }
+      if (name == "tirx.fma") {
+        LaneUse result = LaneUse::kUniform;
+        for (const auto &arg : call->args) {
+          LaneUse use = AnalyzeLaneUseImpl(arg, ctx, reason, metadata_mode);
+          if (use == LaneUse::kUnknown) return use;
+          if (use == LaneUse::kVarying) result = use;
+        }
+        return result;
       }
     }
   }

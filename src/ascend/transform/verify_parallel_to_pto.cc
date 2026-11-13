@@ -612,6 +612,20 @@ private:
         if (const auto *call = e.as<CallNode>()) {
           if (auto call_op = call->op.as<Op>()) {
             const std::string &name = call_op.value()->name;
+            if (name == "tirx.fma") {
+              pto_analysis::LaneUseContext ctx = MakeLaneUseContext();
+              std::string why;
+              bool varying = false;
+              for (const auto &arg : call->args) {
+                check(arg);
+                varying |= pto_analysis::AnalyzeLaneUse(arg, &ctx, &why) ==
+                           pto_analysis::LaneUse::kVarying;
+              }
+              if (!varying && pto_analysis::ContainsRuntimeValue(e)) {
+                parent_->Fail("dtype", "tirx.fma on runtime lane-uniform floats is unsupported");
+              }
+              return;
+            }
             if (name == "tirx.fabs" || name == "tirx.exp" ||
                 name == "tirx.log" || name == "tirx.sqrt") {
               check(call->args[0]);

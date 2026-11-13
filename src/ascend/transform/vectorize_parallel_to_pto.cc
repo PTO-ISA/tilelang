@@ -151,6 +151,7 @@ private:
         "tl.vmi.vadd",
         "tl.vmi.vsub",
         "tl.vmi.vmul",
+        "tl.vmi.vmula",
         "tl.vmi.vdiv",
         "tl.vmi.vabs",
         "tl.vmi.vexp",
@@ -1176,6 +1177,23 @@ private:
           << "[VectorizeParallelToPTO] internal error: non-Op call passed "
              "Verify: "
           << expr;
+      if (call_op.value()->name == "tirx.fma") {
+        Array<PrimExpr> values;
+        for (const auto &arg : call->args) values.push_back(ConvertExpr(arg, pre));
+        bool any_vector = false;
+        for (const auto &value : values) any_vector |= value.dtype().lanes() > 1;
+        if (!any_vector) return Call(expr.dtype(), call->op, values);
+        for (size_t i = 0; i < values.size(); ++i) {
+          if (values[i].dtype().lanes() == 1) {
+            values.Set(i, EmitBind("fma_brc",
+                Call(VectorDType(DataType::Float(32), lanes_), VmiOp("vbrc"),
+                     {values[i]}, {{"size", IntImm(DataType::Int(32), lanes_)}}), pre));
+          }
+        }
+        return EmitBind("fma",
+            Call(VectorDType(DataType::Float(32), lanes_), VmiOp("vmula"),
+                 {values[2], values[0], values[1], mask_var_}), pre);
+      }
       auto it = kUnaryMap.find(call_op.value()->name);
       ICHECK(it != kUnaryMap.end())
           << "[VectorizeParallelToPTO] internal error: call passed Verify "
