@@ -8843,6 +8843,15 @@ void CodeGenTileLangPTO::VisitStmt_(const BufferStoreNode *op) {
   }
 
   std::string value = RemoveOutermostParentheses(PrintExpr_(op->value));
+  if (!inside_simtvf_body_ && ScopeOfBuffer(op->buffer.get()) == "local" &&
+      op->buffer->dtype.is_scalar()) {
+    // Lists must retain the authored scalar element type, including rounding
+    // at the store. Later VMI broadcasts infer their type from this value.
+    bool literal = op->value.as<IntImmNode>() || op->value.as<FloatImmNode>();
+    value = literal ? WrapTypedConst(value, op->buffer->dtype, true)
+                    : ScalarCastExpr(value, op->buffer->dtype,
+                                     "PTO scalar local array store");
+  }
   PrintIndent();
   EmitScalarStore(op->buffer.get(), value, op->indices[0]);
 }

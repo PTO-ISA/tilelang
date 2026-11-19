@@ -85,6 +85,22 @@ public:
     return new_buffer;
   }
 
+  Stmt VisitStmt_(const ForNode *op) final {
+    For loop = Downcast<For>(StmtExprMutator::VisitStmt_(op));
+    auto found = loop->annotations.find(attr::kParallelPrivateAllocs);
+    if (found != loop->annotations.end()) {
+      auto vars = (*found).second.cast<Array<Var>>();
+      Array<Var> remapped;
+      for (const Var &var : vars) {
+        auto it = var_remap_.find(var);
+        remapped.push_back(it == var_remap_.end() ? var : (*it).second);
+      }
+      loop.CopyOnWrite()->annotations.Set(attr::kParallelPrivateAllocs,
+                                          remapped);
+    }
+    return loop;
+  }
+
   Stmt VisitStmt_(const AttrStmtNode *op) final {
     if (op->attr_key != tl::attr::kVmiAllocKind) {
       return StmtExprMutator::VisitStmt_(op);

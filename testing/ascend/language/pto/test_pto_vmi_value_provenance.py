@@ -1129,7 +1129,7 @@ def test_vmi_allocation_table_resets_between_functions():
     # The unmarked local.var in the next function reuses the same data Var and
     # must not inherit the register-array category from the first function.
     assert "regs_tl_slot" not in plain_section
-    assert "= 7" in plain_section
+    assert "= pto.const(7, dtype=pto.si32)" in plain_section
 
 
 def _plain_array_buffer(shape=(2,), dtype="int32x64", name="plain_regs"):
