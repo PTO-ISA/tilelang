@@ -1196,8 +1196,6 @@ private:
   PrimExpr BroadcastValue(const PrimExpr &value, Array<Stmt> *pre) {
     pto_analysis::CheckBroadcastDType(value.dtype(),
                                       "Parallel scalar assignment");
-    pto_analysis::CheckBroadcastDType(value.dtype(),
-                                      "vector store or indexed operand");
     return EmitBind("broadcast",
                     Call(VectorDType(value.dtype(), lanes_), VmiOp("vbrc"),
                          {value},
