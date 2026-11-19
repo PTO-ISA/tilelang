@@ -754,8 +754,8 @@ def _vmi_array_alias_and_reinterpret():
 @pytest.mark.pto
 def test_vmi_register_array_alias_and_reinterpret_stay_vmi_data():
     source = _compile(_vmi_array_alias_and_reinterpret()).get_kernel_source()
-    assert "regs_tl_slot_0 = None" in source
-    assert "regs_tl_slot_1 = None" in source
+    assert "regs_tl_slot_0 = pto.vmi.vreg(64, pto.f32)" in source
+    assert "regs_tl_slot_1 = pto.vmi.vreg(64, pto.f32)" in source
     assert re.search(r"regs_tl_slot_0 = pto\.vmi\.vload\(", source), source
     assert re.search(r"regs_tl_slot_1 = (regs_tl_slot_0|alias)\b", source), source
     reinterpret_line = _one(source, "pto.vmi.vinterpret_cast(")
@@ -830,7 +830,7 @@ def _vmi_array_multidim_update(dtype):
 def test_vmi_register_array_multidim_unroll_and_runtime_update_compile(dtype, pto_type):
     source = _compile(_vmi_array_multidim_update(dtype)).get_kernel_source()
     for index in range(4):
-        assert f"regs_tl_slot_{index} = None" in source
+        assert f"regs_tl_slot_{index} = pto.vmi.vreg(64, {pto_type})" in source
     # The array is initialized as independent register names, never as one
     # multi-lane vreg allocation.
     assert "pto.vmi.vreg(4" not in source

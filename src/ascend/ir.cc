@@ -380,7 +380,8 @@ void RegisterParallelFrame(ForFrame frame) {
   }
 }
 
-void RegisterParallelOrdinaryAllocation(tirx::Buffer buffer) {
+void RegisterParallelOrdinaryAllocation(tirx::Buffer buffer,
+                                        bool default_init) {
   auto *vf = CurrentSimdVF();
   if (!vf)
     return;
@@ -400,6 +401,24 @@ void RegisterParallelOrdinaryAllocation(tirx::Buffer buffer) {
         candidates = (*found).second;
       candidates.push_back(buffer->data);
       vf->private_candidates_.Set(key, candidates);
+      if (default_init && buffer.scope() == "local.var") {
+        // Capture the declaration site before TVM hoists the allocation.
+        // Wait until the frame closes to recognize declarations between
+        // adjacent Parallel loops: those do not belong to the complete unit.
+        TIRFrame site = Downcast<TIRFrame>(builder->frames.back());
+        size_t pos = site->stmts.size();
+        bool direct = site.same_as(*it);
+        site->AddCallback([site, pos, direct, buffer]() {
+          if (direct && site->stmts.size() == 1) {
+            const auto *inner = site->stmts.front().as<tirx::ForNode>();
+            if (inner && inner->kind == tirx::ForKind::kParallel)
+              return;
+          }
+          auto zero = tirx::BufferStore(buffer, tirx::make_zero(buffer->dtype),
+                                        {Integer(0)});
+          site->stmts.insert(site->stmts.begin() + pos, zero);
+        });
+      }
       return;
     }
   }

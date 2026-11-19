@@ -2866,19 +2866,9 @@ void CodeGenTileLangPTO::EmitLocalVarInitialization_(const Buffer &buffer,
     vid = name_supply_->FreshName("tl" + vid, false);
     var_idmap_[buffer->data.get()] = vid;
   }
-  if (FindVmiAllocSlot_(buffer.get(), "PTO VMI data slot initialization") !=
-      nullptr) {
-    // Explicit mutable VMI slots, including one lane, start from the vreg
-    // descriptor placeholder used by the existing vector-slot path.
-    stream << vid << " = pto.vmi.vreg(" << dtype.lanes() << ", "
-           << DataTypeName(dtype.element_of()) << ")\n";
-    RegisterHandleType_(buffer->data.get(), dtype);
-    EmitMixedEntrySnapshot(buffer->data.get());
-    return;
-  }
-  if (dtype.lanes() > 1) {
-    // Mutable vector registers start as a vreg descriptor placeholder; the
-    // first actual store overwrites it with a real vector value.
+  if (FindVmiAllocSlot_(buffer.get(), "PTO VMI data slot initialization") ||
+      dtype.lanes() > 1) {
+    // A typed SSA value can be carried into a loop before its first store.
     stream << vid << " = pto.vmi.vreg(" << dtype.lanes() << ", "
            << DataTypeName(dtype.element_of()) << ")\n";
     RegisterHandleType_(buffer->data.get(), dtype);
@@ -2969,8 +2959,13 @@ void CodeGenTileLangPTO::EmitBufferAllocation(const Buffer &buffer) {
       // Keep vector-register slots as independent Python names.  PTOAS's AST
       // liveness analysis tracks Name stores as scf.for iter_args, but cannot
       // treat list subscript assignments as loop-carried SSA values.
+      const std::string initial =
+          IsVmiLocalRegisterBuffer(buffer.get())
+              ? "pto.vmi.vreg(" + std::to_string(buffer->dtype.lanes()) + ", " +
+                    DataTypeName(elem) + ")"
+              : "None";
       for (int64_t i = 0; i < opt_size.value(); ++i) {
-        stream << vid << "_tl_slot_" << i << " = None\n";
+        stream << vid << "_tl_slot_" << i << " = " << initial << "\n";
         if (i + 1 < opt_size.value()) {
           PrintIndent();
         }

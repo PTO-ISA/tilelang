@@ -50,9 +50,10 @@ its original shape. Element dtypes gain the VF lane count. Reads become Bind
 snapshots and writes replace the slot's vector value. There is no table that
 substitutes a slot with its most recent expression.
 
-Every chunk, including every row of a two-dimensional unit, initializes private
-`alloc_var` with a typed zero broadcast. Explicit initializers execute afterward
-in source order. `alloc_local` has no implicit initialization. Tail stores use
+Each execution of an `alloc_var` declaration assigns its explicit initializer or,
+by default, a typed zero. A declaration at the top of the unit runs for each
+chunk, including on every row of a two-dimensional unit. A declaration inside
+a serial loop runs again on every iteration. Tail stores use
 the existing mask; inputs must provide readable storage for complete vector
 loads. For a singleton selected dimension, a uniform output address is accepted
 because the tail mask enables only lane zero.
@@ -85,35 +86,33 @@ use `pto.cast`. This includes float16/bfloat16 rounding at storage time and
 also applies outside Parallel. SIMT backing storage and VMI vector arrays use
 their existing codegen paths.
 
-The existing `VerifyBufferInit` configuration and warning behavior are retained.
-Parallel verification adds no definite-initialization rejection. This does
-**not** promise that uninitialized reads compile through PTODSL/PTOAS or have a
-defined result. Initialize every `alloc_local` slot before reading it; this
-implementation introduces neither an undef value nor automatic zero filling.
+Each VMI data slot starts with a typed SSA value from `pto.vmi.vreg(lanes,
+dtype)` (PTOAS !424). Each element of a data array gets its own value. Its
+lanes initially have unspecified contents. A conditional assignment can carry
+these lanes through a vector select. Every lane observed by the program must
+have been assigned before it is read. For example, two one-sided assignments
+guarded by `x > 0` and `x <= 0` cover all lanes when `x` is finite.
+`VerifyBufferInit` retains its existing configuration and warnings.
 
 ## Integration with Parallel control flow
 
-On the `pto-parallel` branch, the control-flow support merged through PR #42
-allows initialized private slots to be read and written in supported branches.
-A two-sided assignment becomes a Select; a one-sided assignment reads the old
-slot on the missing arm. Private reads remain lane-varying even at index zero,
-and the resulting value choice lowers to VMI `vsel`. The default zero for
-`alloc_var` is emitted once per chunk before the unit body. Source initializers
-retain their position, including inside a supported serial shell.
+Declare a private variable where its lifetime should begin:
 
-A condition reading the destination is captured before its writes, and a
-source Bind of the previous slot value also remains a snapshot. Scalar Select
-arms use the shared broadcast dtype check. External ordinary storage stays
-read-only inside the unit, including in branches.
+- Inside a supported `if` arm or `T.serial` body, the variable can be used in
+  that region and its nested regions. Each entry executes the declaration.
+  Writing a computed result to an outer UB buffer is valid.
+- Before a branch or serial loop, a declaration stays in scope during and
+  after that construct. Updates to the same variable persist. For example,
+  adding `a[i]` twice to a default-initialized outer `acc` produces
+  `2 * a[i]`. Moving the declaration into the loop yields `a[i]` each time.
+- Using a variable declared inside the branch or loop after leaving that
+  region is a frontend scope error. This applies to both allocation forms.
 
-Declare the private storage before the branch and initialize `alloc_local`
-before any path reads it. Branch-local declarations remain unsupported by the
-control-flow legalizer. Dynamic slots and cross-unit state remain unsupported.
-
-The integration tests cover single- and two-sided updates for both allocation
-forms, conditions that read the updated slot, old-value snapshots, full chunks
-and tails. This does not claim arbitrary control flow or define uninitialized
-reads.
+One-sided updates retain the previous value on inactive lanes. Two-sided
+assignments select between their arms. If a condition reads its destination,
+the lowering captures the condition before the write. A Bind of the old slot
+value likewise preserves a snapshot. Scalar Select arms follow the shared
+broadcast dtype rules, and external ordinary storage stays read-only.
 
 ## Validation
 
@@ -130,6 +129,10 @@ multiple units, two-dimensional layouts and tails. Numeric tests use independent
 CPU references, nonuniform inputs and explicit padding/output sentinels.
 Mandatory cases must be collected and executed; skips and timeouts do not
 constitute successful validation.
+
+`test_private_controlflow_integration.py` covers serial declaration lifetimes,
+conditional first assignments, preservation of inactive lanes and lexical scope
+errors for both allocation forms.
 
 Related regression suites cover Parallel structure/verification, pipeline
 routing, early unrolling, explicit VMI value provenance and the cast matrix.

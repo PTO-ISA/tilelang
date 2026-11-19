@@ -487,7 +487,7 @@ def _vmi_array_multidim_update():
 def test_vmi_register_array_multidim_update_device(npu):
     kernel, source = _compile(_vmi_array_multidim_update())
     for index in range(4):
-        assert f"regs_tl_slot_{index} = None" in source, source
+        assert f"regs_tl_slot_{index} = pto.vmi.vreg(64, pto.ui32)" in source, source
     assert "pto.vmi.vreg(4" not in source, source
     assert "slot = pto.vmi.vreg(1, pto.ui32)" in source, source
     assert source.count("pto.vmi.vload(") == 4, source

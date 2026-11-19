@@ -9,7 +9,7 @@ from tvm import arith
 from tilelang._typing import DType, ShapeType
 from tilelang.language.allocate import (
     _with_span,
-    alloc_var as _common_alloc_var,
+    _alloc_var,
     alloc_local as _common_alloc_local,
 )
 from tilelang import _ffi_api
@@ -193,15 +193,13 @@ def alloc_var(dtype: DType, scope: str = "local.var", *, init: PrimExpr | int | 
 
 def alloc_var(dtype: DType, *args, scope: str = "local.var", init: PrimExpr | int | float | None = None) -> Buffer:
     """Allocate an ordinary scalar, preserving its Parallel lexical owner."""
-    buf = _common_alloc_var(dtype, *args, scope=scope, init=init)
-    _ffi_api.RegisterParallelOrdinaryAllocation(buf)
-    return buf
+    return _alloc_var(dtype, args, scope, init, register=_ffi_api.RegisterParallelOrdinaryAllocation)
 
 
 def alloc_local(shape: ShapeType, dtype: DType, scope="local") -> Buffer:
     """Allocate ordinary local storage, preserving its Parallel lexical owner."""
     buf = _common_alloc_local(shape, dtype, scope=scope)
-    _ffi_api.RegisterParallelOrdinaryAllocation(buf)
+    _ffi_api.RegisterParallelOrdinaryAllocation(buf, False)
     return buf
 
 

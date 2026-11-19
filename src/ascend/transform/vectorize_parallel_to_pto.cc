@@ -899,16 +899,6 @@ private:
     }
 
     Array<Stmt> statements;
-    for (const Buffer &old : storage_.PrivateAllocations(loop)) {
-      if (old.scope() == "local.var") {
-        pto_analysis::CheckBroadcastDType(old->dtype,
-                                          "default zero initialization of " +
-                                              std::string(old->name));
-        PrimExpr zero = BroadcastValue(make_zero(old->dtype), &statements);
-        statements.push_back(BufferStore(promoted_.at(old->data), zero,
-                                         {make_zero(DataType::Int(32))}));
-      }
-    }
     const Stmt &source = inner.defined() ? inner.value()->body : loop->body;
     ConvertBody(source, &statements);
     Stmt converted = DeadBindElim()(SeqStmt::Flatten(statements));
