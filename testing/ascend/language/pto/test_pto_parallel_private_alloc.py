@@ -395,7 +395,8 @@ def test_explicit_vmi_not_recorded_as_ordinary():
 def test_singleton_private_store_uses_one_lane_mask():
     source = _lower(private_kernel(n=1)).kernel_source
     assert "pto.vmi.vstore" in source
-    assert "pto.vmi.create_mask" in source
+    assert "pto.const(1, dtype=pto.si32)" in source
+    assert "pto.vmi.create_mask(remaining, size=64)" in source
 
 
 def test_direct_scalar_local_codegen_preserves_type():

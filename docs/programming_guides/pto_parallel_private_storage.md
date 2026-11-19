@@ -63,7 +63,8 @@ The first version accepts only rank-one shape `(1,)` ordinary storage, with
 constant in-bounds slots. `CheckStorageV1` centralizes that restriction, while
 `ResolveSlot` retains generic capacity and constant-offset representation for
 future arrays with more slots. Arbitrary views, dynamic slots, private address
-escapes, cross-unit private state and internal control flow are unsupported.
+escapes and cross-unit private state are unsupported. Conditional updates use
+the restricted control-flow contract described below.
 
 Storage capability and scalar-to-vector broadcast capability are separate.
 Verify and Vectorize share `CheckBroadcastDType`: broadcasts support 8-, 16-
@@ -92,27 +93,27 @@ implementation introduces neither an undef value nor automatic zero filling.
 
 ## Integration with Parallel control flow
 
-Internal control flow remains outside this change. The control-flow proposal
-in [PR #11](https://github.com/PTO-ISA/tilelang/pull/11), reviewed at
-`0ae08678d01410c5f8d625af631d860b57176880`, does not automatically enable
-conditional private-slot writes: its scope checks admit only UB, and its
-conditional destination pairing requires a lane-dependent address. A private
-slot such as `tmp[0]` has a constant index but represents independent lane state.
+On the `pto-parallel` branch, the control-flow support merged through PR #42
+allows initialized private slots to be read and written in supported branches.
+A two-sided assignment becomes a Select; a one-sided assignment reads the old
+slot on the missing arm. Private reads remain lane-varying even at index zero,
+and the resulting value choice lowers to VMI `vsel`. The default zero for
+`alloc_var` is emitted once per chunk before the unit body. Source initializers
+retain their position, including inside a supported serial shell.
 
-Integration must use `ParallelStorageQuery` in both verification and branch
-legalization to recognize private destinations by allocation and slot, while
-continuing to reject writes to external ordinary storage. The query must refer
-to the current loop tree after legalization, preserving allocation ownership.
-Scalar arms introduced by Select lowering must also use `CheckBroadcastDType`.
+A condition reading the destination is captured before its writes, and a
+source Bind of the previous slot value also remains a snapshot. Scalar Select
+arms use the shared broadcast dtype check. External ordinary storage stays
+read-only inside the unit, including in branches.
 
-The control-flow legalizer fills a missing store arm with a read of the old
-destination. For a private slot this must read its previous vector value;
-`alloc_local` must already be initialized on that path. Integration tests need
-two-arm assignments, one-arm updates, read-modify-write and a bound old value
-used after a conditional overwrite, including multiple chunks and tails.
-Branch-local declarations and Bind statements also need explicit admission in
-the branch legalizer; this change does not promise support for them. These are
-integration requirements, not completed combined-backend validation.
+Declare the private storage before the branch and initialize `alloc_local`
+before any path reads it. Branch-local declarations remain unsupported by the
+control-flow legalizer. Dynamic slots and cross-unit state remain unsupported.
+
+The integration tests cover single- and two-sided updates for both allocation
+forms, conditions that read the updated slot, old-value snapshots, full chunks
+and tails. This does not claim arbitrary control flow or define uninitialized
+reads.
 
 ## Validation
 

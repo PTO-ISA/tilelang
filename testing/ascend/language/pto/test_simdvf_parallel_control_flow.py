@@ -989,9 +989,7 @@ def test_conditional_interleaved_destination_is_rejected_at_verify():
     # address is reported by the access-pattern rule ("indexed access requires
     # scatter") rather than by the pairing contract itself.
     message = str(error)
-    assert (
-        "continuous" in message or "cannot pair" in message or "scatter" in message
-    ), f"expected an address diagnostic, got: {message}"
+    assert "continuous" in message or "cannot pair" in message or "scatter" in message, f"expected an address diagnostic, got: {message}"
 
 
 def _k_plain_offset_destination(E=150, lanes=128, dtype="float32"):

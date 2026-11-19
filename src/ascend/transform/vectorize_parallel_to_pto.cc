@@ -145,26 +145,16 @@ private:
     // are rejected there, and opaque calls are already excluded
     // from addresses.
     static const std::set<std::string> kDiscardable = {
-        "tl.vmi.vload",
-        "tl.vmi.vgather",
-        "tl.vmi.vbrc",
-        "tl.vmi.vci",
-        "tl.vmi.vadd",
-        "tl.vmi.vsub",
-        "tl.vmi.vmul",
-        "tl.vmi.vdiv",
-        "tl.vmi.vabs",
-        "tl.vmi.vexp",
-        "tl.vmi.vln",
-        "tl.vmi.vsqrt",
-        "tl.vmi.vcvt",
-        "tl.vmi.vinterpret_cast",
-        "tl.vmi.vcmp",
-        "tl.vmi.vcmps",
-        "tl.vmi.vsel",
-        "tl.vmi.vand",
-        "tl.vmi.vor",
-        "tl.vmi.vnot",
+        "tl.vmi.vload",  "tl.vmi.vgather",
+        "tl.vmi.vbrc",   "tl.vmi.vci",
+        "tl.vmi.vadd",   "tl.vmi.vsub",
+        "tl.vmi.vmul",   "tl.vmi.vdiv",
+        "tl.vmi.vabs",   "tl.vmi.vexp",
+        "tl.vmi.vln",    "tl.vmi.vsqrt",
+        "tl.vmi.vcvt",   "tl.vmi.vinterpret_cast",
+        "tl.vmi.vcmp",   "tl.vmi.vcmps",
+        "tl.vmi.vsel",   "tl.vmi.vand",
+        "tl.vmi.vor",    "tl.vmi.vnot",
         "tl.access_ptr",
     };
     bool discardable = true;
@@ -787,8 +777,10 @@ private:
         Stmt converted = ConvertUnit(target, mapping);
         Array<Stmt> declarations;
         for (const Buffer &old : storage_.PrivateAllocations(target)) {
-          declarations.push_back(AllocBuffer(promoted_.at(old->data),
-              {{attr::kVmiAllocKind, String(old.scope() == "local.var" ? "data" : "data_array")}}));
+          declarations.push_back(AllocBuffer(
+              promoted_.at(old->data),
+              {{attr::kVmiAllocKind,
+                String(old.scope() == "local.var" ? "data" : "data_array")}}));
         }
         declarations.push_back(converted);
         return SeqStmt::Flatten(declarations);
@@ -909,9 +901,12 @@ private:
     Array<Stmt> statements;
     for (const Buffer &old : storage_.PrivateAllocations(loop)) {
       if (old.scope() == "local.var") {
-        pto_analysis::CheckBroadcastDType(old->dtype, "default zero initialization of " + std::string(old->name));
+        pto_analysis::CheckBroadcastDType(old->dtype,
+                                          "default zero initialization of " +
+                                              std::string(old->name));
         PrimExpr zero = BroadcastValue(make_zero(old->dtype), &statements);
-        statements.push_back(BufferStore(promoted_.at(old->data), zero, {make_zero(DataType::Int(32))}));
+        statements.push_back(BufferStore(promoted_.at(old->data), zero,
+                                         {make_zero(DataType::Int(32))}));
       }
     }
     const Stmt &source = inner.defined() ? inner.value()->body : loop->body;
@@ -1010,6 +1005,8 @@ private:
   PrimExpr Broadcast(PrimExpr value, Array<Stmt> *pre) {
     if (value.dtype().lanes() != 1)
       return value;
+    pto_analysis::CheckBroadcastDType(value.dtype(),
+                                      "vector store or indexed operand");
     return EmitBind("broadcast",
                     Call(VectorDType(value.dtype(), lanes_), VmiOp("vbrc"),
                          {value},
@@ -1018,6 +1015,21 @@ private:
   }
 
   bool IsUniform(const PrimExpr &expr) {
+    // Coordinate analysis alone sees slot [0] as uniform. Private storage and
+    // already-converted vector snapshots are varying regardless of address.
+    bool private_value = false;
+    PostOrderVisit(expr, [&](const ObjectRef &node) {
+      if (const auto *load = node.as<BufferLoadNode>()) {
+        private_value |= storage_.IsPrivate(load->buffer->data);
+      }
+      if (const auto *var = node.as<VarNode>()) {
+        auto found = value_map_.find(GetRef<Var>(var));
+        private_value |=
+            found != value_map_.end() && (*found).second.dtype().lanes() > 1;
+      }
+    });
+    if (private_value)
+      return false;
     Optional<Var> kept_var;
     int64_t kept_extent = 0;
     if (unit_mapping_.is_2d) {
@@ -1184,6 +1196,8 @@ private:
   PrimExpr BroadcastValue(const PrimExpr &value, Array<Stmt> *pre) {
     pto_analysis::CheckBroadcastDType(value.dtype(),
                                       "Parallel scalar assignment");
+    pto_analysis::CheckBroadcastDType(value.dtype(),
+                                      "vector store or indexed operand");
     return EmitBind("broadcast",
                     Call(VectorDType(value.dtype(), lanes_), VmiOp("vbrc"),
                          {value},
@@ -1249,7 +1263,9 @@ private:
           CurrentMapping(), &analyzer_, bind_env_);
       value = Broadcast(value, &pre);
       PrimExpr call;
-      if (access.pattern == pto_analysis::AccessPattern::kContinuous) {
+      if (access.pattern == pto_analysis::AccessPattern::kContinuous ||
+          (access.pattern == pto_analysis::AccessPattern::kLaneUniform &&
+           unit_mapping_.logical_extent == 1)) {
         Array<PrimExpr> starts;
         for (const PrimExpr &index : access.start_indices) {
           starts.push_back(ConvertScalarExpr(BindChunkToQ(index)));
@@ -1469,8 +1485,8 @@ private:
         coordinate_uniform = false;
       }
       if (coordinate_uniform) {
-        PrimExpr coordinate = pto_analysis::SubstituteVar(
-            expr, loop_var_.get(), lane_indexed_expr_);
+        PrimExpr coordinate = pto_analysis::SubstituteVar(expr, loop_var_.get(),
+                                                          lane_indexed_expr_);
         return ConvertScalarExpr(BindChunkToQ(coordinate));
       }
       // Lane-varying int value choices fall through to the vsel lowering.
