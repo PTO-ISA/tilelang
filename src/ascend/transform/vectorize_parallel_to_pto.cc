@@ -313,77 +313,157 @@ private:
            "structure passed Verify: "
         << scan.issue;
 
-    Stmt new_body;
-    {
-      // One inverse per unit: the same mapping feeds the lanes read, the
-      // shared-mask decision and the unit conversion below, so a region
-      // with n units inverts n times instead of 2n+1. The inversion is
-      // the expensive part (layout reshape + analyzer proofs); the
-      // mappings are small value structs.
-      std::vector<pto_analysis::PtoInverseMapping> mappings;
-      mappings.reserve(scan.units.size());
-      for (const For &unit : scan.units) {
-        mappings.push_back(pto_analysis::InvertPtoLaneLayout(unit));
-      }
-      // Read the VF annotation directly: a reduce-only VF has no Parallel
-      // layout from which to recover lanes. Verify checks layout consistency
-      // when Parallel units are also present.
-      auto lanes_annotation = op->annotations.Get("tl.simdvf_lanes");
-      ICHECK(lanes_annotation.has_value());
-      int64_t lanes = Downcast<IntImm>(lanes_annotation.value())->value;
-      // Divisible units share a static full mask. Units with a tail use
-      // their own per-iteration mask throughout the unified chunk loop.
-      shared_mask_ = Var();
-      bool needs_full_mask = false;
-      for (const pto_analysis::PtoInverseMapping &mapping : mappings) {
-        needs_full_mask |= mapping.tail_lanes == 0;
-      }
-      Stmt new_region = region;
-      if (needs_full_mask) {
-        shared_mask_ = Var("mask", DataType::Bool(static_cast<int>(lanes)));
-        PrimExpr mask_value = Call(
-            DataType::Bool(static_cast<int>(lanes)), VmiOp("create_mask"),
-            {IntImm(DataType::Int(32), static_cast<int>(lanes))},
-            {{"size", IntImm(DataType::Int(32), static_cast<int>(lanes))}});
-        // Define the shared mask inside the simdvf scope attr when the
-        // region is wrapped by one: VPTO treats vecscope-region data as
-        // region-local and rejects pset values crossing the boundary.
-        const auto *scope_attr = new_region.as<AttrStmtNode>();
-        if (scope_attr != nullptr &&
-            scope_attr->attr_key == "tl.simdvf_scope") {
-          new_region = AttrStmt(scope_attr->node, scope_attr->attr_key,
-                                scope_attr->value,
-                                SeqStmt::Flatten(Bind(shared_mask_, mask_value),
-                                                 scope_attr->body));
-        } else {
-          new_region =
-              SeqStmt::Flatten(Bind(shared_mask_, mask_value), new_region);
-        }
-      }
-
-      // Convert each sequential unit in order; unit state (bind
-      // maps, counters) is reset per unit; the shared full mask, when
-      // emitted, is visible to every unit.
-      for (size_t i = 0; i < scan.units.size(); ++i) {
-        new_region = ReplaceStmt(new_region, scan.units[i], mappings[i]);
-      }
-      int64_t saved_lanes = current_vf_lanes_;
-      current_vf_lanes_ = lanes;
-      new_body = VisitStmt(new_region);
-      current_vf_lanes_ = saved_lanes;
+    auto saved_reducers = reducers_;
+    auto saved_buffers = vf_buffers_;
+    auto saved_bind = bind_env_;
+    auto saved_values = value_map_;
+    auto saved_infos = value_infos_;
+    auto saved_masks = full_masks_;
+    auto saved_prelude = mask_prelude_;
+    int64_t saved_lanes = lanes_;
+    reducers_ = pto::CollectReducerStates(GetRef<SBlock>(op), storage_);
+    lanes_ = reducers_.lanes;
+    vf_buffers_.clear();
+    full_masks_.clear();
+    mask_prelude_.clear();
+    for (const auto &[data, info] : reducers_.storage_values) {
+      if (info.kind != pto::ValueKind::kVmi)
+        continue;
+      Buffer old = storage_.Allocation(data);
+      vf_buffers_.emplace(
+          old->data,
+          decl_buffer(old->shape, old->dtype.with_lanes(info.logical_lanes),
+                      old->name + "_v",
+                      info.logical_lanes == 1 ? "local.var" : "local"));
     }
-
-    pto_analysis::PtoRegionScan residual =
-        pto_analysis::ScanPtoRegion(new_body);
+    Stmt body = ConvertRegion(region);
+    const auto residual = pto_analysis::ScanPtoRegion(body);
     ICHECK(!residual.has_direct_reduce && !residual.has_fill)
         << "[VectorizeParallelToPTO] direct tileops "
            "must be standalone Evaluate(Call) statements";
+    auto wrap = [&](Stmt inner) {
+      inner = SeqStmt::Flatten(mask_prelude_, inner);
+      for (const auto &[old, replacement] : vf_buffers_) {
+        inner = AttrStmt(
+            replacement->data, attr::kVmiAllocKind,
+            StringImm(replacement->dtype.lanes() == 1 ? "data" : "data_array"),
+            inner);
+      }
+      return inner;
+    };
+    if (const auto *scope = body.as<AttrStmtNode>();
+        scope && scope->attr_key == "tl.simdvf_scope")
+      body = AttrStmt(scope->node, scope->attr_key, scope->value,
+                      wrap(scope->body));
+    else
+      body = wrap(body);
+    Array<Buffer> allocations;
+    for (const auto &old : op->alloc_buffers) {
+      auto it = vf_buffers_.find(old->data);
+      allocations.push_back(it == vf_buffers_.end() ? old : it->second);
+    }
+    auto annotations = op->annotations;
+    annotations.erase(attr::kPtoReducerStates);
+    Stmt result =
+        SBlock(op->iter_vars, op->reads, op->writes, op->name_hint, body,
+               op->init, allocations, op->match_buffers, annotations);
+    reducers_ = std::move(saved_reducers);
+    vf_buffers_ = std::move(saved_buffers);
+    bind_env_ = std::move(saved_bind);
+    value_map_ = std::move(saved_values);
+    value_infos_ = std::move(saved_infos);
+    full_masks_ = std::move(saved_masks);
+    mask_prelude_ = std::move(saved_prelude);
+    lanes_ = saved_lanes;
+    return result;
+  }
 
-    // new_body is (mask bind + region with all units converted); the
-    // scope AttrStmt wrapper, if any, is inside it already.
-    return SBlock(op->iter_vars, op->reads, op->writes, op->name_hint, new_body,
-                  op->init, op->alloc_buffers, op->match_buffers,
-                  op->annotations);
+  Var GetFullMask(int64_t lanes) {
+    auto it = full_masks_.find(lanes);
+    if (it != full_masks_.end())
+      return it->second;
+    Var mask("full_mask_" + std::to_string(lanes), DataType::Bool(lanes));
+    mask_prelude_.push_back(
+        Bind(mask, Call(mask.dtype(), VmiOp("create_mask"), {Integer(lanes)},
+                        {{"size", Integer(lanes)}})));
+    full_masks_.emplace(lanes, mask);
+    return mask;
+  }
+
+  pto::ValueInfo Info(const PrimExpr &value) const {
+    if (const auto *var = value.as<VarNode>()) {
+      auto it = value_infos_.find(GetRef<Var>(var));
+      if (it != value_infos_.end())
+        return it->second;
+    }
+    return {value.dtype().lanes() > 1 ? pto::ValueKind::kVmi
+                                      : pto::ValueKind::kScalar,
+            value.dtype().lanes()};
+  }
+
+  PrimExpr ToVmiWidth(const PrimExpr &source, int64_t width, Array<Stmt> *pre) {
+    auto info = Info(source);
+    if (info.kind == pto::ValueKind::kVmi && info.logical_lanes == width)
+      return source;
+    ICHECK(info.logical_lanes == 1) << "unsupported PTO value width conversion";
+    pto::CheckBroadcastDType(source.dtype().element_of(),
+                             "PTO value broadcast");
+    Map<String, ObjectRef> attrs{{"size", Integer(width)}};
+    if (info.kind == pto::ValueKind::kVmi)
+      attrs.Set("group", Integer(1));
+    return EmitBind(
+        "broadcast",
+        Call(source.dtype().with_lanes(width), VmiOp("vbrc"), {source}, attrs),
+        pre);
+  }
+
+  PrimExpr ReadRegionValue(const PrimExpr &source, Array<Stmt> *pre) {
+    if (const auto *load = source.as<BufferLoadNode>()) {
+      auto it = vf_buffers_.find(load->buffer->data);
+      if (it != vf_buffers_.end()) {
+        Var value = EmitBind("result_snapshot",
+                             BufferLoad(it->second, load->indices), pre);
+        value_infos_[value] = {pto::ValueKind::kVmi, it->second->dtype.lanes()};
+        return value;
+      }
+      return EmitBind("scalar_snapshot", source, pre);
+    }
+    if (const auto *var = source.as<VarNode>()) {
+      if (auto mapped = value_map_.Get(GetRef<Var>(var)))
+        return mapped.value();
+    }
+    return source;
+  }
+
+  Stmt ConvertPtoFinalize(const PtoFinalizeReducerOp &op) {
+    pto::AnalyzePtoFinalize(op, reducers_);
+    Array<Stmt> out;
+    Buffer acc = vf_buffers_.at(op->accumulator->buffer->data);
+    auto value =
+        EmitBind("partial_snapshot", BufferLoad(acc, {Integer(0)}), &out);
+    const char *names[] = {"vcadd", "vcmax", "vcmin"};
+    Map<String, ObjectRef> attrs{{"group", Integer(1)}};
+    if (op->op == ReducerV2OpType::kSum)
+      attrs.Set("reassoc", Bool(true));
+    PrimExpr result = EmitBind("reduced_one",
+                               Call(acc->dtype.element_of(),
+                                    VmiOp(names[static_cast<int>(op->op)]),
+                                    {value, GetFullMask(lanes_)}, attrs),
+                               &out);
+    if (op->seed.defined()) {
+      auto seed = ReadRegionValue(
+          BufferLoad(op->seed.value()->buffer, {Integer(0)}), &out);
+      seed = ToVmiWidth(seed, 1, &out);
+      const char *combine[] = {"vadd", "vmax", "vmin"};
+      result = EmitBind("seed_combine",
+                        Call(result.dtype(),
+                             VmiOp(combine[static_cast<int>(op->op)]),
+                             {result, seed, GetFullMask(1)}),
+                        &out);
+    }
+    out.push_back(BufferStore(vf_buffers_.at(op->result->buffer->data), result,
+                              {Integer(0)}));
+    return SeqStmt::Flatten(out);
   }
 
   Stmt LowerDirectReduce(const Call &call, int64_t lanes) {
@@ -737,100 +817,160 @@ private:
     return StmtExprMutator::VisitStmt_(op);
   }
 
-  Stmt VisitStmt_(const EvaluateNode *op) final {
-    if (current_vf_lanes_ != 0) {
-      if (const auto *call = op->value.as<CallNode>()) {
-        if (pto_analysis::IsPtoDirectReduce(GetRef<Call>(call))) {
-          return LowerDirectReduce(GetRef<Call>(call), current_vf_lanes_);
-        }
-        if (pto_analysis::IsPtoFill(GetRef<Call>(call))) {
-          return LowerFill(GetRef<Call>(call), current_vf_lanes_);
-        }
-      }
-    }
-    return StmtExprMutator::VisitStmt_(op);
-  }
-
-  // Replace one statement (the unit's For) with its conversion, recursing
-  // through the same wrapper kinds DiscoverUnits understands.
-  Stmt ReplaceStmt(const Stmt &body, const For &target,
-                   const pto_analysis::PtoInverseMapping &mapping) {
-    // Conversion needs the owner environment at the unit's source position,
-    // including allocations inside VF-local blocks and flat definitions.
+  Stmt ConvertRegion(const Stmt &stmt) {
     struct AllocationScope {
-      std::vector<Buffer> *allocations;
+      std::vector<Buffer> &allocations;
       size_t mark;
       bool restore;
       ~AllocationScope() {
-        if (restore) {
-          allocations->resize(mark);
-        }
+        if (restore)
+          allocations.resize(mark);
       }
-    } allocation_scope{&active_allocations_, active_allocations_.size(),
-                       body.as<AllocBufferNode>() == nullptr};
-    if (const auto *alloc = body.as<AllocBufferNode>()) {
+    } scope{active_allocations_, active_allocations_.size(),
+            !stmt.as<AllocBufferNode>()};
+    if (const auto *alloc = stmt.as<AllocBufferNode>()) {
       active_allocations_.push_back(alloc->buffer);
-      return body;
+      return stmt;
     }
-    if (const auto *for_node = body.as<ForNode>()) {
-      if (for_node == target.get()) {
-        Stmt converted = ConvertUnit(target, mapping);
+    if (const auto *seq = stmt.as<SeqStmtNode>()) {
+      Array<Stmt> out;
+      for (const auto &child : seq->seq)
+        out.push_back(ConvertRegion(child));
+      return SeqStmt::Flatten(out);
+    }
+    if (const auto *loop = stmt.as<ForNode>()) {
+      auto saved_bind = bind_env_;
+      auto saved_values = value_map_;
+      auto saved_infos = value_infos_;
+      Stmt result;
+      if (loop->kind == ForKind::kParallel &&
+          !pto::UsesExplicitSIMD(loop->body)) {
+        For unit = GetRef<For>(loop);
+        auto mapping = pto::InvertPtoLaneLayout(unit);
+        result = ConvertUnit(unit, mapping);
         Array<Stmt> declarations;
-        for (const Buffer &old : storage_.PrivateAllocations(target)) {
+        for (const auto &old : storage_.PrivateAllocations(unit))
           declarations.push_back(AllocBuffer(
               promoted_.at(old->data),
               {{attr::kVmiAllocKind,
                 String(old.scope() == "local.var" ? "data" : "data_array")}}));
-        }
-        declarations.push_back(converted);
-        return SeqStmt::Flatten(declarations);
+        declarations.push_back(result);
+        result = SeqStmt::Flatten(declarations);
+      } else {
+        analyzer_.Bind(loop->loop_var,
+                       Range::FromMinExtent(loop->min, loop->extent));
+        For replacement = GetRef<For>(loop);
+        replacement.CopyOnWrite()->body = ConvertRegion(loop->body);
+        result = replacement;
       }
-      Stmt nb = ReplaceStmt(for_node->body, target, mapping);
-      if (nb.same_as(for_node->body)) {
-        return body;
-      }
-      For nf = GetRef<For>(for_node);
-      nf.CopyOnWrite()->body = nb;
-      return nf;
+      bind_env_ = std::move(saved_bind);
+      value_map_ = std::move(saved_values);
+      value_infos_ = std::move(saved_infos);
+      return result;
     }
-    if (const auto *seq = body.as<SeqStmtNode>()) {
-      Array<Stmt> new_seq;
-      bool changed = false;
-      for (const auto &s : seq->seq) {
-        Stmt ns = ReplaceStmt(s, target, mapping);
-        changed |= !ns.same_as(s);
-        new_seq.push_back(ns);
-      }
-      return changed ? SeqStmt::Flatten(new_seq) : body;
+    if (const auto *attr = stmt.as<AttrStmtNode>()) {
+      auto saved_bind = bind_env_;
+      auto saved_values = value_map_;
+      auto saved_infos = value_infos_;
+      auto saved_versions = buffer_versions_;
+      if (attr->attr_key == "tl.buffer_version")
+        for (const auto &[data, count] : Downcast<Map<Var, int>>(attr->node))
+          buffer_versions_.Set(data, count);
+      Stmt body = ConvertRegion(attr->body);
+      buffer_versions_ = std::move(saved_versions);
+      bind_env_ = std::move(saved_bind);
+      value_map_ = std::move(saved_values);
+      value_infos_ = std::move(saved_infos);
+      return AttrStmt(attr->node, attr->attr_key, attr->value, body);
     }
-    if (const auto *attr = body.as<AttrStmtNode>()) {
-      Stmt nb = ReplaceStmt(attr->body, target, mapping);
-      if (nb.same_as(attr->body)) {
-        return body;
-      }
-      return AttrStmt(attr->node, attr->attr_key, attr->value, nb);
+    if (const auto *bind = stmt.as<BindNode>()) {
+      Array<Stmt> out;
+      if (reducers_.accumulators.empty())
+        return stmt;
+      auto value = ReadRegionValue(bind->value, &out);
+      Var replacement = bind->var;
+      bind_env_.Set(bind->var, bind->value);
+      value_map_.Set(bind->var, replacement);
+      value_infos_[replacement] = Info(value);
+      out.push_back(Bind(replacement, value));
+      return SeqStmt::Flatten(out);
     }
-    if (const auto *block = body.as<SBlockNode>()) {
-      for (const Buffer &buffer : block->alloc_buffers) {
+    if (const auto *eval = stmt.as<EvaluateNode>()) {
+      if (const auto *call = eval->value.as<CallNode>();
+          call && pto::IsPtoFill(GetRef<Call>(call)))
+        return LowerFill(GetRef<Call>(call), lanes_);
+      if (const auto *call = eval->value.as<CallNode>();
+          call && pto::IsPtoDirectReduce(GetRef<Call>(call)))
+        return LowerDirectReduce(GetRef<Call>(call), lanes_);
+      if (const auto *call = eval->value.as<CallNode>();
+          call && call->op.same_as(PtoFinalizeReducerOp::Get()))
+        return ConvertPtoFinalize(
+            Downcast<PtoFinalizeReducerOp>(ParseOperator(GetRef<Call>(call))));
+      return stmt;
+    }
+    if (const auto *store = stmt.as<BufferStoreNode>()) {
+      Array<Stmt> out;
+      if (reducers_.accumulators.empty())
+        return stmt;
+      PrimExpr value = ReadRegionValue(store->value, &out);
+      auto data = store->buffer->data;
+      bool seed = false;
+      for (const auto &site : reducers_.finalizes)
+        seed |= site->seed.defined() &&
+                site->seed.value()->buffer->data.same_as(data);
+      if (seed && Info(value).kind == pto::ValueKind::kVmi &&
+          !vf_buffers_.count(data))
+        vf_buffers_.emplace(
+            data, decl_buffer(store->buffer->shape, store->buffer->dtype,
+                              store->buffer->name + "_v", "local.var"));
+      auto target = vf_buffers_.find(data);
+      if (target != vf_buffers_.end()) {
+        value = ToVmiWidth(value, target->second->dtype.lanes(), &out);
+        out.push_back(BufferStore(target->second, value, store->indices));
+      } else if (Info(value).kind == pto::ValueKind::kVmi) {
+        PrimExpr ptr = Call(DataType::Handle(), tl::access_ptr(),
+                            {BufferLoad(store->buffer, store->indices),
+                             Integer(1), Integer(2)});
+        out.push_back(Evaluate(
+            Call(DataType::Void(), VmiOp("vstore"), {value, ptr, Integer(0)})));
+      } else
+        out.push_back(BufferStore(store->buffer, value, store->indices,
+                                  store->predicate));
+      return SeqStmt::Flatten(out);
+    }
+    if (const auto *branch = stmt.as<IfThenElseNode>()) {
+      auto saved_bind = bind_env_;
+      auto saved_values = value_map_;
+      auto saved_infos = value_infos_;
+      Stmt yes = ConvertRegion(branch->then_case);
+      bind_env_ = saved_bind;
+      value_map_ = saved_values;
+      value_infos_ = saved_infos;
+      Optional<Stmt> no;
+      if (branch->else_case.defined())
+        no = ConvertRegion(branch->else_case.value());
+      bind_env_ = std::move(saved_bind);
+      value_map_ = std::move(saved_values);
+      value_infos_ = std::move(saved_infos);
+      return IfThenElse(branch->condition, yes, no);
+    }
+    if (const auto *block = stmt.as<SBlockNode>()) {
+      auto saved_bind = bind_env_;
+      auto saved_values = value_map_;
+      auto saved_infos = value_infos_;
+      for (const Buffer &buffer : block->alloc_buffers)
         active_allocations_.push_back(buffer);
-      }
-      Stmt nb = ReplaceStmt(block->body, target, mapping);
-      if (nb.same_as(block->body)) {
-        return body;
-      }
-      return SBlock(block->iter_vars, block->reads, block->writes,
-                    block->name_hint, nb, block->init, block->alloc_buffers,
-                    block->match_buffers, block->annotations);
+      SBlock copy = GetRef<SBlock>(block);
+      copy.CopyOnWrite()->body = ConvertRegion(block->body);
+      bind_env_ = std::move(saved_bind);
+      value_map_ = std::move(saved_values);
+      value_infos_ = std::move(saved_infos);
+      return copy;
     }
-    if (const auto *realize = body.as<SBlockRealizeNode>()) {
-      SBlock block =
-          Downcast<SBlock>(ReplaceStmt(realize->block, target, mapping));
-      if (block.same_as(realize->block)) {
-        return body;
-      }
-      return SBlockRealize(realize->iter_values, realize->predicate, block);
-    }
-    return body;
+    if (const auto *realize = stmt.as<SBlockRealizeNode>())
+      return SBlockRealize(realize->iter_values, realize->predicate,
+                           Downcast<SBlock>(ConvertRegion(realize->block)));
+    return stmt;
   }
 
   // ------------------------------------------------------------------
@@ -853,8 +993,6 @@ private:
       w->elem_offset = old->elem_offset;
       promoted_.emplace(old->data, b);
     }
-    bind_env_.clear();
-    value_map_.clear();
     tmp_counter_ = 0;
     unit_mapping_ = mapping;
     Optional<For> inner;
@@ -894,8 +1032,8 @@ private:
                             "remaining", "local.var");
       mask_var_ = Var("mask", DataType::Bool(static_cast<int>(lanes_)));
     } else {
-      ICHECK(shared_mask_.defined());
-      mask_var_ = shared_mask_;
+
+      mask_var_ = GetFullMask(lanes_);
     }
 
     Array<Stmt> statements;
@@ -1183,16 +1321,6 @@ private:
   // ------------------------------------------------------------------
   // Statement conversion (pre-binds first, then the statement)
   // ------------------------------------------------------------------
-  PrimExpr BroadcastValue(const PrimExpr &value, Array<Stmt> *pre) {
-    pto_analysis::CheckBroadcastDType(value.dtype(),
-                                      "Parallel scalar assignment");
-    return EmitBind("broadcast",
-                    Call(VectorDType(value.dtype(), lanes_), VmiOp("vbrc"),
-                         {value},
-                         {{"size", IntImm(DataType::Int(32), lanes_)}}),
-                    pre);
-  }
-
   void ConvertBody(const Stmt &body, Array<Stmt> *out) {
     if (const auto *alloc = body.as<AllocBufferNode>()) {
       ICHECK(storage_.Classify(alloc->buffer, current_unit_) ==
@@ -1219,6 +1347,7 @@ private:
       Var new_var(bind->var->name_hint, value.dtype());
       bind_env_.Set(bind->var, bind->value); // analysis environment
       value_map_.Set(bind->var, new_var);    // value environment
+      value_infos_[new_var] = Info(value);
       out->push_back(Bind(new_var, value));
       return;
     }
@@ -1230,12 +1359,21 @@ private:
       Array<Stmt> pre;
       PrimExpr value = ConvertExpr(store->value, &pre);
       auto kind = storage_.Classify(store->buffer, current_unit_);
-      if (kind == pto::StorageClass::kPrivate) {
+      bool accumulator = reducers_.accumulators.count(store->buffer->data);
+      if (kind == pto::StorageClass::kPrivate || accumulator) {
         auto slot = storage_.ResolveSlot(store->buffer, store->indices,
                                          &analyzer_, bind_env_);
-        Buffer target = promoted_.at(store->buffer->data);
-        if (value.dtype().lanes() == 1)
-          value = BroadcastValue(value, &pre);
+        Buffer target = accumulator ? vf_buffers_.at(store->buffer->data)
+                                    : promoted_.at(store->buffer->data);
+        value = ToVmiWidth(value, lanes_, &pre);
+        if (accumulator && unit_mapping_.tail_lanes != 0) {
+          auto old = EmitBind("previous_partial",
+                              BufferLoad(target, {Integer(slot.slot)}), &pre);
+          value = EmitBind(
+              "preserve_partial",
+              Call(target->dtype, VmiOp("vsel"), {mask_var_, value, old}),
+              &pre);
+        }
         ICHECK(value.dtype() == target->dtype)
             << "PTO private Store dtype/lanes mismatch";
         for (const Stmt &stmt : pre)
@@ -1249,7 +1387,7 @@ private:
       auto access = pto_analysis::AnalyzeBufferAccess(
           store->buffer, store->indices, /*is_write=*/true, loop_var_,
           CurrentMapping(), &analyzer_, bind_env_);
-      value = Broadcast(value, &pre);
+      value = ToVmiWidth(value, lanes_, &pre);
       PrimExpr call;
       if (access.pattern == pto_analysis::AccessPattern::kContinuous ||
           (access.pattern == pto_analysis::AccessPattern::kLaneUniform &&
@@ -1368,6 +1506,8 @@ private:
   // ------------------------------------------------------------------
   PrimExpr ConvertExpr(const PrimExpr &expr, Array<Stmt> *pre) {
     if (const auto *load = expr.as<BufferLoadNode>()) {
+      if (vf_buffers_.count(load->buffer->data))
+        return ReadRegionValue(expr, pre);
       auto kind = storage_.Classify(load->buffer, current_unit_);
       if (kind == pto::StorageClass::kPrivate ||
           kind == pto::StorageClass::kExternal) {
@@ -1383,7 +1523,9 @@ private:
       auto access = pto_analysis::AnalyzeBufferAccess(
           load->buffer, load->indices, /*is_write=*/false, loop_var_,
           CurrentMapping(), &analyzer_, bind_env_);
-      if (access.pattern == pto_analysis::AccessPattern::kContinuous) {
+      if (access.pattern == pto_analysis::AccessPattern::kContinuous ||
+          (access.pattern == pto_analysis::AccessPattern::kLaneUniform &&
+           unit_mapping_.logical_extent == 1)) {
         Array<PrimExpr> start_idx;
         for (const auto &idx : access.start_indices) {
           start_idx.push_back(ConvertScalarExpr(BindChunkToQ(idx)));
@@ -1526,12 +1668,13 @@ private:
              "without a VMI mapping: "
           << call_op.value()->name;
       PrimExpr a = ConvertExpr(call->args[0], pre);
-      if (a.dtype().lanes() == 1) {
+      if (Info(a).kind == pto::ValueKind::kScalar)
         return Call(expr.dtype(), call->op, {a});
-      }
+      auto width = Info(a).logical_lanes;
       return EmitBind(unary,
-                      Call(VectorDType(expr.dtype().element_of(), lanes_),
-                           VmiOp(unary), {a, mask_var_}),
+                      Call(VectorDType(expr.dtype().element_of(), width),
+                           VmiOp(unary),
+                           {a, width == 1 ? GetFullMask(1) : mask_var_}),
                       pre);
     }
     if (const auto *cast = expr.as<CastNode>()) {
@@ -1539,16 +1682,17 @@ private:
       // that converted input (the original Cast carries the element types).
       PrimExpr value = ConvertExpr(cast->value, pre);
       pto_analysis::CastContext context;
-      if (value.dtype().lanes() == 1) {
+      int64_t cast_lanes = Info(value).logical_lanes;
+      if (Info(value).kind == pto::ValueKind::kScalar) {
         context.value_kind = pto_analysis::CastValueKind::kScalar;
         context.logical_lanes = 1;
       } else {
-        ICHECK_EQ(value.dtype().lanes(), lanes_)
+        ICHECK(value.dtype().lanes() == 1 || value.dtype().lanes() == lanes_)
             << "[VectorizeParallelToPTO] internal error: Cast input has "
                "unexpected lanes "
             << value.dtype().lanes() << " (current VL " << lanes_ << ")";
         context.value_kind = pto_analysis::CastValueKind::kVectorVmi;
-        context.logical_lanes = lanes_;
+        context.logical_lanes = cast_lanes;
       }
       ICHECK_EQ(value.dtype().element_of(), cast->value.dtype())
           << "[VectorizeParallelToPTO] internal error: converted Cast input "
@@ -1583,8 +1727,8 @@ private:
         attrs.Set("to_dtype", StringImm(TvmDtypeName(step.to)));
         PrimExpr call;
         if (step.op == pto_analysis::VectorCastOp::kIntegerReinterpret) {
-          call = Call(VectorDType(step.to, lanes_), VmiOp("vinterpret_cast"),
-                      {current}, attrs);
+          call = Call(VectorDType(step.to, cast_lanes),
+                      VmiOp("vinterpret_cast"), {current}, attrs);
         } else {
           if (!step.saturate.empty()) {
             attrs.Set("saturate", StringImm(step.saturate));
@@ -1592,17 +1736,17 @@ private:
           if (!step.rounding.empty()) {
             attrs.Set("rounding", StringImm(step.rounding));
           }
-          call = Call(VectorDType(step.to, lanes_), VmiOp("vcvt"), {current},
-                      attrs);
+          call = Call(VectorDType(step.to, cast_lanes), VmiOp("vcvt"),
+                      {current}, attrs);
         }
         current = EmitBind("cast", call, pre);
       }
       // Zero steps is the proven identity; a final type check keeps every
       // multi-step chain honest (source convert once, dtype/VL continuous).
-      ICHECK_EQ(current.dtype(), VectorDType(cast->dtype, lanes_))
+      ICHECK_EQ(current.dtype(), VectorDType(cast->dtype, cast_lanes))
           << "[VectorizeParallelToPTO] internal error: Cast plan ended at "
           << current.dtype() << ", expected "
-          << VectorDType(cast->dtype, lanes_);
+          << VectorDType(cast->dtype, cast_lanes);
       return current;
     }
     if (pto_analysis::IsPtoScalarCoordinate(expr, loop_var_, bind_env_)) {
@@ -1636,20 +1780,16 @@ private:
       PrimExpr cond = ConvertExpr(sel->condition, pre);
       PrimExpr tval = ConvertExpr(sel->true_value, pre);
       PrimExpr fval = ConvertExpr(sel->false_value, pre);
-      if (IsScalarBool(cond) && tval.dtype().lanes() == 1 &&
-          fval.dtype().lanes() == 1) {
+      if (IsScalarBool(cond) && Info(tval).kind == pto::ValueKind::kScalar &&
+          Info(fval).kind == pto::ValueKind::kScalar) {
         // A vector consumer broadcasts this at the combination point.
         return Select(cond, tval, fval);
       }
       if (IsScalarBool(cond)) {
         cond = ScalarBoolToMask(cond, pre);
       }
-      if (tval.dtype().lanes() == 1) {
-        tval = BroadcastToLanes("brc", tval, pre);
-      }
-      if (fval.dtype().lanes() == 1) {
-        fval = BroadcastToLanes("brc", fval, pre);
-      }
+      tval = ToVmiWidth(tval, lanes_, pre);
+      fval = ToVmiWidth(fval, lanes_, pre);
       ICHECK(cond.dtype().lanes() > 1)
           << "[VectorizeParallelToPTO] unsupported Select condition: expected "
              "a lane mask, a lane-uniform comparison, or a scalar bool; got a "
@@ -1776,6 +1916,12 @@ private:
                           const char *cmp, Array<Stmt> *pre) {
     PrimExpr a = ConvertExpr(lhs, pre);
     PrimExpr b = ConvertExpr(rhs, pre);
+    // Comparisons participate in the unit mask. Expand a finalized one-lane
+    // data register before choosing the scalar or vector comparison form.
+    if (Info(a).kind == pto::ValueKind::kVmi && a.dtype().lanes() == 1)
+      a = ToVmiWidth(a, lanes_, pre);
+    if (Info(b).kind == pto::ValueKind::kVmi && b.dtype().lanes() == 1)
+      b = ToVmiWidth(b, lanes_, pre);
     const pto::RelationalKind *kind = pto::RelationalByName(cmp);
     ICHECK(kind != nullptr)
         << "[VectorizeParallelToPTO] internal error: unknown cmp " << cmp;
@@ -1813,8 +1959,10 @@ private:
                          const std::string &vmi_name, Array<Stmt> *pre) {
     PrimExpr a = ConvertExpr(lhs, pre);
     PrimExpr b = ConvertExpr(rhs, pre);
-    bool a_vec = a.dtype().lanes() > 1;
-    bool b_vec = b.dtype().lanes() > 1;
+    auto lhs_info = Info(a);
+    auto rhs_info = Info(b);
+    bool a_vec = lhs_info.kind == pto::ValueKind::kVmi;
+    bool b_vec = rhs_info.kind == pto::ValueKind::kVmi;
     if (!a_vec && !b_vec) {
       // Lane-uniform folds stay scalar with the TIR semantics of the node.
       if (vmi_name == "vadd") {
@@ -1826,21 +1974,18 @@ private:
       if (vmi_name == "vmul") {
         return a * b;
       }
-      if (vmi_name == "vdiv") {
+      if (vmi_name == "vdiv")
         return div(a, b);
-      }
       ICHECK(false) << "[VectorizeParallelToPTO] internal error: unknown "
                        "binary op "
                     << vmi_name;
     }
-    if (a_vec && !b_vec) {
-      b = BroadcastToLanes("brc", b, pre);
-    } else if (!a_vec && b_vec) {
-      a = BroadcastToLanes("brc", a, pre);
-    }
+    int64_t width = std::max(lhs_info.logical_lanes, rhs_info.logical_lanes);
+    a = ToVmiWidth(a, width, pre);
+    b = ToVmiWidth(b, width, pre);
     return EmitBind(vmi_name,
-                    Call(VectorDType(a.dtype().element_of(), lanes_),
-                         VmiOp(vmi_name), {a, b, mask_var_}),
+                    Call(a.dtype(), VmiOp(vmi_name),
+                         {a, b, width == 1 ? GetFullMask(1) : mask_var_}),
                     pre);
   }
 
@@ -1888,14 +2033,22 @@ private:
                Array<Stmt> *pre) {
     Var result(name + "_" + std::to_string(tmp_counter_++), value.dtype());
     pre->push_back(Bind(result, value));
+    if (const auto *call = value.as<CallNode>())
+      if (const auto *op = call->op.as<OpNode>();
+          op && std::string(op->name).rfind("tl.vmi.", 0) == 0)
+        value_infos_[result] = {pto::ValueKind::kVmi, value.dtype().lanes()};
     return result;
   }
 
+  pto::PtoReducerStates reducers_;
+  std::unordered_map<Var, Buffer, ObjectPtrHash, ObjectPtrEqual> vf_buffers_;
+  pto::ValueInfoMap value_infos_;
+  std::map<int64_t, Var> full_masks_;
+  Array<Stmt> mask_prelude_;
   pto::ParallelStorageQuery storage_;
   For current_unit_;
   std::unordered_map<Var, Buffer, ObjectPtrHash, ObjectPtrEqual> promoted_;
   arith::Analyzer analyzer_;
-  Var shared_mask_; // one full mask per VF, shared by all units
 
   // Per-unit state.
   Var loop_var_;
@@ -1909,7 +2062,7 @@ private:
   int64_t lanes_ = 0;
   Var mask_var_;
   int tmp_counter_ = 0;
-  int64_t current_vf_lanes_ = 0;
+
   std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> parameters_;
   std::vector<Buffer> active_allocations_;
   BufferVersionMap buffer_versions_;

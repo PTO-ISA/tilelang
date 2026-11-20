@@ -31,6 +31,114 @@ using ffi::Array;
 using ffi::GetRef;
 using ffi::Map;
 
+int64_t AnalyzePtoFinalize(const PtoFinalizeReducerOp &op,
+                           const PtoReducerStates &states) {
+  auto acc = op->accumulator->buffer;
+  ICHECK(states.accumulators.count(acc->data))
+      << "PTO finalize accumulator missing from tl.pto.reducer_states";
+  ICHECK(states.lanes == 64 || states.lanes == 128 || states.lanes == 256)
+      << "PTO reducer requires VL 64/128/256";
+  ICHECK(op->plan_steps.size() == 2 &&
+         op->plan_steps[0]->value == states.lanes &&
+         op->plan_steps[1]->value == 1)
+      << "PTO reducer supports only plan_steps=[VL,1]";
+  ICHECK(acc->dtype == DataType::Float(16) || acc->dtype == DataType::Float(32))
+      << "PTO reducer requires float16/float32";
+  auto check = [&](const BufferRegion &region) {
+    auto b = region->buffer;
+    ICHECK(b.scope() == "local")
+        << "PTO reducer requires ordinary local storage";
+    ICHECK(b->shape.size() == 1 && is_one(b->shape[0]) &&
+           region->region.size() == 1 && is_zero(region->region[0]->min) &&
+           is_one(region->region[0]->extent))
+        << "PTO reducer requires a single local slot region";
+    ICHECK_EQ(b->dtype, acc->dtype) << "PTO reducer dtype mismatch";
+  };
+  check(op->accumulator);
+  check(op->result);
+  ICHECK(!acc->data.same_as(op->result->buffer->data))
+      << "PTO reducer result must be independent";
+  if (op->seed.defined()) {
+    check(op->seed.value());
+    auto seed = op->seed.value()->buffer->data;
+    ICHECK(!seed.same_as(acc->data) && !seed.same_as(op->result->buffer->data))
+        << "PTO reducer seed must be independent";
+  }
+  return 1;
+}
+
+PtoReducerStates CollectReducerStates(const SBlock &vf,
+                                      const ParallelStorageQuery &storage) {
+  PtoReducerStates states;
+  if (auto lanes = vf->annotations.Get("tl.simdvf_lanes"))
+    states.lanes = Downcast<IntImm>(lanes.value())->value;
+  if (auto metadata = vf->annotations.Get(attr::kPtoReducerStates)) {
+    auto vars = metadata.value().as<Array<ffi::Any>>();
+    ICHECK(vars.has_value()) << "tl.pto.reducer_states must contain data Vars";
+    for (const auto &entry : vars.value()) {
+      auto var = entry.try_cast<Var>();
+      ICHECK(var.has_value()) << "tl.pto.reducer_states must contain data Vars";
+      Var data = var.value();
+      const auto &b = storage.Allocation(data);
+      bool owned = false;
+      for (const auto &a : vf->alloc_buffers)
+        owned |= a->data.same_as(data);
+      ICHECK(owned) << "PTO reducer metadata allocation must belong to its VF";
+      ICHECK(!states.accumulators.count(data)) << "duplicate PTO reducer state";
+      storage.CheckStorageV1(b);
+      states.accumulators.Set(data, b);
+      states.storage_values[data] = {ValueKind::kVmi, states.lanes};
+    }
+  }
+  auto check_owned = [&](const Buffer &buffer) {
+    storage.CheckStorageV1(buffer);
+    const auto &allocation = storage.Allocation(buffer->data);
+    bool owned = false;
+    for (const auto &b : vf->alloc_buffers)
+      owned |= b->data.same_as(buffer->data);
+    ICHECK(owned && allocation->dtype == buffer->dtype &&
+           ffi::StructuralEqual()(allocation->shape, buffer->shape))
+        << "PTO finalize allocation must belong to its VF and match its "
+           "storage";
+  };
+  PostOrderVisit(vf->body, [&](const ObjectRef &node) {
+    if (const auto *block = node.as<SBlockNode>())
+      ICHECK(block->name_hint != "SIMD_VF")
+          << "nested PTO reducer VF is unsupported";
+    if (const auto *eval = node.as<EvaluateNode>()) {
+      const auto *call = eval->value.as<CallNode>();
+      if (call && call->op.same_as(PtoFinalizeReducerOp::Get())) {
+        auto op =
+            Downcast<PtoFinalizeReducerOp>(ParseOperator(GetRef<Call>(call)));
+        int64_t lanes = AnalyzePtoFinalize(op, states);
+        states.storage_values[op->result->buffer->data] = {ValueKind::kVmi,
+                                                           lanes};
+        check_owned(op->accumulator->buffer);
+        check_owned(op->result->buffer);
+        if (op->seed.defined())
+          check_owned(op->seed.value()->buffer);
+        states.finalizes.push_back(op);
+      }
+    }
+  });
+  return states;
+}
+
+Optional<Buffer> AnalyzeReducerAccess(const PtoReducerStates &states,
+                                      const Buffer &buffer,
+                                      const Array<PrimExpr> &indices,
+                                      const ParallelStorageQuery &storage,
+                                      arith::Analyzer *analyzer,
+                                      const Map<Var, PrimExpr> &bind_env) {
+  auto found = states.accumulators.Get(buffer->data);
+  if (!found.has_value())
+    return std::nullopt;
+  storage.CheckStorageV1(buffer);
+  auto slot = storage.ResolveSlot(buffer, indices, analyzer, bind_env);
+  ICHECK_EQ(slot.slot, 0) << "PTO reducer slot must be zero";
+  return found.value();
+}
+
 bool IsPtoDirectReduce(const Call &call) {
   return call->op.same_as(Op::Get("tl.tileop.reduce"));
 }
@@ -1499,6 +1607,11 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
     return LaneUse::kUnknown;
   }
   if (const auto *var = expr.as<VarNode>()) {
+    if (ctx->value_infos) {
+      auto it = ctx->value_infos->find(GetRef<Var>(var));
+      if (it != ctx->value_infos->end() && it->second.kind == ValueKind::kVmi)
+        return LaneUse::kVarying;
+    }
     if (var == ctx->loop_var.get()) {
       return LaneUse::kVarying;
     }
@@ -1572,6 +1685,12 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
     return LaneUse::kUnknown;
   }
   if (const auto *load = expr.as<BufferLoadNode>()) {
+    if (ctx->storage_values) {
+      auto it = ctx->storage_values->find(load->buffer->data);
+      if (it != ctx->storage_values->end() &&
+          it->second.kind == ValueKind::kVmi)
+        return LaneUse::kVarying;
+    }
     if (ctx->storage) {
       auto kind = ctx->storage->Classify(load->buffer, ctx->unit);
       if (kind == pto::StorageClass::kPrivate ||
@@ -1769,6 +1888,58 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
 
 } // namespace
 
+ValueInfo AnalyzeComputeValue(const PrimExpr &expr, LaneUseContext *ctx) {
+  if (const auto *var = expr.as<VarNode>()) {
+    if (ctx->value_infos) {
+      auto it = ctx->value_infos->find(GetRef<Var>(var));
+      if (it != ctx->value_infos->end())
+        return it->second;
+    }
+  }
+  if (const auto *load = expr.as<BufferLoadNode>()) {
+    if (ctx->storage_values) {
+      auto it = ctx->storage_values->find(load->buffer->data);
+      if (it != ctx->storage_values->end())
+        return it->second;
+    }
+  }
+  if (const auto *cast = expr.as<CastNode>())
+    return AnalyzeComputeValue(cast->value, ctx);
+  auto merge = [](ValueInfo a, ValueInfo b) {
+    return ValueInfo{a.kind == ValueKind::kVmi || b.kind == ValueKind::kVmi
+                         ? ValueKind::kVmi
+                         : ValueKind::kScalar,
+                     std::max(a.logical_lanes, b.logical_lanes)};
+  };
+  const PrimExpr *lhs = nullptr;
+  const PrimExpr *rhs = nullptr;
+  if (const auto *op = expr.as<AddNode>()) {
+    lhs = &op->a;
+    rhs = &op->b;
+  } else if (const auto *op = expr.as<SubNode>()) {
+    lhs = &op->a;
+    rhs = &op->b;
+  } else if (const auto *op = expr.as<MulNode>()) {
+    lhs = &op->a;
+    rhs = &op->b;
+  } else if (const auto *op = expr.as<DivNode>()) {
+    lhs = &op->a;
+    rhs = &op->b;
+  }
+  if (lhs)
+    return merge(AnalyzeComputeValue(*lhs, ctx),
+                 AnalyzeComputeValue(*rhs, ctx));
+  if (const auto *call = expr.as<CallNode>(); call && call->args.size() == 1)
+    return AnalyzeComputeValue(call->args[0], ctx);
+  std::string reason;
+  auto use = AnalyzeLaneUse(expr, ctx, &reason);
+  ICHECK(use != LaneUse::kUnknown)
+      << "PTO value classification failed: " << reason;
+  return use == LaneUse::kVarying
+             ? ValueInfo{ValueKind::kVmi, ctx->mapping.lanes}
+             : ValueInfo{};
+}
+
 LaneUse AnalyzeLaneUse(const PrimExpr &expr, LaneUseContext *ctx,
                        std::string *reason) {
   return AnalyzeLaneUseImpl(expr, ctx, reason, /*metadata_mode=*/false);
@@ -1839,6 +2010,8 @@ bool IsSupportedVectorBinaryOp(const std::string &vmi_op, DataType dtype) {
     return (is_int_like && (bits == 8 || bits == 16 || bits == 32)) ||
            is_fp_like;
   }
+  if (vmi_op == "vmax" || vmi_op == "vmin")
+    return is_fp_like;
   if (vmi_op == "vdiv") {
     return dtype.is_float() && (bits == 16 || bits == 32);
   }
