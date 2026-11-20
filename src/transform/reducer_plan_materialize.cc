@@ -715,6 +715,9 @@ public:
         ICHECK(epoch.buffer->shape.size() == 1 &&
                is_one(epoch.buffer->shape[0]))
             << "PTO reducer requires shape (1,)";
+        const auto &indices = epoch.updates.front().indices;
+        ICHECK(indices.size() == 1 && is_zero(indices[0]))
+            << "PTO reducer requires a single update at index zero";
         ICHECK(epoch.buffer->dtype == DataType::Float(16) ||
                epoch.buffer->dtype == DataType::Float(32))
             << "PTO reducer requires float16/float32";

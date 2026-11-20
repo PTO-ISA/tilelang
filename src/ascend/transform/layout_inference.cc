@@ -615,36 +615,12 @@ public:
       pto_loop_layouts_.Set(unit.root, layout);
     }
 
-    std::unordered_map<const VarNode *, int> update_counts;
-    for (const auto &unit : pto_parallel_units_)
-      for (const auto &update : unit.reducer_updates)
-        ++update_counts[update.reducer->data.get()];
-    for (const auto &[buffer, bounds] : pto_reducer_bounds_)
-      if (update_counts[buffer->data.get()] != 1)
-        layout_map.Set(buffer, PartialFragment::FullyReplicated(
-                                   buffer->shape, bounds->extent, bounds));
-    for (const auto &unit : pto_parallel_units_) {
-      Array<Var> vars;
-      const ForNode *loop = unit.root.get();
-      while (loop && loop->kind == ForKind::kParallel) {
-        vars.push_back(loop->loop_var);
-        loop = loop->body.as<ForNode>();
-      }
-      for (const auto &update : unit.reducer_updates) {
-        if (update_counts[update.reducer->data.get()] != 1)
-          continue;
-        ReducerUpdateSiteHint site{pto_loop_layouts_[unit.root], vars,
-                                   update.indices, update.value};
-        auto analysis = AnalyzeReducerUpdateSite(
-            site, update.reducer->shape,
-            *as_const_int(unit.lane_bounds->extent),
-            *as_const_int(unit.lane_bounds->min), &analyzer_);
-        ICHECK(analysis.narrow_eligible)
-            << "PTO reducer update layout: " << analysis.reason;
-        layout_map.Set(update.reducer,
-                       PartialFragment::FromInduced(
-                           analysis.induced, Integer(analysis.combine_size)));
-      }
+    // A single-output PTO reducer owns one partial per SIMD lane. Each
+    // logical iteration contributes once, including when its input is a
+    // lane-private local. Finalization combines the entire lane domain.
+    for (const auto &[buffer, bounds] : pto_reducer_bounds_) {
+      layout_map.Set(buffer, PartialFragment::FullyReplicated(
+                                 buffer->shape, bounds->extent, bounds));
     }
 
     Map<Buffer, Layout> strict_layout_map;
@@ -1091,14 +1067,8 @@ private:
         // unit is recorded; nested Parallel layers are part of this unit.
         // Defer inference until collection has finished so later constraint
         // producers (e.g. Fragment buffers) can be collected first.
-        PtoParallelUnit unit{GetRef<For>(op), CurrentPtoLaneBounds(), {}};
-        PostOrderVisit(op->body, [&](const ObjectRef &node) {
-          if (const auto *call = node.as<CallNode>()) {
-            if (call->op.same_as(reducer_update()))
-              unit.reducer_updates.push_back(ParseReducerUpdate(call));
-          }
-        });
-        pto_parallel_units_.push_back(std::move(unit));
+        pto_parallel_units_.push_back(
+            {GetRef<For>(op), CurrentPtoLaneBounds()});
         return;
       }
 
@@ -1515,7 +1485,6 @@ private:
   struct PtoParallelUnit {
     For root;
     Range lane_bounds;
-    std::vector<ReducerUpdateArgs> reducer_updates;
   };
   // PTO SIMD_VF nesting stack. Only non-empty on the PTO target: entering a
   // SIMD_VF block under a non-PTO target keeps the stack empty so the
