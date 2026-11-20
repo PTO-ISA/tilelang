@@ -54,6 +54,8 @@ namespace {
 class VerifyParallelToPTOImpl : public StmtExprVisitor {
 public:
   void Verify(const PrimFunc &f) {
+    storage_.Build(f->body);
+    storage_.ValidateOwnerUses(f->body);
     // The definition environment starts at function entry with
     // the params and the buffer data pointers. Every other definition is
     // registered at its lexical position during the traversal below and
@@ -70,6 +72,9 @@ public:
   }
 
 private:
+  pto::ParallelStorageQuery storage_;
+  For current_unit_;
+
   // Function-level pre-scan for AllocBuffer nodes carrying the
   // tirx.volatile annotation. Presence of the annotation marks the
   // allocation volatile (PTO codegen semantics:
@@ -303,12 +308,16 @@ private:
             << buffer->name << "` has scope global); stage through UB first";
         parent_->Fail("memory access", oss.str());
       }
-      // The remaining scopes only support UB accesses. local /
-      // shared.l1 (L1) and other scopes are rejected.
-      if (scope != "shared" && scope != "shared.dyn") {
+      // Support UB and ordinary local storage under the private / external
+      // read-only contracts checked below. local.fragment, shared.l1 (L1)
+      // and other scopes are rejected.
+      if (scope != "shared" && scope != "shared.dyn" && scope != "local" &&
+          scope != "local.var") {
         std::ostringstream oss;
         oss << "buffer `" << buffer->name << "` has scope `" << scope
-            << "`; only UB (shared/shared.dyn) accesses are supported";
+            << "`; supported scopes are UB (shared/shared.dyn) and ordinary "
+               "local storage (local/local.var), subject to private or "
+               "external read-only storage contracts";
         parent_->Fail("memory access", oss.str());
       }
       if (!pto_analysis::IsSupportedElementDType(buffer->dtype)) {
@@ -756,7 +765,13 @@ private:
                     "nested blocks inside T.Parallel are not yet "
                     "supported");
     }
-    void VisitStmt_(const AllocBufferNode *) final {
+    void VisitStmt_(const AllocBufferNode *op) final {
+      if (parent_->storage_.Classify(op->buffer, parent_->current_unit_) ==
+          pto::StorageClass::kPrivate) {
+        parent_->storage_.CheckStorageV1(op->buffer);
+        external_defs_.insert(op->buffer->data.get());
+        return;
+      }
       parent_->Fail("loop structure",
                     "buffer allocation inside T.Parallel is not yet "
                     "supported");
@@ -818,7 +833,14 @@ private:
       // The store value runs the shared compute-value
       // admission (whitelist, cast plans, op types, references, lane
       // classification).
-      CheckComputeValue(op->value, "store value");
+      auto rhs_use = CheckComputeValue(op->value, "store value");
+      auto kind =
+          parent_->storage_.Classify(op->buffer, parent_->current_unit_);
+      if (rhs_use == pto_analysis::LaneUse::kUniform &&
+          (kind == pto::StorageClass::kPrivate ||
+           kind == pto::StorageClass::kUB))
+        pto_analysis::CheckBroadcastDType(
+            op->value.dtype(), "store to " + std::string(op->buffer->name));
       // Store indices get the same unified reference check — the
       // address continuity proof can cancel a common ghost offset and
       // must not double as a definition check.
@@ -840,6 +862,8 @@ private:
     // definition environment, classification cache and guards.
     pto_analysis::LaneUseContext MakeLaneUseContext() {
       pto_analysis::LaneUseContext ctx;
+      ctx.storage = &parent_->storage_;
+      ctx.unit = parent_->current_unit_;
       ctx.loop_var = loop_var_;
       ctx.serial_var = serial_var_;
       ctx.mapping = mapping_;
@@ -1041,123 +1065,132 @@ private:
     // scalar Mul inside a Varying Add is legal while an int8 vector Mul
     // stays rejected.
     void CheckBinaryOpTypes(const PrimExpr &expr, bool indexed_offset = false) {
-      std::function<void(const PrimExpr &)> check =
-          [&](const PrimExpr &e) {
-            // Ordered comparison of bool operands has no lane-mask lowering;
-            // only EQ/NE is expressed in the mask domain.
-            {
-              PrimExpr rel_a;
-              PrimExpr rel_b;
-              const pto::RelationalKind *rel =
-                  pto::MatchRelational(e, &rel_a, &rel_b);
-              if (rel != nullptr && std::string(rel->cmp) != "eq" &&
-                  std::string(rel->cmp) != "ne" && rel_a.dtype().is_bool() &&
-                  rel_b.dtype().is_bool()) {
-                LOG(FATAL) << "[VerifyParallelToPTO] type: ordered comparison "
-                              "of bool operands has no lane-mask lowering";
+      std::function<void(const PrimExpr &)> check = [&](const PrimExpr &e) {
+        // Ordered comparison of bool operands has no lane-mask lowering;
+        // only EQ/NE is expressed in the mask domain.
+        {
+          PrimExpr rel_a;
+          PrimExpr rel_b;
+          const pto::RelationalKind *rel =
+              pto::MatchRelational(e, &rel_a, &rel_b);
+          if (rel != nullptr && std::string(rel->cmp) != "eq" &&
+              std::string(rel->cmp) != "ne" && rel_a.dtype().is_bool() &&
+              rel_b.dtype().is_bool()) {
+            LOG(FATAL) << "[VerifyParallelToPTO] type: ordered comparison "
+                          "of bool operands has no lane-mask lowering";
+          }
+        }
+        if (auto bin = GetBinaryOperands(e)) {
+          check(bin->a);
+          check(bin->b);
+          if (bin->vmi_op != nullptr) {
+            CheckOneOp(bin->vmi_op, bin->dtype, bin->a, bin->b, indexed_offset);
+          }
+          return;
+        }
+        if (const auto *cast = e.as<CastNode>()) {
+          check(cast->value);
+          return;
+        }
+        // Select, like the relational / boolean nodes of
+        // GetBinaryOperands, is expressed by Legalize and Vectorize as
+        // vcmp+vsel. Operands recurse through the same check, so lane
+        // classification and dtype rules still apply to whatever feeds
+        // them.
+        if (const auto *sel = e.as<SelectNode>()) {
+          if (sel->true_value.dtype().is_bool() ||
+              sel->false_value.dtype().is_bool()) {
+            LOG(FATAL) << "[VerifyParallelToPTO] type: a bool-valued "
+                          "Select has no vreg lowering";
+          }
+          check(sel->condition);
+          check(sel->true_value);
+          check(sel->false_value);
+          auto ctx = MakeLaneUseContext();
+          std::string why;
+          if (pto_analysis::AnalyzeLaneUse(e, &ctx, &why) ==
+              pto_analysis::LaneUse::kVarying) {
+            for (const PrimExpr &arm : {sel->true_value, sel->false_value}) {
+              if (pto_analysis::AnalyzeLaneUse(arm, &ctx, &why) ==
+                  pto_analysis::LaneUse::kUniform) {
+                pto_analysis::CheckBroadcastDType(arm.dtype(), "Select arm");
               }
             }
-            if (auto bin = GetBinaryOperands(e)) {
-              check(bin->a);
-              check(bin->b);
-              if (bin->vmi_op != nullptr) {
-                CheckOneOp(bin->vmi_op, bin->dtype, bin->a, bin->b,
-                         indexed_offset);
+          }
+          return;
+        }
+        if (const auto *notn = e.as<NotNode>()) {
+          check(notn->a);
+          return;
+        }
+        // Min/Max are rewritten to Select by Legalize, but their operands
+        // must still pass the same type rules here (e.g. the
+        // integer-bitwise ban).
+        if (const auto *minn = e.as<MinNode>()) {
+          // Legalize rewrites Min/Max to Select, which would introduce a
+          // bool-ordered comparison and a bool-valued Select after Verify.
+          if (minn->dtype.is_bool()) {
+            LOG(FATAL) << "[VerifyParallelToPTO] type: Min/Max of bool "
+                          "operands has no lane-mask lowering";
+          }
+          check(minn->a);
+          check(minn->b);
+          return;
+        }
+        if (const auto *maxn = e.as<MaxNode>()) {
+          // Same gate as Min: Legalize rewrites Max to Select, which would
+          // introduce a bool-ordered compare and a bool-valued Select.
+          if (maxn->dtype.is_bool()) {
+            LOG(FATAL) << "[VerifyParallelToPTO] type: Min/Max of bool "
+                          "operands has no lane-mask lowering";
+          }
+          check(maxn->a);
+          check(maxn->b);
+          return;
+        }
+        if (const auto *call = e.as<CallNode>()) {
+          if (auto call_op = call->op.as<Op>()) {
+            const std::string &name = call_op.value()->name;
+            // Boolean mask-combine calls (the shared
+            // tirx.bitwise_* / tir.And|Or|Not admission table) and the
+            // tl/tir.infinity() constant.
+            // A mask combine only has a lowering for bool (lane-mask)
+            // values.
+            if (pto_analysis::MaskLogicVmiOpName(name) != nullptr) {
+              // An integer bitwise call is rejected with a proper
+              // diagnostic; CheckBinaryOpTypes is static, so report via
+              // LOG(FATAL) (the same channel Fail uses).
+              if (!call->dtype.is_bool()) {
+                LOG(FATAL)
+                    << "[VerifyParallelToPTO] type: bitwise mask combine `"
+                    << name
+                    << "` requires bool (lane-mask) operands; an integer "
+                       "bitwise call has no lane-mask lowering";
+              }
+              for (const auto &arg : call->args) {
+                check(arg);
               }
               return;
             }
-            if (const auto *cast = e.as<CastNode>()) {
-              check(cast->value);
+            if (name == "tl.infinity" || name == "tir.infinity") {
               return;
             }
-            // Select, like the relational / boolean nodes of
-            // GetBinaryOperands, is expressed by Legalize and Vectorize as
-            // vcmp+vsel. Operands recurse through the same check, so lane
-            // classification and dtype rules still apply to whatever feeds
-            // them.
-            if (const auto *sel = e.as<SelectNode>()) {
-              if (sel->true_value.dtype().is_bool() ||
-                  sel->false_value.dtype().is_bool()) {
-                LOG(FATAL) << "[VerifyParallelToPTO] type: a bool-valued "
-                              "Select has no vreg lowering";
-              }
-              check(sel->condition);
-              check(sel->true_value);
-              check(sel->false_value);
+            // The tirx.fabs/exp/log/sqrt unary math table; the original
+            // tirx op name stays the CheckOneUnaryOp key.
+            if (pto_analysis::VectorUnaryVmiOpName(name) != nullptr) {
+              check(call->args[0]);
+              CheckOneUnaryOp(name.c_str(), call->dtype, call->args[0]);
               return;
             }
-            if (const auto *notn = e.as<NotNode>()) {
-              check(notn->a);
-              return;
-            }
-            // Min/Max are rewritten to Select by Legalize, but their operands
-            // must still pass the same type rules here (e.g. the
-            // integer-bitwise ban).
-            if (const auto *minn = e.as<MinNode>()) {
-              // Legalize rewrites Min/Max to Select, which would introduce a
-              // bool-ordered comparison and a bool-valued Select after Verify.
-              if (minn->dtype.is_bool()) {
-                LOG(FATAL) << "[VerifyParallelToPTO] type: Min/Max of bool "
-                              "operands has no lane-mask lowering";
-              }
-              check(minn->a);
-              check(minn->b);
-              return;
-            }
-            if (const auto *maxn = e.as<MaxNode>()) {
-              // Same gate as Min: Legalize rewrites Max to Select, which would
-              // introduce a bool-ordered compare and a bool-valued Select.
-              if (maxn->dtype.is_bool()) {
-                LOG(FATAL) << "[VerifyParallelToPTO] type: Min/Max of bool "
-                              "operands has no lane-mask lowering";
-              }
-              check(maxn->a);
-              check(maxn->b);
-              return;
-            }
-            if (const auto *call = e.as<CallNode>()) {
-              if (auto call_op = call->op.as<Op>()) {
-                const std::string &name = call_op.value()->name;
-                // Boolean mask-combine calls (the shared
-                // tirx.bitwise_* / tir.And|Or|Not admission table) and the
-                // tl/tir.infinity() constant.
-                // A mask combine only has a lowering for bool (lane-mask)
-                // values.
-                if (pto_analysis::MaskLogicVmiOpName(name) != nullptr) {
-                  // An integer bitwise call is rejected with a proper
-                  // diagnostic; CheckBinaryOpTypes is static, so report via
-                  // LOG(FATAL) (the same channel Fail uses).
-                  if (!call->dtype.is_bool()) {
-                    LOG(FATAL)
-                        << "[VerifyParallelToPTO] type: bitwise mask combine `"
-                        << name
-                        << "` requires bool (lane-mask) operands; an integer "
-                           "bitwise call has no lane-mask lowering";
-                  }
-                  for (const auto &arg : call->args) {
-                    check(arg);
-                  }
-                  return;
-                }
-                if (name == "tl.infinity" || name == "tir.infinity") {
-                  return;
-                }
-                // The tirx.fabs/exp/log/sqrt unary math table; the original
-                // tirx op name stays the CheckOneUnaryOp key.
-                if (pto_analysis::VectorUnaryVmiOpName(name) != nullptr) {
-                  check(call->args[0]);
-                  CheckOneUnaryOp(name.c_str(), call->dtype, call->args[0]);
-                  return;
-                }
-              }
-            }
-            if (const auto *load = e.as<BufferLoadNode>()) {
-              // Index arithmetic is address analysis, not value arithmetic.
-              (void)load;
-              return;
-            }
-            // Vars/constants carry no operation to check.
-          };
+          }
+        }
+        if (const auto *load = e.as<BufferLoadNode>()) {
+          // Index arithmetic is address analysis, not value arithmetic.
+          (void)load;
+          return;
+        }
+        // Vars/constants carry no operation to check.
+      };
       check(expr);
     }
 
@@ -1303,6 +1336,10 @@ private:
         parent_->Fail("dtype", oss.str());
       }
       if (vector_op) {
+        if (a == pto_analysis::LaneUse::kUniform)
+          pto_analysis::CheckBroadcastDType(lhs.dtype(), op_name);
+        if (b == pto_analysis::LaneUse::kUniform)
+          pto_analysis::CheckBroadcastDType(rhs.dtype(), op_name);
         // The node emits a VMI op: apply the operation matrix.
         if (!pto_analysis::IsSupportedVectorBinaryOp(op_name, dtype)) {
           std::ostringstream oss;
@@ -1403,6 +1440,15 @@ private:
       // check is repeated here, next to the access it belongs to.
       if (predicate.defined()) {
         CheckDefinedVars(predicate.value());
+      }
+      auto kind = parent_->storage_.Classify(buffer, parent_->current_unit_);
+      if (kind == pto::StorageClass::kPrivate ||
+          kind == pto::StorageClass::kExternal) {
+        parent_->storage_.ResolveSlot(buffer, indices, &analyzer_, bind_env_);
+        if (is_write && kind == pto::StorageClass::kExternal)
+          parent_->Fail("memory access", "external ordinary storage write: " +
+                                             std::string(buffer->name));
+        return;
       }
       try {
         auto access = pto_analysis::AnalyzeBufferAccess(
@@ -1731,6 +1777,26 @@ private:
   // Per-unit checks (structure, ranges, layout)
   // ------------------------------------------------------------------
   void VerifyUnit(const For &unit, int64_t lanes, size_t unit_index) {
+    current_unit_ = unit;
+    for (const Buffer &buffer : storage_.PrivateAllocations(unit)) {
+      storage_.CheckStorageV1(buffer);
+      ICHECK(pto_analysis::IsSupportedElementDType(buffer->dtype) &&
+             !buffer->dtype.is_bool())
+          << "PTO Parallel unsupported private allocation dtype "
+          << buffer->dtype << " for " << buffer->name;
+      if (buffer.scope() == "local.var")
+        pto_analysis::CheckBroadcastDType(buffer->dtype,
+                                          "default zero initialization of " +
+                                              std::string(buffer->name));
+      Buffer promoted = buffer;
+      promoted.CopyOnWrite()->dtype = buffer->dtype.with_lanes(lanes);
+      if (buffer.scope() == "local.var")
+        vmi::ValidateDataSlot(promoted.get(),
+                              "PTO Parallel private allocation");
+      else
+        vmi::ValidateDataArray(promoted.get(),
+                               "PTO Parallel private allocation");
+    }
     // Full per-unit context for diagnostics.
     {
       std::ostringstream oss;

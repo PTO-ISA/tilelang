@@ -124,6 +124,10 @@ def alloc_var(dtype: DType, *args, scope: str = "local.var", init: PrimExpr | in
     Returns:
         T.Buffer: A TVM buffer object allocated as a single-element variable
     """
+    return _alloc_var(dtype, args, scope, init)
+
+
+def _alloc_var(dtype, args, scope, init, *, register=None):
     parsed_scope = scope
     parsed_init = init
 
@@ -152,6 +156,8 @@ def alloc_var(dtype: DType, *args, scope: str = "local.var", init: PrimExpr | in
         dtype = _dtypes.int64
 
     buffer = _with_span(T.sblock_alloc_buffer([1], dtype, scope=parsed_scope))
+    if register is not None:
+        register(buffer, parsed_init is None)
     if parsed_init is not None:
         # Always use T.buffer_store for reliable initialisation across all
         # backends.  The sblock_attr("tl.local_var_init") path feeds into the

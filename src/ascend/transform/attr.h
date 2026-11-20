@@ -37,6 +37,9 @@ constexpr const char *kAscendStage = "tl.ascend_stage";
 // grouping or core-placement semantics.
 constexpr const char *kScheduleUnit = "tl.schedule_unit";
 
+// Source ownership of ordinary private allocations on a Parallel unit root.
+constexpr const char *kParallelPrivateAllocs = "tl.parallel_private_allocs";
+
 // Allocation category of an explicit VMI register allocation.  Frontend blocks
 // carry a Var -> String map, NormalizePTOAllocMarkers turns it into scoped
 // AttrStmt carriers inside the owning SIMD_VF block, and

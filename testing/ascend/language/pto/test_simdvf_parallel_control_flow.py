@@ -989,9 +989,7 @@ def test_conditional_interleaved_destination_is_rejected_at_verify():
     # address is reported by the access-pattern rule ("indexed access requires
     # scatter") rather than by the pairing contract itself.
     message = str(error)
-    assert (
-        "continuous" in message or "cannot pair" in message or "scatter" in message
-    ), f"expected an address diagnostic, got: {message}"
+    assert "continuous" in message or "cannot pair" in message or "scatter" in message, f"expected an address diagnostic, got: {message}"
 
 
 def _k_plain_offset_destination(E=150, lanes=128, dtype="float32"):
@@ -1214,13 +1212,11 @@ def _k_per_lane_scalar_in_unit(E=150, lanes=64, dtype="float32"):
 
 
 @pytest.mark.pto
-def test_per_lane_scalar_inside_a_unit_is_rejected():
-    """`T.alloc_var` has no promotion path here: a `local.var` access inside a
-    converting unit is rejected before Legalize sees it."""
-
-    _, error = _lower_capture(_k_per_lane_scalar_in_unit(), expect_error=True)
-    assert error is not None, "a per-lane scalar must be rejected"
-    assert "only UB (shared/shared.dyn) accesses are supported" in str(error), f"expected the scope diagnostic, got: {error}"
+def test_per_lane_scalar_inside_a_unit_is_promoted():
+    """PR38 supplies the promotion path missing from the PR11 baseline."""
+    stages, error = _lower_capture(_k_per_lane_scalar_in_unit())
+    assert error is None
+    assert "tl.vmi.vload" in _vmi_call_names(stages["vectorize"])
 
 
 # ---------------------------------------------------------------------------

@@ -52,7 +52,7 @@ def _region_kernel(shape, extent, strides=None, dtype="float32", scope="shared.d
         ((256,), 64, (1,), "shared.dyn", "tail regions"),
         ((3, 256), 128, (258, 1), "shared.dyn", "32-byte aligned"),
         ((3, 128), 128, (256, 2), "shared.dyn", "unit-stride axis"),
-        ((128,), 128, (1,), "local.fragment", "only UB"),
+        ((128,), 128, (1,), "local.fragment", "supported scopes are UB"),
     ],
     ids=["empty", "single-element", "short-vector", "unaligned-row", "no-contiguous-axis", "fragment"],
 )

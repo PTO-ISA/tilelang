@@ -55,6 +55,18 @@ public:
 // domain includes the padded tail lanes.
 class PtoAccessCollector : public tirx::StmtExprVisitor {
 public:
+  PtoAccessCollector(const pto::ParallelStorageQuery &storage, const For &root)
+      : storage_(storage), root_(root) {}
+  bool IsMemory(const Buffer &b, const Array<PrimExpr> &indices) {
+    auto kind = storage_.Classify(b, root_);
+    if (kind == pto::StorageClass::kPrivate ||
+        kind == pto::StorageClass::kExternal) {
+      arith::Analyzer analyzer;
+      storage_.ResolveSlot(b, indices, &analyzer, bind_env_);
+      return false;
+    }
+    return true;
+  }
   struct Access {
     Buffer buffer;
     Array<PrimExpr> indices;
@@ -66,12 +78,15 @@ public:
   std::vector<Access> accesses;
 
   void VisitStmt_(const BufferStoreNode *op) final {
-    accesses.push_back({op->buffer, op->indices, /*is_write=*/true, bind_env_});
+    if (IsMemory(op->buffer, op->indices))
+      accesses.push_back(
+          {op->buffer, op->indices, /*is_write=*/true, bind_env_});
     tirx::StmtExprVisitor::VisitStmt_(op);
   }
   void VisitExpr_(const BufferLoadNode *op) final {
-    accesses.push_back(
-        {op->buffer, op->indices, /*is_write=*/false, bind_env_});
+    if (IsMemory(op->buffer, op->indices))
+      accesses.push_back(
+          {op->buffer, op->indices, /*is_write=*/false, bind_env_});
     tirx::StmtExprVisitor::VisitExpr_(op);
   }
   void VisitStmt_(const BindNode *op) final {
@@ -94,6 +109,8 @@ public:
 
 private:
   Map<Var, PrimExpr> bind_env_;
+  const pto::ParallelStorageQuery &storage_;
+  For root_;
 };
 
 // 2D layout candidate. Both dimensions are tried with their canonical mapping
@@ -119,9 +136,9 @@ std::pair<int64_t, int64_t> CheckedPaddingForInference(int64_t extent,
 }
 
 int PtoRequiredVectorDim(const For &root, const Var &iv, const Var &jv,
-                         int64_t M, int64_t N, int64_t lanes,
-                         std::string *why) {
-  PtoAccessCollector collector;
+                         int64_t M, int64_t N, int64_t lanes, std::string *why,
+                         const pto::ParallelStorageQuery &storage) {
+  PtoAccessCollector collector(storage, root);
   collector(root->body);
 
   struct Candidate {
@@ -213,7 +230,8 @@ int PtoRequiredVectorDim(const For &root, const Var &iv, const Var &jv,
 // contract (access patterns, dtype, expression whitelist) belongs to
 // VerifyParallelToPTO; the checks below are only the minimal conditions
 // needed to construct a valid layout, reported as layout-inference errors.
-Fragment InferPtoParallelLayout(const For &root, const Range &lane_bounds) {
+Fragment InferPtoParallelLayout(const For &root, const Range &lane_bounds,
+                                const ParallelStorageQuery &storage) {
   PtoParallelLoopCollector loop_collector;
   loop_collector(root);
   const Array<IterVar> &loop_vars = loop_collector.loop_vars;
@@ -280,8 +298,8 @@ Fragment InferPtoParallelLayout(const For &root, const Range &lane_bounds) {
     const Var &i_var = loop_vars[0]->var;
     const Var &j_var = loop_vars[1]->var;
     std::string candidate_why;
-    int required =
-        PtoRequiredVectorDim(root, i_var, j_var, M, N, lanes, &candidate_why);
+    int required = PtoRequiredVectorDim(root, i_var, j_var, M, N, lanes,
+                                        &candidate_why, storage);
     if (required < 0) {
       // Both candidates failed address analysis under the padded domain.
       // Report the concrete access and reason; -1 never means "no constraint".
