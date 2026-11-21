@@ -52,6 +52,68 @@ def reducer_kernel(n=257, lanes=128, dtype="float32", op="sum", seed=False, arit
     return main
 
 
+def result_consumer_kernel(mode, dtype="float32"):
+    cast_dtype = "float16" if dtype == "float32" else "float32"
+    out_dtype = cast_dtype if mode.startswith("cast") else dtype
+
+    @T.prim_func
+    def main(A: T.Tensor((384,), dtype), Out: T.Tensor((384,), out_dtype)):
+        with T.Kernel(1):
+            a = T.alloc_shared((384,), dtype)
+            out = T.alloc_shared((384,), out_dtype)
+            T.copy(A, a)
+            T.copy(Out, out)
+            with T.SimdVF(lanes=128):
+                acc = T.alloc_reducer((1,), dtype, op="sum")
+                result = T.alloc_local((1,), dtype)
+                T.reducer_init(acc)
+                for i in T.Parallel(257):
+                    T.reducer_update(acc[0], a[i])
+                T.finalize_reducer(acc, result)
+                alias = result[0]
+                alias2 = alias
+                if mode == "while_direct" or mode == "while_alias":
+                    keep = T.alloc_var("bool", init=True)
+                    while keep:
+                        if mode == "while_alias":
+                            out[0] = alias2
+                        else:
+                            out[0] = result[0]
+                        keep = False
+                elif mode == "if_result":
+                    if result[0] > 0:
+                        out[0] = T.Cast(dtype, 1)
+                elif mode == "while_result":
+                    while (alias2 > 0) & (a[0] > 0):
+                        out[0] = T.Cast(dtype, 1)
+                elif mode == "ub_condition":
+                    out[0] = result[0]
+                    if out[0] > 0:
+                        out[1] = result[0]
+                elif mode == "cast_alias":
+                    for i in T.Parallel(257):
+                        out[i] = T.Cast(cast_dtype, alias2)
+                else:
+                    for i in T.Parallel(257):
+                        out[i] = T.Cast(cast_dtype, result[0])
+            T.copy(out, Out)
+
+    return main
+
+
+@pytest.mark.parametrize("mode,wrapper", [("if_result", "If"), ("while_result", "While")])
+def test_region_condition_requires_scalar(mode, wrapper):
+    with pytest.raises(Exception, match=rf"VerifyParallelToPTO.*region-level {wrapper} condition.*depends on VMI value"):
+        _lower(result_consumer_kernel(mode))
+
+
+@pytest.mark.parametrize("dtype", ["float16", "float32"])
+@pytest.mark.parametrize("mode", ["cast_direct", "cast_alias"])
+def test_one_lane_result_cast_rejected(dtype, mode):
+    with pytest.raises(Exception, match="VerifyParallelToPTO.*casting a one-lane VMI value"):
+        _lower(result_consumer_kernel(mode, dtype))
+
+
 def _lower(f):
     target = normalize_pto_target("pto")
     with target:
@@ -76,11 +138,25 @@ def test_seed_and_one_lane_arithmetic():
 @pytest.mark.parametrize("extent", ["one", "short", "full", "tail"])
 @pytest.mark.parametrize("dtype", ["float16", "float32"])
 @pytest.mark.parametrize("op", ["sum", "max", "min"])
-def test_reducer_layout_width(lanes, extent, dtype, op):
+def test_reducer_layout_width(lanes, extent, dtype, op, monkeypatch):
+    from tilelang import tvm
+    from tilelang.layout.partial_fragment import PartialFragment
+    from testing.ascend._ir import calls, nodes
+
     n = {"one": 1, "short": 17, "full": lanes, "tail": 2 * lanes + 1}[extent]
-    assert {"sum": "vcadd", "max": "vcmax", "min": "vcmin"}[op] in _lower(
-        reducer_kernel(n=n, lanes=lanes, dtype=dtype, op=op)
-    ).kernel_source
+    stages = _capture_stages(reducer_kernel(n=n, lanes=lanes, dtype=dtype, op=op), monkeypatch)
+    vf = next(b for b in nodes(stages["AscendLayoutInference"], tvm.tirx.SBlock) if b.name_hint == "SIMD_VF")
+    (partial,) = [layout for buf, layout in vf.annotations["layout_map"].items() if "reducer" in buf.scope()]
+    assert isinstance(partial, PartialFragment) and int(partial.combine_size) == lanes
+    after = stages["VectorizeParallelToPTO"]
+    producers = {b.var: b.value for b in nodes(after, tvm.tirx.Bind)}
+    (horizontal,) = calls(after, {"sum": "tl.vmi.vcadd", "max": "tl.vmi.vcmax", "min": "tl.vmi.vcmin"}[op])
+    mask = producers[horizontal.args[1]]
+    assert mask.op.name == "tl.vmi.create_mask" and int(mask.args[0]) == lanes
+    accumulator = producers[horizontal.args[0]].buffer
+    writes = [store for store in nodes(after, tvm.tirx.BufferStore) if store.buffer.same_as(accumulator)]
+    init = producers[writes[0].value]
+    assert init.op.name == "tl.vmi.vbrc" and int(init.annotations["size"]) == lanes
 
 
 def unsupported_kernel(updates=1, arithmetic="none", seed=False):
@@ -232,11 +308,12 @@ def _capture_stages(f, monkeypatch):
     return snapshots
 
 
-def test_finalize_dataflow(monkeypatch):
+@pytest.mark.parametrize("lanes", [64, 128, 256])
+def test_finalize_dataflow(monkeypatch, lanes):
     from tilelang import tvm
     from testing.ascend._ir import calls, nodes
 
-    s = _capture_stages(reducer_kernel(seed=True, arithmetic=True), monkeypatch)
+    s = _capture_stages(reducer_kernel(lanes=lanes, seed=True, arithmetic=True), monkeypatch)
     layout_vf = next(b for b in nodes(s["AscendLayoutInference"], tvm.tirx.SBlock) if b.name_hint == "SIMD_VF")
     layouts = layout_vf.annotations["layout_map"]
     partials = [(b, layout) for b, layout in layouts.items() if "reducer" in b.scope()]
@@ -249,21 +326,21 @@ def test_finalize_dataflow(monkeypatch):
     assert len(states) == 1
     assert any(b.data.same_as(states[0]) and b.scope() == "local" for b in vf.alloc_buffers)
     final = calls(before, "tl.tileop.pto_finalize_reducer")
-    assert len(final) == 1 and [int(x) for x in final[0].annotations["plan_steps"]] == [128, 1]
+    assert len(final) == 1 and [int(x) for x in final[0].annotations["plan_steps"]] == [lanes, 1]
     assert not calls(after, "tl.tileop.pto_finalize_reducer")
     assert all("tl.pto.reducer_states" not in b.annotations for b in nodes(after, tvm.tirx.SBlock))
     binds = nodes(after, tvm.tirx.Bind)
     producer = {b.var: b.value for b in binds}
     horizontal = calls(after, "tl.vmi.vcadd")[0]
     mask = producer[horizontal.args[1]]
-    assert mask.op.name == "tl.vmi.create_mask" and int(mask.args[0]) == 128
+    assert mask.op.name == "tl.vmi.create_mask" and int(mask.args[0]) == lanes
     div = calls(after, "tl.vmi.vdiv")[0]
     one_mask = producer[div.args[2]]
     assert int(one_mask.annotations["size"]) == 1 and int(one_mask.args[0]) == 1
     div_var = next(b.var for b in binds if b.value.same_as(div))
     broadcast = next(c for c in calls(after, "tl.vmi.vbrc") if c.args[0].same_as(div_var))
     assert int(broadcast.annotations["group"]) == 1
-    assert int(broadcast.annotations["size"]) == 128
+    assert int(broadcast.annotations["size"]) == lanes
     one_stores = [c for c in calls(after, "tl.vmi.vstore") if len(c.args) == 3]
     assert len(one_stores) == 1 and int(one_stores[0].args[1].args[1]) == 1
 

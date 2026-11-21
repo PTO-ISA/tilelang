@@ -114,6 +114,25 @@ the lowering captures the condition before the write. A Bind of the old slot
 value likewise preserves a snapshot. Scalar Select arms follow the shared
 broadcast dtype rules, and external ordinary storage stays read-only.
 
+## SIMD reducer results
+
+In a PTO SIMD VF, each active logical iteration contributes once to the single
+output `acc[0]`, including when the contribution comes from a lane-private
+local. Each lane holds a partial initialized to the reduction identity. A tail
+update preserves inactive partials. Finalization combines the full VF width
+(VL 64, 128 or 256), applies any captured seed once and writes an independent
+one-lane VMI value to the result slot.
+
+A later Parallel can compute with the result in its original dtype and
+broadcast it for a full-width consumer. The shared PTO cast planner supports
+VMI casts at VL 64, 128 and 256. Casting the one-lane result or a bound alias
+to another dtype is currently unsupported, including FP16 to FP32 and FP32 to
+FP16. A store to a single UB element preserves the result dtype.
+
+A region-level `if` or `while` requires a scalar predicate. Its body can write
+the result to UB. To compare the one-lane VMI result directly, place the
+comparison inside a subsequent Parallel.
+
 ## Validation
 
 Host tests in `testing/ascend/language/pto/test_pto_parallel_private_alloc.py`

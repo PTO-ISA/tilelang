@@ -2428,6 +2428,11 @@ Optional<CastPlan> PlanValueCast(const CastNode *cast,
                     std::to_string(context.logical_lanes));
     }
   } else {
+    if (context.logical_lanes == 1) {
+      return reject(pair +
+                    ": casting a one-lane VMI value (such as a finalized "
+                    "reducer result) is unsupported");
+    }
     if (!IsVmiLogicalLaneCount(context.logical_lanes)) {
       return reject(pair +
                     ": a VMI cast context requires logical lanes "

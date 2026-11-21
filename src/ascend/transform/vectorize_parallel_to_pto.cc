@@ -341,6 +341,14 @@ private:
     ICHECK(!residual.has_direct_reduce && !residual.has_fill)
         << "[VectorizeParallelToPTO] direct tileops "
            "must be standalone Evaluate(Call) statements";
+    if (!vf_buffers_.empty()) {
+      ICHECK(!UsesVar(body,
+                      [&](const VarNode *var) {
+                        return vf_buffers_.count(GetRef<Var>(var));
+                      }))
+          << "[VectorizeParallelToPTO] lowered body still references a "
+             "replaced reducer allocation";
+    }
     auto wrap = [&](Stmt inner) {
       inner = SeqStmt::Flatten(mask_prelude_, inner);
       for (const auto &[old, replacement] : vf_buffers_) {
@@ -817,6 +825,17 @@ private:
     return StmtExprMutator::VisitStmt_(op);
   }
 
+  Stmt ConvertScopedRegion(const Stmt &body) {
+    auto saved_bind = bind_env_;
+    auto saved_values = value_map_;
+    auto saved_infos = value_infos_;
+    Stmt result = ConvertRegion(body);
+    bind_env_ = std::move(saved_bind);
+    value_map_ = std::move(saved_values);
+    value_infos_ = std::move(saved_infos);
+    return result;
+  }
+
   Stmt ConvertRegion(const Stmt &stmt) {
     struct AllocationScope {
       std::vector<Buffer> &allocations;
@@ -938,21 +957,17 @@ private:
                                   store->predicate));
       return SeqStmt::Flatten(out);
     }
+    if (const auto *loop = stmt.as<WhileNode>()) {
+      While rewritten = GetRef<While>(loop);
+      rewritten.CopyOnWrite()->body = ConvertScopedRegion(loop->body);
+      return rewritten;
+    }
     if (const auto *branch = stmt.as<IfThenElseNode>()) {
-      auto saved_bind = bind_env_;
-      auto saved_values = value_map_;
-      auto saved_infos = value_infos_;
-      Stmt yes = ConvertRegion(branch->then_case);
-      bind_env_ = saved_bind;
-      value_map_ = saved_values;
-      value_infos_ = saved_infos;
+      Stmt yes = ConvertScopedRegion(branch->then_case);
       Optional<Stmt> no;
       if (branch->else_case.defined())
-        no = ConvertRegion(branch->else_case.value());
-      bind_env_ = std::move(saved_bind);
-      value_map_ = std::move(saved_values);
-      value_infos_ = std::move(saved_infos);
-      return IfThenElse(branch->condition, yes, no);
+        no = ConvertScopedRegion(branch->else_case.value());
+      return IfThenElse(branch->condition, yes, no, branch->span);
     }
     if (const auto *block = stmt.as<SBlockNode>()) {
       auto saved_bind = bind_env_;

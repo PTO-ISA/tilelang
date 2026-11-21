@@ -133,3 +133,16 @@ def test_reducer_with_parallel_private_allocations():
     expected[:257] = a[:257] * total
     torch.testing.assert_close(result.cpu()[0], total, rtol=0, atol=0)
     torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("mode", ["while_direct", "while_alias", "ub_condition"])
+def test_result_store_in_scalar_control_flow(mode):
+    from testing.ascend.language.pto.test_pto_simd_reducer import result_consumer_kernel
+
+    kernel = tilelang.compile(result_consumer_kernel(mode), target="pto")
+    a = torch.arange(384, dtype=torch.float32) % 7
+    out = torch.full_like(a, -123).npu()
+    kernel(a.npu(), out)
+    expected = torch.full_like(a, -123)
+    expected[: 2 if mode == "ub_condition" else 1] = a[:257].sum()
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)

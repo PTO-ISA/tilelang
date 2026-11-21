@@ -23,6 +23,7 @@
  * annotation independently of any neighboring Parallel unit.
  */
 
+#include <tvm/tirx/analysis.h>
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 
@@ -1962,7 +1963,7 @@ private:
   // environment; call sites run this *before* registering new
   // definitions so lexical order is preserved (a self reference is
   // undefined too).
-  void CheckRegionExprDefined(const PrimExpr &expr, const char *what) {
+  void CheckRegionExprDefined(const PrimExpr &expr, const std::string &what) {
     PostOrderVisit(expr, [&](const ObjectRef &node) {
       if (const auto *v = node.as<VarNode>()) {
         if (defs_.count(v) == 0) {
@@ -2208,6 +2209,38 @@ private:
          "ordinary data arithmetic outside Parallel unit is unsupported");
   }
 
+  void CheckRegionCondition(const PrimExpr &condition, const char *wrapper) {
+    SetRegionContext();
+    CheckRegionExprDefined(condition, std::string("region-level ") + wrapper +
+                                          " condition");
+    if (reducers_.accumulators.empty())
+      return;
+    DataType dtype = condition.dtype();
+    if (!dtype.is_scalar() ||
+        !(dtype.is_bool() || dtype.is_int() || dtype.is_uint()))
+      Fail("control flow",
+           std::string(wrapper) + " requires a scalar integer predicate");
+    // UsesVar also visits the data Var of each BufferLoad. A UB load keeps
+    // its scalar storage identity even if a one-lane vstore wrote the value.
+    UsesVar(condition, [&](const VarNode *node) {
+      Var var = GetRef<Var>(node);
+      auto alias = region_values_.find(var);
+      auto storage = reducers_.storage_values.find(var);
+      if ((alias != region_values_.end() &&
+           alias->second.kind == pto::ValueKind::kVmi) ||
+          (storage != reducers_.storage_values.end() &&
+           storage->second.kind == pto::ValueKind::kVmi)) {
+        std::ostringstream message;
+        message
+            << "region-level " << wrapper << " condition " << condition
+            << " depends on VMI value " << var
+            << "; use a scalar predicate or compare the result inside Parallel";
+        Fail("control flow", message.str());
+      }
+      return false;
+    });
+  }
+
   void WalkRegion(const Stmt &stmt, const std::vector<For> &units,
                   int64_t lanes, size_t *next_unit) {
     // This walk does not use VisitStmt, so maintain the same allocation
@@ -2444,8 +2477,7 @@ private:
       // A Parallel under control flow is rejected by ScanPtoRegion, so
       // the branches carry plain statements only; branch-local
       // definitions must not leak to later siblings.
-      SetRegionContext();
-      CheckRegionExprDefined(ite->condition, "region-level branch condition");
+      CheckRegionCondition(ite->condition, "If");
       {
         std::set<const VarNode *> saved = defs_;
         auto saved_values = region_values_;
@@ -2463,9 +2495,7 @@ private:
       return;
     }
     if (const auto *while_node = stmt.as<WhileNode>()) {
-      SetRegionContext();
-      CheckRegionExprDefined(while_node->condition,
-                             "region-level while condition");
+      CheckRegionCondition(while_node->condition, "While");
       std::set<const VarNode *> saved = defs_;
       auto saved_values = region_values_;
       WalkRegion(while_node->body, units, lanes, next_unit);
