@@ -11,6 +11,7 @@
 #ifndef TVM_TL_ASCEND_TRANSFORM_PARALLEL_TO_PTO_UTILS_H_
 #define TVM_TL_ASCEND_TRANSFORM_PARALLEL_TO_PTO_UTILS_H_
 
+#include "../op/pto_finalize_reducer.h"
 #include "support/check.h"
 #include <tvm/arith/analyzer.h>
 #include <tvm/arith/iter_affine_map.h>
@@ -22,6 +23,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <variant>
 #include <vector>
 
@@ -47,6 +49,31 @@ namespace pto {
 /*! Explicit legacy SIMD instructions already operate on vector blocks.
  * Their containing Parallel nest retains its pre-VMI treatment. */
 bool UsesExplicitSIMD(const Stmt &stmt);
+
+// Value representation is independent of scalar-looking TIR dtypes.
+enum class ValueKind { kScalar, kVmi, kVectorVmi = kVmi };
+struct ValueInfo {
+  ValueKind kind{ValueKind::kScalar};
+  int64_t logical_lanes{1};
+};
+using ValueInfoMap =
+    std::unordered_map<Var, ValueInfo, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>;
+struct PtoReducerStates {
+  int64_t lanes{0};
+  Map<Var, Buffer> accumulators;
+  Array<PtoFinalizeReducerOp> finalizes;
+  ValueInfoMap storage_values;
+};
+PtoReducerStates CollectReducerStates(const SBlock &vf,
+                                      const ParallelStorageQuery &storage);
+int64_t AnalyzePtoFinalize(const PtoFinalizeReducerOp &op,
+                           const PtoReducerStates &states);
+Optional<Buffer> AnalyzeReducerAccess(const PtoReducerStates &states,
+                                      const Buffer &buffer,
+                                      const Array<PrimExpr> &indices,
+                                      const ParallelStorageQuery &storage,
+                                      arith::Analyzer *analyzer,
+                                      const Map<Var, PrimExpr> &bind_env = {});
 
 /*!
  * \brief Classification of one buffer access against the lane mapping.
@@ -243,15 +270,12 @@ bool IsSupportedFloat8(DataType dtype);
 /*! Value category of one value-Cast position.  The kind is supplied by the
  * caller (Verify from AnalyzeLaneUse, Vectorize from the converted input
  * shape); the planner never infers it from lanes. */
-enum class CastValueKind {
-  kScalar,
-  kVectorVmi,
-};
+using CastValueKind = ValueKind;
 
 /*! Per-Cast planning context.  `logical_lanes` is validation information
  * only; `value_kind` is the dispatch key. */
 struct CastContext {
-  CastValueKind value_kind = CastValueKind::kScalar;
+  ValueKind value_kind = ValueKind::kScalar;
   int64_t logical_lanes = 1;
 };
 
@@ -343,6 +367,8 @@ std::string LaneUseToString(LaneUse use);
  * (params / buffer data pointers / outer-scope definitions), and the
  * recursion guards of the classification walk. */
 struct LaneUseContext {
+  const ValueInfoMap *storage_values = nullptr;
+  const ValueInfoMap *value_infos = nullptr;
   const pto::ParallelStorageQuery *storage = nullptr;
   For unit;
   Var loop_var;
@@ -371,6 +397,8 @@ struct LaneUseContext {
  * vars use their recorded classification (on-demand analysis is guarded
  * by the visiting set and budget; cycles and exhaustion -> Unknown).
  * \p reason is filled on kUnknown. */
+ValueInfo AnalyzeComputeValue(const PrimExpr &expr, LaneUseContext *ctx);
+
 LaneUse AnalyzeLaneUse(const PrimExpr &expr, LaneUseContext *ctx,
                        std::string *reason);
 

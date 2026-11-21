@@ -96,7 +96,7 @@ int main() {
   CastContext vector_lane1{CastValueKind::kVectorVmi, 1};
   auto plan = PlanValueCast(widen.get(), vector_lane1, &why);
   Check(!plan.has_value() &&
-            why.find("requires logical lanes 64/128/256") != std::string::npos,
+            why.find("casting a one-lane VMI value") != std::string::npos,
         "kVectorVmi lanes=1 is rejected as VMI, never scalar: " + why);
 
   why.clear();
