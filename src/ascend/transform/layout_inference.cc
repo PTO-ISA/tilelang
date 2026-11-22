@@ -615,6 +615,14 @@ public:
       pto_loop_layouts_.Set(unit.root, layout);
     }
 
+    // A single-output PTO reducer owns one partial per SIMD lane. Each
+    // logical iteration contributes once, including when its input is a
+    // lane-private local. Finalization combines the entire lane domain.
+    for (const auto &[buffer, bounds] : pto_reducer_bounds_) {
+      layout_map.Set(buffer, PartialFragment::FullyReplicated(
+                                 buffer->shape, bounds->extent, bounds));
+    }
+
     Map<Buffer, Layout> strict_layout_map;
     int num_infer = infer_list_.size();
 
@@ -873,6 +881,14 @@ private:
     if (op->op.as<GlobalVarNode>())
       return;
 
+    // PTO finalization has an independent ordinary-local destination. Its
+    // virtual partial layout is supplied by the PTO update sites below.
+    if (InsidePtoSimdVF() && op->op.same_as(FinalizeReducerV2Op::Get())) {
+      Buffer reducer =
+          Downcast<BufferLoad>(Downcast<Call>(op->args[0])->args[0])->buffer;
+      pto_reducer_bounds_.Set(reducer, CurrentPtoLaneBounds());
+      return;
+    }
     TileOperator p;
     try {
       p = ParseOperator(GetRef<Call>(op));
@@ -1487,6 +1503,7 @@ private:
   // are solved directly from the nest and never enter infer_list_ or the
   // generic layout worklist.
   Map<For, Fragment> pto_loop_layouts_;
+  Map<Buffer, Range> pto_reducer_bounds_;
   // Per-infer-list flag: this op was collected inside a PTO SIMD_VF block.
   std::vector<bool> in_pto_simd_vf_vec_;
   // Lane bounds [0, L) captured when the op was collected (valid only when
@@ -1840,12 +1857,19 @@ private:
       if (!ContainsPtoSimdRoot(op->body)) {
         return ffi::GetRef<Stmt>(op);
       }
-      // Descend for the lane annotations; only the kLayoutMap writeback is
-      // skipped for the block itself.
+      // Publish the partial layout on the VF that owns the reducer so
+      // materialization can replace its allocation.
       bool saved_inside_pto_simd_vf = inside_pto_simd_vf_;
       inside_pto_simd_vf_ = true;
       SBlock block = Downcast<SBlock>(IRMutatorWithAnalyzer::VisitStmt_(op));
       inside_pto_simd_vf_ = saved_inside_pto_simd_vf;
+      for (const auto &buffer : block->alloc_buffers) {
+        if (IsReducerV2Buffer(buffer) && result_.layout_map.count(buffer)) {
+          block.CopyOnWrite()->annotations.Set(attr::kLayoutMap,
+                                               result_.layout_map);
+          break;
+        }
+      }
       if (block.same_as(GetRef<SBlock>(op))) {
         return ffi::GetRef<Stmt>(op);
       }

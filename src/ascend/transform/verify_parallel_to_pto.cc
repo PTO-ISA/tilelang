@@ -23,6 +23,7 @@
  * annotation independently of any neighboring Parallel unit.
  */
 
+#include <tvm/tirx/analysis.h>
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 
@@ -74,6 +75,8 @@ public:
 private:
   pto::ParallelStorageQuery storage_;
   For current_unit_;
+  pto::PtoReducerStates reducers_;
+  pto::ValueInfoMap region_values_;
 
   // Function-level pre-scan for AllocBuffer nodes carrying the
   // tirx.volatile annotation. Presence of the annotation marks the
@@ -545,7 +548,7 @@ private:
                 const pto_analysis::PtoInverseMapping &mapping,
                 const std::set<const VarNode *> &external_defs)
         : parent_(parent), loop_var_(loop_var), mapping_(mapping),
-          external_defs_(external_defs) {
+          external_defs_(external_defs), value_infos_(parent->region_values_) {
       // In a 2D unit `loop_var` is the vectorized coordinate; the
       // other one is kept as a serial loop and classifies as uniform.
       if (mapping.is_2d) {
@@ -608,9 +611,11 @@ private:
       // binds stay visible inside.
       Map<Var, PrimExpr> saved_env = bind_env_;
       Map<Var, Integer> saved_classified = classified_;
+      auto saved_values = value_infos_;
       StmtExprVisitor::VisitStmt_(op);
       bind_env_ = std::move(saved_env);
       classified_ = std::move(saved_classified);
+      value_infos_ = std::move(saved_values);
     }
     // The StmtVisitor base class already dispatches several node
     // kinds (AllocBuffer/DeclBuffer/...) so VisitStmtDefault_ alone is
@@ -813,12 +818,13 @@ private:
       // compute-value admission (whitelist, cast plans, op types,
       // references, lane classification) — the same entry as Evaluate
       // and store values.
-      pto_analysis::LaneUse use = CheckComputeValue(
+      pto::ValueInfo info = CheckComputeValue(
           op->value, "bind `" + op->var->name_hint + "` value");
       // Register only after the analysis succeeded.
       bind_env_.Set(op->var, op->value);
       classified_.Set(op->var,
-                      Integer(use == pto_analysis::LaneUse::kUniform ? 0 : 1));
+                      Integer(info.kind == pto::ValueKind::kScalar ? 0 : 1));
+      value_infos_[op->var] = info;
       StmtExprVisitor::VisitStmt_(op);
     }
     void VisitStmt_(const EvaluateNode *op) final {
@@ -836,7 +842,7 @@ private:
       auto rhs_use = CheckComputeValue(op->value, "store value");
       auto kind =
           parent_->storage_.Classify(op->buffer, parent_->current_unit_);
-      if (rhs_use == pto_analysis::LaneUse::kUniform &&
+      if (rhs_use.kind == pto::ValueKind::kScalar &&
           (kind == pto::StorageClass::kPrivate ||
            kind == pto::StorageClass::kUB))
         pto_analysis::CheckBroadcastDType(
@@ -862,6 +868,8 @@ private:
     // definition environment, classification cache and guards.
     pto_analysis::LaneUseContext MakeLaneUseContext() {
       pto_analysis::LaneUseContext ctx;
+      ctx.storage_values = &parent_->reducers_.storage_values;
+      ctx.value_infos = &value_infos_;
       ctx.storage = &parent_->storage_;
       ctx.unit = parent_->current_unit_;
       ctx.loop_var = loop_var_;
@@ -995,8 +1003,8 @@ private:
     // whitelist lets through but that is not a legal scalar computation
     // (e.g. an external vector Var) reached Vectorize through Evaluate or
     // a store. `what` is the diagnostic prefix for the position.
-    pto_analysis::LaneUse CheckComputeValue(const PrimExpr &value,
-                                            const std::string &what) {
+    pto::ValueInfo CheckComputeValue(const PrimExpr &value,
+                                     const std::string &what) {
       if (auto reason = pto_analysis::FindUnsupportedExprNode(value)) {
         parent_->Fail("expression", what + ": " + reason.value());
       }
@@ -1012,7 +1020,11 @@ private:
         oss << what << " cannot be classified: " << why;
         parent_->Fail("expression", oss.str());
       }
-      return use;
+      if (parent_->reducers_.accumulators.empty())
+        return use == pto::LaneUse::kVarying
+                   ? pto::ValueInfo{pto::ValueKind::kVmi, mapping_.lanes}
+                   : pto::ValueInfo{};
+      return pto::AnalyzeComputeValue(value, &ctx);
     }
 
     /*! The two-operand value nodes, one shared recursion shape: both
@@ -1405,6 +1417,12 @@ private:
           } else {
             context.value_kind = pto_analysis::CastValueKind::kVectorVmi;
             context.logical_lanes = parent_->mapping_.lanes;
+            if (!parent_->parent_->reducers_.accumulators.empty() &&
+                !indexed_offset_) {
+              auto ctx = parent_->MakeLaneUseContext();
+              context.logical_lanes =
+                  pto::AnalyzeComputeValue(op->value, &ctx).logical_lanes;
+            }
           }
           std::string why;
           auto plan = pto_analysis::PlanValueCast(op, context, &why);
@@ -1440,6 +1458,18 @@ private:
       // check is repeated here, next to the access it belongs to.
       if (predicate.defined()) {
         CheckDefinedVars(predicate.value());
+      }
+      if (pto::AnalyzeReducerAccess(parent_->reducers_, buffer, indices,
+                                    parent_->storage_, &analyzer_, bind_env_)
+              .defined())
+        return;
+      if (parent_->reducers_.storage_values.count(buffer->data)) {
+        parent_->storage_.ResolveSlot(buffer, indices, &analyzer_, bind_env_);
+        if (is_write)
+          parent_->Fail(
+              "memory access",
+              "PTO reducer result/seed cannot be written inside Parallel");
+        return;
       }
       auto kind = parent_->storage_.Classify(buffer, parent_->current_unit_);
       if (kind == pto::StorageClass::kPrivate ||
@@ -1554,6 +1584,7 @@ private:
     // Classification recorded at each Bind definition
     // (0 = uniform, 1 = varying) for this unit.
     Map<Var, Integer> classified_;
+    pto::ValueInfoMap value_infos_;
     // The lexical definition snapshot at the unit's position —
     // params, buffer data pointers, and every definition (outer loop
     // vars, thread_extent bindings, binds, allocations) that is in scope
@@ -1752,6 +1783,10 @@ private:
     current_lanes_ = lanes;
     SetRegionContext(); // refresh the region context with the lane count
 
+    auto saved_reducers = reducers_;
+    auto saved_values = region_values_;
+    reducers_ = pto::CollectReducerStates(GetRef<SBlock>(op), storage_);
+    region_values_.clear();
     // Region-level checks across the whole converting region.
     RegionVisitor region_visitor(this);
     region_visitor(region);
@@ -1771,6 +1806,8 @@ private:
         << "[VerifyParallelToPTO] internal error: region walk and unit "
            "scan disagree on the unit count";
     defs_ = std::move(saved);
+    reducers_ = std::move(saved_reducers);
+    region_values_ = std::move(saved_values);
   }
 
   // ------------------------------------------------------------------
@@ -1926,7 +1963,7 @@ private:
   // environment; call sites run this *before* registering new
   // definitions so lexical order is preserved (a self reference is
   // undefined too).
-  void CheckRegionExprDefined(const PrimExpr &expr, const char *what) {
+  void CheckRegionExprDefined(const PrimExpr &expr, const std::string &what) {
     PostOrderVisit(expr, [&](const ObjectRef &node) {
       if (const auto *v = node.as<VarNode>()) {
         if (defs_.count(v) == 0) {
@@ -2143,6 +2180,67 @@ private:
     admission(body);
   }
 
+  pto::ValueInfo CheckRegionInput(const PrimExpr &value) {
+    using pto::ValueKind;
+    if (value.as<IntImmNode>() || value.as<FloatImmNode>())
+      return {};
+    if (const auto *var = value.as<VarNode>()) {
+      auto it = region_values_.find(GetRef<Var>(var));
+      return it == region_values_.end() ? pto::ValueInfo{} : it->second;
+    }
+    if (const auto *load = value.as<BufferLoadNode>()) {
+      if (load->predicate.defined() && !is_one(load->predicate.value()))
+        Fail("memory access", "region-level predicated load is unsupported");
+      auto kind = storage_.Classify(load->buffer);
+      if (kind == pto::StorageClass::kExternal)
+        storage_.ResolveSlot(load->buffer, load->indices, &analyzer_);
+      else if (kind != pto::StorageClass::kUB)
+        Fail("memory access", "unsupported region-level source storage");
+      auto it = reducers_.storage_values.find(load->buffer->data);
+      if (it != reducers_.storage_values.end()) {
+        if (it->second.logical_lanes != 1)
+          Fail("expression",
+               "VL-lane reducer state cannot be a region-level input");
+        return it->second;
+      }
+      return {};
+    }
+    Fail("expression",
+         "ordinary data arithmetic outside Parallel unit is unsupported");
+  }
+
+  void CheckRegionCondition(const PrimExpr &condition, const char *wrapper) {
+    SetRegionContext();
+    CheckRegionExprDefined(condition, std::string("region-level ") + wrapper +
+                                          " condition");
+    if (reducers_.accumulators.empty())
+      return;
+    DataType dtype = condition.dtype();
+    if (!dtype.is_scalar() ||
+        !(dtype.is_bool() || dtype.is_int() || dtype.is_uint()))
+      Fail("control flow",
+           std::string(wrapper) + " requires a scalar integer predicate");
+    // UsesVar also visits the data Var of each BufferLoad. A UB load keeps
+    // its scalar storage identity even if a one-lane vstore wrote the value.
+    UsesVar(condition, [&](const VarNode *node) {
+      Var var = GetRef<Var>(node);
+      auto alias = region_values_.find(var);
+      auto storage = reducers_.storage_values.find(var);
+      if ((alias != region_values_.end() &&
+           alias->second.kind == pto::ValueKind::kVmi) ||
+          (storage != reducers_.storage_values.end() &&
+           storage->second.kind == pto::ValueKind::kVmi)) {
+        std::ostringstream message;
+        message
+            << "region-level " << wrapper << " condition " << condition
+            << " depends on VMI value " << var
+            << "; use a scalar predicate or compare the result inside Parallel";
+        Fail("control flow", message.str());
+      }
+      return false;
+    });
+  }
+
   void WalkRegion(const Stmt &stmt, const std::vector<For> &units,
                   int64_t lanes, size_t *next_unit) {
     // This walk does not use VisitStmt, so maintain the same allocation
@@ -2179,11 +2277,13 @@ private:
         CheckRegionExprDefined(for_node->step.value(), "serial loop step");
       }
       std::set<const VarNode *> saved = defs_;
+      auto saved_values = region_values_;
       defs_.insert(for_node->loop_var.get());
       analyzer_.Bind(for_node->loop_var,
                      Range::FromMinExtent(for_node->min, for_node->extent));
       WalkRegion(for_node->body, units, lanes, next_unit);
       defs_ = std::move(saved);
+      region_values_ = std::move(saved_values);
       return;
     }
     if (const auto *assertion = stmt.as<AssertStmtNode>()) {
@@ -2217,13 +2317,21 @@ private:
       // The body is a nested statement scope.
       {
         std::set<const VarNode *> saved = defs_;
+        auto saved_values = region_values_;
+        auto saved_versions = buffer_versions_;
+        if (attr->attr_key == "tl.buffer_version")
+          for (const auto &[data, count] : Downcast<Map<Var, int>>(attr->node))
+            buffer_versions_.Set(data, count);
         WalkRegion(attr->body, units, lanes, next_unit);
+        buffer_versions_ = std::move(saved_versions);
         defs_ = std::move(saved);
+        region_values_ = std::move(saved_values);
       }
       return;
     }
     if (const auto *block = stmt.as<SBlockNode>()) {
       std::set<const VarNode *> saved = defs_;
+      auto saved_values = region_values_;
       for (const auto &iv : block->iter_vars) {
         defs_.insert(iv->var.get());
       }
@@ -2233,10 +2341,12 @@ private:
       }
       WalkRegion(block->body, units, lanes, next_unit);
       defs_ = std::move(saved);
+      region_values_ = std::move(saved_values);
       return;
     }
     if (const auto *realize = stmt.as<SBlockRealizeNode>()) {
       std::set<const VarNode *> saved = defs_;
+      auto saved_values = region_values_;
       for (const auto &iv : realize->block->iter_vars) {
         defs_.insert(iv->var.get());
       }
@@ -2246,6 +2356,7 @@ private:
       }
       WalkRegion(realize->block->body, units, lanes, next_unit);
       defs_ = std::move(saved);
+      region_values_ = std::move(saved_values);
       return;
     }
     if (const auto *bind = stmt.as<BindNode>()) {
@@ -2272,6 +2383,8 @@ private:
              "lowering inside SIMD_VF; put the casts directly in T.fill or "
              "use a lane-varying T.Parallel value");
       }
+      if (!reducers_.accumulators.empty())
+        region_values_[bind->var] = CheckRegionInput(bind->value);
       defs_.insert(bind->var.get());
       return;
     }
@@ -2292,6 +2405,41 @@ private:
     if (const auto *store = stmt.as<BufferStoreNode>()) {
       SetRegionContext();
       CheckRegionExprDefined(store->value, "region-level store value");
+      if (!reducers_.accumulators.empty()) {
+        auto info = CheckRegionInput(store->value);
+        if (store->predicate.defined() && !is_one(store->predicate.value()))
+          Fail("memory access", "region-level predicated store is unsupported");
+        auto kind = storage_.Classify(store->buffer);
+        if (kind != pto::StorageClass::kExternal &&
+            kind != pto::StorageClass::kUB)
+          Fail("memory access", "unsupported region-level destination storage");
+        auto data = store->buffer->data;
+        if (reducers_.accumulators.count(data)) {
+          bool identity = false;
+          for (const auto &site : reducers_.finalizes)
+            if (site->accumulator->buffer->data.same_as(data))
+              identity |= StructuralEqual()(
+                  store->value,
+                  ReducerV2Identity(site->op, store->buffer->dtype));
+          if (!identity)
+            Fail("reducer", "accumulator initialization must use its identity");
+        } else {
+          bool seed = false;
+          for (const auto &site : reducers_.finalizes)
+            seed |= site->seed.defined() &&
+                    site->seed.value()->buffer->data.same_as(data);
+          if (seed)
+            reducers_.storage_values[data] = info;
+          else if (info.kind == pto::ValueKind::kVmi &&
+                   !reducers_.storage_values.count(data) &&
+                   store->buffer.scope() != "shared" &&
+                   store->buffer.scope() != "shared.dyn")
+            Fail("reducer", "one-lane result requires a VMI destination");
+        }
+        if (store->buffer.scope() == "local" ||
+            store->buffer.scope() == "local.var")
+          storage_.ResolveSlot(store->buffer, store->indices, &analyzer_);
+      }
       for (const auto &idx : store->indices) {
         CheckRegionExprDefined(idx, "region-level store index");
       }
@@ -2318,6 +2466,9 @@ private:
           } catch (const pto_analysis::PtoAnalysisError &error) {
             Fail("fill/clear", error.what());
           }
+        } else if (!reducers_.accumulators.empty() &&
+                   !call->op.same_as(PtoFinalizeReducerOp::Get())) {
+          CheckRegionInput(eval->value);
         }
       }
       return;
@@ -2326,27 +2477,30 @@ private:
       // A Parallel under control flow is rejected by ScanPtoRegion, so
       // the branches carry plain statements only; branch-local
       // definitions must not leak to later siblings.
-      SetRegionContext();
-      CheckRegionExprDefined(ite->condition, "region-level branch condition");
+      CheckRegionCondition(ite->condition, "If");
       {
         std::set<const VarNode *> saved = defs_;
+        auto saved_values = region_values_;
         WalkRegion(ite->then_case, units, lanes, next_unit);
         defs_ = std::move(saved);
+        region_values_ = std::move(saved_values);
       }
       if (ite->else_case.defined()) {
         std::set<const VarNode *> saved = defs_;
+        auto saved_values = region_values_;
         WalkRegion(ite->else_case.value(), units, lanes, next_unit);
         defs_ = std::move(saved);
+        region_values_ = std::move(saved_values);
       }
       return;
     }
     if (const auto *while_node = stmt.as<WhileNode>()) {
-      SetRegionContext();
-      CheckRegionExprDefined(while_node->condition,
-                             "region-level while condition");
+      CheckRegionCondition(while_node->condition, "While");
       std::set<const VarNode *> saved = defs_;
+      auto saved_values = region_values_;
       WalkRegion(while_node->body, units, lanes, next_unit);
       defs_ = std::move(saved);
+      region_values_ = std::move(saved_values);
       return;
     }
   }
