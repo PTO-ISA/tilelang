@@ -1474,13 +1474,12 @@ Buffer MakeTypedOwnerView(const Buffer &owner, DataType access_dtype,
                 {}, owner->span);
 }
 
-void ValidateDtypeChangingView(arith::Analyzer *analyzer,
-                               const AccessAddress &address,
+void ValidateDtypeChangingView(arith::Analyzer *analyzer, const Buffer &view,
                                const Buffer &owner,
                                const PrimExpr &typed_extent,
                                const std::string &op_name, const Span &span) {
   DataType owner_dtype = owner->dtype;
-  DataType access_dtype = address.buffer->dtype;
+  DataType access_dtype = view->dtype;
   if (!IsByteAddressableIndexedType(owner_dtype) ||
       !IsByteAddressableIndexedType(access_dtype)) {
     Fail(op_name + " supports dtype-changing indexed views only for scalar "
@@ -1495,18 +1494,10 @@ void ValidateDtypeChangingView(arith::Analyzer *analyzer,
          span);
   }
   if (std::optional<std::string> stability =
-          OwnerCapacityStabilityReason(address.buffer)) {
+          OwnerCapacityStabilityReason(view)) {
     Fail(op_name + " dtype-changing view " + stability.value(), span);
   }
-  if (std::optional<std::string> tight =
-          OwnerTightReason(analyzer, address.buffer)) {
-    Fail(op_name + " dtype-changing view is not usable: " + tight.value(),
-         span);
-  }
-
-  PrimExpr view_extent = OwnerExtent(analyzer, address.buffer, op_name, span);
-  Array<PrimExpr> view_origin =
-      address.buffer.OffsetOf(BufferZeros(address.buffer));
+  Array<PrimExpr> view_origin = view.OffsetOf(BufferZeros(view));
   if (view_origin.size() != 1 ||
       !RepresentableInInt64(analyzer, view_origin[0])) {
     Fail(op_name + " requires a single, value-preserving scalar origin for a "
@@ -1514,6 +1505,52 @@ void ValidateDtypeChangingView(arith::Analyzer *analyzer,
          span);
   }
   PrimExpr origin64 = WidenToInt64(view_origin[0]);
+  auto tight = OwnerTightReason(analyzer, view);
+  if (tight && owner_dtype.bits() == access_dtype.bits() &&
+      !view->strides.empty()) {
+    // Prove the physical footprint in owner elements. Debit each axis from
+    // the remaining capacity only after proving the product fits.
+    auto range_error = [&]() {
+      Fail(op_name + " dtype-changing view range is not provably contained in "
+                     "the allocation owner",
+           span);
+    };
+    if (view->strides.size() != view->shape.size() ||
+        !analyzer->CanProve(origin64 >= 0) ||
+        !analyzer->CanProve(origin64 < typed_extent)) {
+      range_error();
+    }
+    PrimExpr remaining = analyzer->Simplify(typed_extent - 1 - origin64);
+    for (size_t dim = 0; dim < view->shape.size(); ++dim) {
+      const PrimExpr &length = view->shape[dim];
+      const PrimExpr &stride = view->strides[dim];
+      if (!RepresentableInInt64(analyzer, length) ||
+          !RepresentableInInt64(analyzer, stride) ||
+          !analyzer->CanProve(length > 0) || !analyzer->CanProve(stride >= 0) ||
+          !ScanExpressionStability(stride, StableOwnerCapacityNode)
+               .first_unstable_type.empty()) {
+        range_error();
+      }
+      PrimExpr steps = analyzer->Simplify(WidenToInt64(length) - 1);
+      if (analyzer->CanProveEqual(steps, 0) ||
+          analyzer->CanProveEqual(stride, 0)) {
+        continue;
+      }
+      PrimExpr pitch = WidenToInt64(stride);
+      if (!analyzer->CanProve(steps > 0) ||
+          !analyzer->CanProve(pitch <= FloorDiv(remaining, steps))) {
+        range_error();
+      }
+      remaining = analyzer->Simplify(remaining - steps * pitch);
+    }
+    return;
+  }
+  if (tight) {
+    Fail(op_name + " dtype-changing view is not usable: " + tight.value(),
+         span);
+  }
+
+  PrimExpr view_extent = OwnerExtent(analyzer, view, op_name, span);
   if (!analyzer->CanProve(origin64 >= 0) ||
       !analyzer->CanProve(origin64 <= typed_extent) ||
       !analyzer->CanProve(view_extent <= typed_extent - origin64)) {
@@ -1550,8 +1587,8 @@ IndexedOwner ValidateIndexedOwner(arith::Analyzer *analyzer,
   PrimExpr typed_extent =
       ConvertOwnerCapacity(analyzer, owner_storage.extent, owner->dtype,
                            address.buffer->dtype, op_name, span);
-  ValidateDtypeChangingView(analyzer, address, owner, typed_extent, op_name,
-                            span);
+  ValidateDtypeChangingView(analyzer, address.buffer, owner, typed_extent,
+                            op_name, span);
   Buffer typed_owner =
       MakeTypedOwnerView(owner, address.buffer->dtype, typed_extent);
   return {typed_owner, IntImm(address.buffer->shape[0].dtype(), 0),
@@ -2200,13 +2237,21 @@ IndexedMemoryOwner GetIndexedMemoryOwner(
   }
   ValidateUbBuffer(source, context + " source", span);
   ValidateUbBuffer(owner, context + " owner", span);
-  if (source->dtype != owner->dtype) {
-    std::ostringstream oss;
-    oss << context << " requires the source element dtype " << source->dtype
-        << " to match the owner element dtype " << owner->dtype;
-    Fail(oss.str(), span);
+  IndexedMemoryOwner storage =
+      ValidateIndexedOwnerStorage(analyzer, owner, context, span);
+  if (source->dtype == owner->dtype) {
+    return storage;
   }
-  return ValidateIndexedOwnerStorage(analyzer, owner, context, span);
+  if (source->dtype.bits() != owner->dtype.bits()) {
+    Fail(context + " requires the indexed view and allocation owner to have "
+                   "the same element width",
+         span);
+  }
+  // Same-width views retain the owner's element offsets and capacity.
+  ValidateDtypeChangingView(analyzer, source, owner, storage.extent, context,
+                            span);
+  storage.buffer = MakeTypedOwnerView(owner, source->dtype, storage.extent);
+  return storage;
 }
 
 void CheckIndexedMemoryBase(const IndexedMemoryOwner &owner,

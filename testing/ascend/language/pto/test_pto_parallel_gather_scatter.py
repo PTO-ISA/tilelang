@@ -952,3 +952,83 @@ def test_native16_address_arithmetic_keeps_wide_intermediates(kind, payload_dtyp
     additions = calls(mod, "tl.vmi.vadd")
     assert additions and all(str(call.dtype) == "int32x128" for call in additions)
     assert calls(mod, "tl.vmi.vcvt"), "adding the view origin must not wrap in 16-bit arithmetic"
+
+
+@pytest.mark.pto
+@pytest.mark.parametrize("owner_dtype,access_dtype", [("float32", "uint32"), ("bfloat16", "uint16"), ("float32", "uint16")])
+def test_indexed_view_element_width(owner_dtype, access_dtype):
+    view_size = 512 if (owner_dtype, access_dtype) == ("float32", "uint16") else 256
+
+    @T.prim_func
+    def kernel(A: T.Tensor((256,), owner_dtype), B: T.Tensor((256,), owner_dtype)):
+        with T.Kernel(1):
+            a = T.alloc_shared((256,), owner_dtype)
+            b = T.alloc_shared((256,), owner_dtype)
+            src = T.view(a, (view_size,), access_dtype)
+            dst = T.view(b, (view_size,), access_dtype)
+            T.copy(A, a)
+            T.copy(B, b)
+            with T.SimdVF(lanes=64):
+                for i in T.Parallel(64):
+                    dst[4 * i + 2] = src[4 * i + 1]
+            T.copy(b, B)
+
+    if view_size != 256:
+        with pytest.raises(Exception, match="same element width"):
+            lower_case("indexed_mixed_width", kernel)
+        return
+
+    artifact, captured = lower_case("indexed_view_" + access_dtype, kernel)
+    after = captured["VectorizeParallelToPTO_after"]
+    for name, pointer_index in (("vgather", 0), ("vscatter", 1)):
+        (operation,) = calls(after, "tl.vmi." + name)
+        descriptor = operation.args[pointer_index]
+        assert str(descriptor.args[0].dtype) == access_dtype
+        assert int(descriptor.args[1]) == 256
+        instruction = next(line for line in artifact.kernel_source.splitlines() if "pto.vmi." + name + "(" in line)
+        assert f'pto.ptr(pto.{access_dtype.replace("uint", "ui")}, "ub")' in instruction
+
+
+@pytest.mark.pto
+@pytest.mark.parametrize(
+    "owner_dtype,access_dtype,pitch,origin,valid",
+    [
+        ("float32", "uint32", 4, 0, True),
+        ("bfloat16", "uint16", 4, 0, True),
+        ("float32", "uint32", 5, 0, False),
+        ("float32", "uint32", 4, 4, True),
+        ("float32", "uint32", 4, 5, False),
+    ],
+)
+def test_indexed_strided_view_range(owner_dtype, access_dtype, pitch, origin, valid):
+    capacity = 260 if origin else 256
+
+    @T.prim_func
+    def kernel(A: T.Tensor((capacity,), owner_dtype), B: T.Tensor((capacity,), owner_dtype)):
+        with T.Kernel(1):
+            a = T.alloc_shared((capacity,), owner_dtype)
+            b = T.alloc_shared((capacity,), owner_dtype)
+            if origin:
+                src = tvm.tirx.decl_buffer((4, 64), access_dtype, data=a.data, strides=(1, pitch), elem_offset=origin)
+                dst = tvm.tirx.decl_buffer((4, 64), access_dtype, data=b.data, strides=(1, pitch), elem_offset=origin)
+            else:
+                src = T.view(a, (4, 64), access_dtype, strides=(1, pitch))
+                dst = T.view(b, (4, 64), access_dtype, strides=(1, pitch))
+            T.copy(A, a)
+            T.copy(B, b)
+            with T.SimdVF(lanes=64):
+                for i in T.Parallel(64):
+                    dst[2, i] = src[1, i]
+            T.copy(b, B)
+
+    if not valid:
+        with pytest.raises(Exception, match="view range is not provably contained"):
+            lower_case("indexed_strided_view_oob", kernel)
+        return
+    _, captured = lower_case("indexed_strided_view", kernel)
+    after = captured["VectorizeParallelToPTO_after"]
+    for name, pointer_index in (("vgather", 0), ("vscatter", 1)):
+        (operation,) = calls(after, "tl.vmi." + name)
+        descriptor = operation.args[pointer_index]
+        assert str(descriptor.args[0].dtype) == access_dtype
+        assert int(descriptor.args[1]) == capacity
