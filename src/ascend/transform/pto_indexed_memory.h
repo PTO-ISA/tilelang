@@ -29,7 +29,7 @@ struct IndexedMemoryOwner {
 };
 
 /*! Resolve the unique active allocation and validate its UB scope, element
- * type, dense physical layout and stable capacity. Source may be a same-dtype
+ * type, dense physical layout and stable capacity. Source may be a same-width
  * view. The environment contains lexical allocations active at this point,
  * never a function-wide collection of every buffer sharing the data Var. */
 IndexedMemoryOwner
