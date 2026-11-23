@@ -53,6 +53,12 @@ enum class ReducerV2OpType : int {
   kBitXor = 5,
 };
 
+/*! \brief Supported accumulator types for PTO SIMD reducers. */
+inline bool IsSupportedPtoReducerDType(ReducerV2OpType op, DataType dtype) {
+  return dtype == DataType::Float(16) || dtype == DataType::Float(32) ||
+         (op == ReducerV2OpType::kMax && dtype == DataType::UInt(32));
+}
+
 /*! \brief Parse a reducer combine-op string
  *  ("sum"/"max"/"min"/"bitand"/"bitor"/"bitxor"). */
 ReducerV2OpType ParseReducerV2OpType(const ffi::String &op_str);

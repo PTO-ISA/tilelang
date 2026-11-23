@@ -129,6 +129,42 @@ def test_reducer_codegen(dtype, op):
     assert "pto.vmi.vsel" in source
 
 
+@pytest.mark.parametrize("seed", [False, True])
+def test_uint32_max_reducer_codegen(seed, monkeypatch):
+    from tilelang import tvm
+    from testing.ascend._ir import calls, nodes
+
+    kernel = reducer_kernel(n=65, lanes=64, dtype="uint32", op="max", seed=seed)
+    after = _capture_stages(kernel, monkeypatch)["VectorizeParallelToPTO"]
+    binds = nodes(after, tvm.tirx.Bind)
+    (compare,) = calls(after, "tl.vmi.vcmp")
+    assert [str(arg.dtype) for arg in compare.args[:2]] == ["uint32x64", "uint32x64"]
+    (horizontal,) = calls(after, "tl.vmi.vcmax")
+    assert str(horizontal.args[0].dtype) == "uint32x64"
+    assert int(horizontal.annotations["group"]) == 1
+    result = next(bind.var for bind in binds if bind.value.same_as(horizontal))
+    combines = calls(after, "tl.vmi.vmax")
+    if seed:
+        (combine,) = combines
+        assert combine.args[0].same_as(result)
+        assert [str(arg.dtype) for arg in combine.args[:2]] == ["uint32", "uint32"]
+        seed_broadcast = next(bind.value for bind in binds if bind.var.same_as(combine.args[1]))
+        assert seed_broadcast.op.name == "tl.vmi.vbrc"
+        seed_load = next(bind.value for bind in binds if bind.var.same_as(seed_broadcast.args[0]))
+        seed_store = next(store for store in nodes(after, tvm.tirx.BufferStore) if store.buffer.same_as(seed_load.buffer))
+        assert int(seed_store.value) == 7
+        result = next(bind.var for bind in binds if bind.value.same_as(combine))
+    else:
+        assert not combines
+    assert any(store.value.same_as(result) for store in nodes(after, tvm.tirx.BufferStore))
+
+
+@pytest.mark.parametrize("op", ["sum", "min"])
+def test_uint32_other_reducer_ops_rejected(op):
+    with pytest.raises(Exception, match="PTO reducer requires float16/float32 or uint32 with max"):
+        _lower(reducer_kernel(dtype="uint32", op=op))
+
+
 def test_seed_and_one_lane_arithmetic():
     source = _lower(reducer_kernel(seed=True, arithmetic=True)).kernel_source
     assert "pto.vmi.vdiv" in source

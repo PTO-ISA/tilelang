@@ -42,8 +42,8 @@ int64_t AnalyzePtoFinalize(const PtoFinalizeReducerOp &op,
          op->plan_steps[0]->value == states.lanes &&
          op->plan_steps[1]->value == 1)
       << "PTO reducer supports only plan_steps=[VL,1]";
-  ICHECK(acc->dtype == DataType::Float(16) || acc->dtype == DataType::Float(32))
-      << "PTO reducer requires float16/float32";
+  ICHECK(IsSupportedPtoReducerDType(op->op, acc->dtype))
+      << "PTO reducer requires float16/float32 or uint32 with max";
   auto check = [&](const BufferRegion &region) {
     auto b = region->buffer;
     ICHECK(b.scope() == "local")
