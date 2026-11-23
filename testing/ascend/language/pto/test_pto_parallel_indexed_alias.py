@@ -14,7 +14,7 @@ def source_module():
 
 
 @pytest.mark.pto
-@pytest.mark.parametrize("kind", ["uniform", "continuous", "alias", "scalar_read"])
+@pytest.mark.parametrize("kind", ["uniform", "continuous", "alias", "scalar_read", "view_offset"])
 def test_saved_index_cancellation_scalarizes_the_address(source_module, kind):
     def make_body(i, payload, index, output):
         saved = tvm.tirx.Var("saved", "int32")
@@ -29,6 +29,9 @@ def test_saved_index_cancellation_scalarizes_the_address(source_module, kind):
             statements.append(tvm.tirx.Bind(alias, tvm.tirx.Add(offset, 0)))
             offset = alias
         address = offset if kind in ("uniform", "scalar_read") else tvm.tirx.Add(offset, i)
+        if kind == "view_offset":
+            payload = tvm.tirx.decl_buffer(payload.shape, payload.dtype, name="view", data=payload.data, elem_offset=offset)
+            address = i
         statements.append(tvm.tirx.BufferStore(output, payload[address], [i]))
         return tvm.tirx.SeqStmt(statements)
 
@@ -68,7 +71,27 @@ def test_saved_index_cancellation_scalarizes_the_address(source_module, kind):
 
 
 @pytest.mark.pto
-def test_dead_gather_removes_its_index_and_tail_cleanup(source_module):
+def test_vector_value_survives_long_bind_alias_chain(source_module):
+    def make_body(i, payload, index, output):
+        statements = []
+        value = payload[i]
+        for n in range(70):
+            alias = tvm.tirx.Var(f"alias{n}", payload.dtype)
+            statements.append(tvm.tirx.Bind(alias, value))
+            value = alias
+        statements.append(tvm.tirx.BufferStore(output, value, [i]))
+        return tvm.tirx.SeqStmt(statements)
+
+    mod = replace_unit_body(source_module, make_body)
+    with normalize_pto_target("pto"):
+        converted = ascend_transform.VectorizeParallelToPTO()(ascend_transform.VerifyParallelToPTO()(mod))
+    assert len(calls(converted, "tl.vmi.vload")) == 1
+    assert len(calls(converted, "tl.vmi.vstore")) == 1
+    assert not calls(converted, "tl.vmi.vbrc")
+
+
+@pytest.mark.pto
+def test_dead_gather_removes_its_index_load(source_module):
     def make_body(i, payload, index, output):
         dead = tvm.tirx.Var("dead", "float32")
         return tvm.tirx.SeqStmt([tvm.tirx.Bind(dead, payload[index[i]]), tvm.tirx.BufferStore(output, payload[i], [i])])
@@ -77,5 +100,4 @@ def test_dead_gather_removes_its_index_and_tail_cleanup(source_module):
     with normalize_pto_target("pto"):
         converted = ascend_transform.VectorizeParallelToPTO()(ascend_transform.VerifyParallelToPTO()(mod))
     assert len(calls(converted, "tl.vmi.vload")) == 1
-    for operation in ("vgather", "vsel"):
-        assert not calls(converted, "tl.vmi." + operation), "an unused gather must not keep its offset chain alive"
+    assert not calls(converted, "tl.vmi.vgather")

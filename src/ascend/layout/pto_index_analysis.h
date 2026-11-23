@@ -56,7 +56,7 @@ bool IsSupportedAddressExpr(const PrimExpr &expr);
  * which gather/scatter index loads and indexed payloads may come. */
 bool IsOrdinaryUbScope(const std::string &scope);
 
-/*! Scalar 16- or 32-bit integer — the required element type of loaded index
+/*! Scalar 8-, 16- or 32-bit integer — the required element type of loaded index
  * values and emitted element offsets. */
 bool IsPtoIndexDType(DataType dtype);
 
@@ -67,23 +67,7 @@ bool IsPtoIndexDType(DataType dtype);
 bool IsPtoScalarCoordinate(const PrimExpr &expr, const Var &vector_var,
                            const ffi::Map<Var, PrimExpr> &bind_env);
 
-/*! Address classification shared by lane-layout selection and consumers. */
-enum class PtoAddressPattern { kContinuous, kLaneUniform, kIndexed };
-
-struct PtoAddressAnalysis {
-  /*! Source offset, suitable for value conversion at the source program point.
-   * Coordinate aliases are expanded; loaded Bind values retain their identity.
-   */
-  PrimExpr original_offset;
-  /*! Uniform-axis base candidate and span of lane-varying logical axes. */
-  PrimExpr scalar_base_offset;
-  PrimExpr relative_extent;
-  /*! Source indices before ElemOffset inserts its own integer promotions. */
-  ffi::Array<PrimExpr> source_indices;
-  ffi::Array<PrimExpr> indices_after_inverse;
-  ffi::Array<PrimExpr> start_indices;
-  PtoAddressPattern pattern;
-};
+struct MemoryAccess;
 
 /*! Prove an integer coordinate is uniform within the canonical lane/chunk
  * domain. Loaded Bind definitions retain the same SSA symbols as address
@@ -96,21 +80,31 @@ bool IsPtoLaneUniform(const PrimExpr &expr, const tirx::Var &vector_var,
                       const ffi::Optional<tirx::Var> &kept_var,
                       int64_t kept_extent, const Map<Var, PrimExpr> &bind_env);
 
+struct PtoInverseMapping;
+
+/*! Check that the planned offset has a supported scalar/VMI expression
+ * lowering under the selected lane mapping. */
+void CheckPtoIndexedOffsetExpr(const PrimExpr &offset, const Var &vector_var,
+                               const PtoInverseMapping &mapping,
+                               const Map<Var, PrimExpr> &bind_env);
+
+/*! View metadata used by the physical address at this access. */
+ffi::Array<PrimExpr> PtoAddressMetadata(const tirx::Buffer &buffer,
+                                        const ffi::Array<PrimExpr> &indices);
+
 /*! Analyze one access under a canonical inverse lane mapping. Loaded values
  * receive analysis-only symbols whose lane dependence follows their defining
  * access, so a varying loaded Bind can never masquerade as a uniform base.
  * These symbols never enter the returned expressions or generated TIR.
- * Index arithmetic without a supported value lowering is rejected only when
- * the access needs indexed lowering; existing scalar/continuous paths retain
- * their coordinate arithmetic support.
+ * Indexed offset encoding is checked separately by PlanPtoIndexedAccess.
  */
-PtoAddressAnalysis AnalyzePtoAddress(
-    const tirx::Buffer &buffer, const ffi::Array<PrimExpr> &indices,
-    const tirx::Var &vector_var, const PrimExpr &inverse_index,
-    const tirx::Var &lane_var, const tirx::Var &chunk_var, int64_t lanes,
-    int64_t chunk_count, const ffi::Optional<tirx::Var> &kept_var,
-    int64_t kept_extent, const Map<Var, PrimExpr> &bind_env,
-    arith::Analyzer *analyzer);
+MemoryAccess
+AnalyzePtoAddress(const tirx::Buffer &buffer,
+                  const ffi::Array<PrimExpr> &indices, bool is_write,
+                  const Var &vector_var, const PrimExpr &inverse_index,
+                  const Var &lane_var, const Var &chunk_var, int64_t lanes,
+                  int64_t chunk_count, const Optional<Var> &kept_var,
+                  int64_t kept_extent, const Map<Var, PrimExpr> &bind_env);
 
 /*! Compute the padded fragment-input extent P = ceil(E / lanes) * lanes with
  * the shared overflow guard. The final execution space is int32-bounded

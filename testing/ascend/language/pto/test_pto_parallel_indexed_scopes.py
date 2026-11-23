@@ -1,18 +1,11 @@
 """Lexical allocation-owner visibility for automatic indexed Parallel access."""
 
-import importlib.util
-from pathlib import Path
-
 import pytest
 
 from tilelang import tvm
 import tilelang.ascend.language as T
 
-_spec = importlib.util.spec_from_file_location(
-    "pto_indexed_scope_contract", Path(__file__).with_name("test_pto_parallel_gather_scatter.py")
-)
-gs = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(gs)
+import test_pto_parallel_gather_scatter as gs
 
 
 @T.prim_func

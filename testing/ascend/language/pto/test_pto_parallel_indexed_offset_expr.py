@@ -2,7 +2,7 @@
 
 import pytest
 
-from test_pto_parallel_gather_scatter import ascend_transform, calls, indexed_kernel, lower_case, tvm
+from test_pto_parallel_gather_scatter import ascend_transform, assert_vector_axis, calls, indexed_kernel, lower_case, tvm
 from test_pto_parallel_indexed_control_flow import replace_unit_body
 from tilelang.ascend.target import normalize_pto_target
 import tilelang.ascend.language as T
@@ -88,7 +88,7 @@ def test_metadata_index_reads_keep_their_own_admission_rules(source_module, kind
 
     mod = replace_unit_body(source_module, make_body)
     diagnostic = (
-        "non-trivial access predicate"
+        "access predicate that is not provably true"
         if kind == "predicate"
         else "requires gather.*Select true value|unsupported indexed offset node.*Select"
     )
@@ -206,11 +206,10 @@ def varying_floor_offset_kernel(kind):
     ["gather_floordiv", "gather_floormod", "gather_chunk_floordiv", "stride_floormod"],
 )
 def test_varying_floor_offsets_are_rejected_without_adaptation(kind):
-    # The failing address belongs to a load nested in the store value, so the
-    # diagnostic must name that buffer instead of blaming the value itself.
+    # The address diagnostic identifies the payload buffer of the failing load.
     with pytest.raises(
         Exception,
-        match=r"nested access to buffer .+: unsupported indexed offset node tirx.Floor(Div|Mod)",
+        match=r"memory access: buffer `(?:x|view)`: unsupported indexed offset node tirx.Floor(Div|Mod)",
     ):
         lower_case(f"rejected_floor_{kind}", varying_floor_offset_kernel(kind))
 
@@ -264,3 +263,27 @@ def test_scalar_floor_coordinates_stay_scalar_in_indexed_offsets(kind):
     broadcasts = calls(converted, "tl.vmi.vbrc")
     assert len(broadcasts) == 1, "the scalar floor coordinate is broadcast once"
     assert str(broadcasts[0].args[0].dtype) == "int32", "the floor coordinate stays a scalar"
+
+
+@T.prim_func
+def chunk_division_offset(A: T.Tensor((512,), "int32"), I: T.Tensor((256,), "int32"), C: T.Tensor((4, 256), "int32")):
+    with T.Kernel(1):
+        x = T.alloc_shared((512,), "int32")
+        idx = T.alloc_shared((256,), "int32")
+        y = T.alloc_shared((4, 256), "int32")
+        T.copy(A, x)
+        T.copy(I, idx)
+        with T.SimdVF(lanes=128):
+            for i, j in T.Parallel(4, 256):
+                y[i, j] = x[idx[j] + T.truncdiv(j, 128)]
+        T.copy(y, C)
+
+
+@pytest.mark.pto
+def test_candidate_rejects_integer_division_with_a_vector_operand():
+    _, captured = lower_case("chunk_division_offset", chunk_division_offset)
+    assert_vector_axis(captured["VerifyParallelToPTO_before"], 0)
+    converted = captured["VectorizeParallelToPTO_after"]
+    assert len(calls(converted, "tl.vmi.vscatter")) == 1
+    assert not calls(converted, "tl.vmi.vgather")
+    assert not calls(converted, "tl.vmi.vdiv")

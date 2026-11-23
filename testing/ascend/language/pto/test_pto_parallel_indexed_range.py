@@ -3,7 +3,8 @@
 import pytest
 
 import tilelang.ascend.language as T
-from test_pto_parallel_gather_scatter import assert_vector_axis, calls, lower_case
+from tilelang import tvm
+from test_pto_parallel_gather_scatter import assert_vector_axis, binding_values, calls, lower_case
 
 
 def b16_transposed_index_kernel(force_scatter=False):
@@ -62,11 +63,19 @@ def affine_b16_scatter_kernel(extent=150, stride=2, origin=1, output_size=512):
     return main
 
 
+AFFINE_B16_SCATTER_CASES = [
+    (150, 2, 1, 512),
+    (128, 512, 511, 65536),
+    (128, 512, 512, 65544),
+    (127, 516, 519, 65536),
+    (255, 258, 3, 65536),
+    (128, 2, 0, 70000),
+    (150, 512, 1, 76800),
+]
+
+
 @pytest.mark.pto
-@pytest.mark.parametrize(
-    "extent,stride,origin,output_size",
-    [(150, 2, 1, 512), (128, 512, 511, 65536), (127, 516, 519, 65536), (255, 258, 3, 65536), (128, 2, 0, 70000)],
-)
+@pytest.mark.parametrize("extent,stride,origin,output_size", AFFINE_B16_SCATTER_CASES)
 def test_affine_b16_offsets_use_uint16_from_the_coordinate_seed(extent, stride, origin, output_size):
     artifact, captured = lower_case("affine_b16_range", affine_b16_scatter_kernel(extent, stride, origin, output_size))
     converted = captured["VectorizeParallelToPTO_after"]
@@ -75,15 +84,17 @@ def test_affine_b16_offsets_use_uint16_from_the_coordinate_seed(extent, stride, 
     assert all(str(call.dtype) == "uint16x128" for call in calls(converted, "tl.vmi.vci"))
     assert not calls(converted, "tl.vmi.vcvt")
     assert "pto.vmi.vcvt(" not in artifact.kernel_source
+    assert not calls(converted, "tl.vmi.vsel")
     if extent % 128:
-        assert len(calls(converted, "tl.vmi.vsel")) == 1, "inactive tail offsets must still be sanitized"
+        mask = binding_values(converted)[scatter[0].args[4]]
+        assert mask.op.name == "tl.vmi.create_mask" and isinstance(mask.args[0], tvm.tirx.BufferLoad)
 
 
 @pytest.mark.pto
 def test_affine_b16_offset_above_uint16_range_is_rejected():
-    # The last active offset is 65536, one beyond the unsigned 16-bit limit.
+    # The first and last active lanes are exactly 65536 elements apart.
     with pytest.raises(Exception, match="ui16 relative window|implicit narrowing|representable"):
-        lower_case("affine_b16_out_of_range", affine_b16_scatter_kernel(128, 512, 512, 65544))
+        lower_case("affine_b16_out_of_range", affine_b16_scatter_kernel(3, 32768, 0, 65544))
 
 
 @T.prim_func

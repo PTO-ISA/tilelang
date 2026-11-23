@@ -2,10 +2,12 @@
  * \file parallel_to_pto_utils.h
  * \brief Shared read-only analysis helpers for PTO Parallel vectorization.
  *
- * VerifyParallelToPTO consumes these helpers to check the input contract;
- * VectorizeParallelToPTO re-runs the same analysis to build its VMI code.
- * Keeping one implementation guarantees the two passes classify the same
- * access identically.
+ * VerifyParallelToPTO proves owner legality and access-plan admission.
+ * VectorizeParallelToPTO resolves the current owner objects and reconstructs
+ * descriptors; address planning uses the same lexical facts as verification.
+ * LegalizeParallelToPTO must preserve allocation scope, data, dtype, shape,
+ * strides, storage offsets and coordinate bounds between these passes. A
+ * legalization that changes those premises must verify its result again.
  */
 
 #ifndef TVM_TL_ASCEND_TRANSFORM_PARALLEL_TO_PTO_UTILS_H_
@@ -20,6 +22,7 @@
 #include <tvm/tirx/stmt.h>
 
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
@@ -32,7 +35,6 @@
 #include "../target_utils.h"
 #include "ascend/layout/pto_index_analysis.h"
 #include "ascend/layout/pto_parallel_layout.h"
-#include "pto_indexed_memory.h"
 
 namespace tvm {
 namespace tl {
@@ -46,34 +48,22 @@ using ffi::Optional;
 
 namespace pto {
 
+/*! Scope the analyzer to a For body, including symbolic min and extent. */
+class ScopedPtoLoopBounds {
+public:
+  ScopedPtoLoopBounds(arith::Analyzer *&analyzer, const For &loop);
+  ~ScopedPtoLoopBounds();
+
+private:
+  arith::Analyzer *&active_;
+  arith::Analyzer *outer_;
+  std::unique_ptr<arith::Analyzer> inner_;
+  With<arith::ConstraintContext> constraints_;
+};
+
 /*! Explicit legacy SIMD instructions already operate on vector blocks.
  * Their containing Parallel nest retains its pre-VMI treatment. */
 bool UsesExplicitSIMD(const Stmt &stmt);
-
-// Value representation is independent of scalar-looking TIR dtypes.
-enum class ValueKind { kScalar, kVmi, kVectorVmi = kVmi };
-struct ValueInfo {
-  ValueKind kind{ValueKind::kScalar};
-  int64_t logical_lanes{1};
-};
-using ValueInfoMap =
-    std::unordered_map<Var, ValueInfo, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>;
-struct PtoReducerStates {
-  int64_t lanes{0};
-  Map<Var, Buffer> accumulators;
-  Array<PtoFinalizeReducerOp> finalizes;
-  ValueInfoMap storage_values;
-};
-PtoReducerStates CollectReducerStates(const SBlock &vf,
-                                      const ParallelStorageQuery &storage);
-int64_t AnalyzePtoFinalize(const PtoFinalizeReducerOp &op,
-                           const PtoReducerStates &states);
-Optional<Buffer> AnalyzeReducerAccess(const PtoReducerStates &states,
-                                      const Buffer &buffer,
-                                      const Array<PrimExpr> &indices,
-                                      const ParallelStorageQuery &storage,
-                                      arith::Analyzer *analyzer,
-                                      const Map<Var, PrimExpr> &bind_env = {});
 
 /*!
  * \brief Classification of one buffer access against the lane mapping.
@@ -101,30 +91,22 @@ std::string AccessPatternToString(AccessPattern pattern);
  */
 struct MemoryAccess {
   Buffer buffer;
-  DataType elem_dtype;
   bool is_write = false;
 
   /*! Source element offset; convert at the current source program point. */
   PrimExpr original_offset;
-  /*! Uniform-axis base candidate; source coordinates and loaded SSA preserved.
-   */
-  PrimExpr scalar_base_offset;
-  /*! Conservative nonnegative span of lane-varying logical axes. */
-  PrimExpr relative_extent;
   /*! Unflattened source indices, preserving explicit casts. */
   Array<PrimExpr> source_indices;
-  /*! indices_after_inverse: buffer indices with the inverse-mapped logical
-   * coordinates (lane appears via the lane Var in one index). */
-  Array<PrimExpr> indices_after_inverse;
   /*! indices with lane bound to 0: the start element of this vector access.
    */
   Array<PrimExpr> start_indices;
   AccessPattern pattern = AccessPattern::kUnknown;
-};
 
-// PtoAnalysisError, SubstituteVar, ResolveIndexAliases and
-// IsSupportedAddressExpr live in pto_index_analysis.h (included above) so
-// PTO lane-layout planning and the consumers here share one implementation.
+  bool RequiresIndexedInstruction() const {
+    return pattern == AccessPattern::kIndexed ||
+           (is_write && pattern == AccessPattern::kLaneUniform);
+  }
+};
 
 /*!
  * \brief The inverse lane mapping of a 1D PTO parallel loop.
@@ -172,19 +154,17 @@ struct PtoInverseMapping {
   /*! Vectorized dimension: true selects the inner (j) dim. */
   bool select_inner = true;
 
-  /*! The loop variable substituted into addresses (the vectorized one). */
-  const VarNode *vector_var() const {
+  /*! The original loop variable kept as a serial loop in a 2D unit. */
+  Optional<Var> SerialVar() const {
     if (!is_2d) {
-      return nullptr; // 1D: the caller passes the single loop var
+      return {};
     }
-    return select_inner ? inner_var.get() : outer_var.get();
+    return select_inner ? outer_var : inner_var;
   }
-  /*! The loop variable kept as a serial loop (2D only). */
-  const VarNode *serial_var() const {
-    if (!is_2d) {
-      return nullptr;
-    }
-    return select_inner ? outer_var.get() : inner_var.get();
+
+  /*! Extent of the kept serial loop, or zero for a 1D unit. */
+  int64_t SerialExtent() const {
+    return is_2d ? (select_inner ? outer_extent : inner_extent) : 0;
   }
 };
 
@@ -203,7 +183,7 @@ PtoInverseMapping InvertPtoLaneLayout(const For &loop);
  *
  * The helper resolves bind aliases, substitutes
  * loop_var -> chunk * L + lane_var, computes ElemOffset, and proves the
- * access pattern with the analyzer over the full lane range (continuous:
+ * access pattern over the full lane range (continuous:
  * data_offset == start_offset + lane as an identity; lane-uniform: the
  * offset does not depend on lane). Returns a fully populated MemoryAccess
  * or throws PtoAnalysisError with a reason. */
@@ -211,43 +191,97 @@ MemoryAccess AnalyzeBufferAccess(const Buffer &buffer,
                                  const Array<PrimExpr> &indices, bool is_write,
                                  const Var &loop_var,
                                  const PtoInverseMapping &mapping,
-                                 arith::Analyzer *analyzer,
                                  const Map<Var, PrimExpr> &bind_env = {});
 
-/*! Remove only ElemOffset's widening of a native source index. Explicit
- * source casts and flattened address arithmetic retain their original width.
- * Throws when the resulting offset would need implicit narrowing. */
-PrimExpr PreparePtoIndexedOffset(const MemoryAccess &access,
-                                 const PrimExpr &relative);
+/*! The existing allocation described by an indexed access. Resolving an owner
+ * does not allocate, copy or initialize storage. */
+struct IndexedMemoryOwner {
+  Buffer buffer;
+  PrimExpr origin;
+  PrimExpr extent;
+};
 
-/*! Scalar instruction base and vector element offsets in source coordinates.
- * Verify checks these expressions; Vectorize only maps them to the emitted
- * chunk loop and converts their scalar/vector values. */
+/*! Shared UB descriptor primitives for the explicit VMI legalization path. */
+void ValidateUbBuffer(const Buffer &buffer, const std::string &op_name,
+                      const Span &span);
+Array<PrimExpr> BufferZeros(const Buffer &buffer);
+std::string BufferContext(const Buffer &buffer);
+PrimExpr MakeDescriptor(const Buffer &buffer, const Array<PrimExpr> &starts,
+                        const PrimExpr &extent, int rw_mask);
+bool RepresentableInInt64(arith::Analyzer *analyzer, const PrimExpr &value);
+PrimExpr WidenToInt64(const PrimExpr &value);
+
+struct ExpressionStabilityScan {
+  bool has_load = false;
+  bool has_call = false;
+  std::string first_unstable_type;
+};
+
+bool StableIndexedAddressNode(const ObjectRef &node);
+ExpressionStabilityScan
+ScanExpressionStability(const PrimExpr &expr,
+                        bool (*is_stable)(const ObjectRef &));
+
+/*! Prove the physical owner's tight layout and stable capacity. */
+IndexedMemoryOwner CheckIndexedAllocationStorage(arith::Analyzer *analyzer,
+                                                 const Buffer &owner,
+                                                 const std::string &op_name,
+                                                 const Span &span);
+
+/*! Prove a dtype-changing view lies within the allocation. */
+void CheckIndexedTypedView(arith::Analyzer *analyzer, const Buffer &view,
+                           const Buffer &owner, const PrimExpr &typed_extent,
+                           const std::string &op_name, const Span &span);
+
+/*! Find the unique active allocation sharing the source buffer's data Var. */
+Buffer FindAllocationOwner(const std::vector<Buffer> &active_allocations,
+                           const Buffer &source, const std::string &op_name,
+                           const Span &span = Span());
+
+/*! Check that an allocation can describe a same-width Parallel access. */
+IndexedMemoryOwner CheckIndexedMemoryOwner(const Buffer &source,
+                                           const Buffer &owner,
+                                           arith::Analyzer *analyzer,
+                                           const std::string &context,
+                                           const Span &span = Span());
+
+/*! Reconstruct the current owner's origin and capacity after Verify. The
+ * descriptor uses allocation-time shape Vars, regardless of analyzer facts at
+ * the access. Vectorize recomputes the offset encoding from those lexical facts
+ * while reusing Verify's owner storage proof across LegalizeParallelToPTO. */
+IndexedMemoryOwner DescribeIndexedMemoryOwner(const Buffer &source,
+                                              const Buffer &owner);
+
+/*! Build a whole-owner may-access descriptor. Scatter does not assert dense or
+ * unconditional write coverage through this descriptor. */
+PrimExpr MakeIndexedMemoryDescriptor(const IndexedMemoryOwner &owner,
+                                     bool is_write,
+                                     const Optional<PrimExpr> &version = {},
+                                     const Optional<PrimExpr> &extent = {});
+
+/*! Scalar instruction base and vector element offsets. The base may reference
+ * the mapping's chunk variable. Generated uint16 coordinates may additionally
+ * reference its lane variable. Loaded indices retain their source expressions.
+ */
 struct PtoIndexedAccessPlan {
   PrimExpr base;
   PrimExpr offsets;
-  bool rebased = false;
+  /*! Address offsets are relative to this physical version slot, when present.
+   */
+  Optional<PrimExpr> version_index;
+  PrimExpr descriptor_extent;
   /*! Generate proved coordinate arithmetic directly with uint16 VMI values. */
-  bool uint16_offsets = false;
+  bool generate_uint16_offsets = false;
 };
 
-/*! Select the scalar base and vector offset encoding shared by Verify and
- * Vectorize. Checks any required offset narrowing without rewriting source
- * indices or evaluating saved loads again. */
-PtoIndexedAccessPlan PlanPtoIndexedAccess(const MemoryAccess &access,
-                                          const IndexedMemoryOwner &owner,
-                                          const Var &loop_var,
-                                          const PtoInverseMapping &mapping,
-                                          arith::Analyzer *analyzer);
-
-/*! Verify the plan's B16 base using the caller's lexical facts in a
- * cloned analyzer. Chunk/kept bounds never enter the pass-wide analyzer.
- * Vectorize consumes verified plans without repeating these range proofs. */
-void CheckPtoIndexedAccessPlan(const PtoIndexedAccessPlan &plan,
-                               const IndexedMemoryOwner &owner,
-                               const Var &loop_var,
-                               const PtoInverseMapping &mapping,
-                               arith::Analyzer *analyzer);
+/*! Select a legal scalar base and vector offset encoding for layout
+ * inference, Verify and Vectorize without rewriting source indices or
+ * evaluating saved loads again. */
+PtoIndexedAccessPlan PlanPtoIndexedAccess(
+    const MemoryAccess &access, const IndexedMemoryOwner &owner,
+    const Var &loop_var, const PtoInverseMapping &mapping,
+    arith::Analyzer *analyzer, const Map<Var, int> &buffer_versions = {},
+    const Map<Var, PrimExpr> &bind_env = {});
 
 /*! Check whether a dtype is supported by the unified element
  * addressing convention: the buffer element dtype itself must not carry
@@ -266,6 +300,52 @@ void CheckBroadcastDType(DataType dtype, const std::string &context);
  * admitting a type here means its conversion directions were validated, not
  * just that a target name exists. */
 bool IsSupportedFloat8(DataType dtype);
+
+/*! Logical value representation. One-lane VMI values retain register
+ * provenance even though their TIR dtype has one lane. */
+enum class ValueKind { kUnknown, kScalar, kOneLaneVmi, kVectorVmi };
+
+struct ValueInfo {
+  ValueKind kind = ValueKind::kUnknown;
+  int64_t logical_lanes = 0;
+
+  static ValueInfo Vmi(DataType dtype);
+  static ValueInfo Vmi(int64_t lanes);
+
+  bool IsVmi() const {
+    return kind == ValueKind::kOneLaneVmi || kind == ValueKind::kVectorVmi;
+  }
+};
+
+using ValueInfoMap =
+    std::unordered_map<Var, ValueInfo, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>;
+
+/*! Classify a value emitted by Parallel conversion. Bound variables carry
+ * their producer's representation, including one-lane register results. */
+ValueInfo GetValueInfo(const PrimExpr &value, const ValueInfoMap &bindings);
+
+enum class WidthAdaptation { kKeep, kBroadcastScalar, kBroadcastOneLane };
+
+/*! Adapt only scalar or one-lane values to a consumer's logical width.
+ * Arbitrary vector resizing requires an explicit future conversion rule. */
+WidthAdaptation PlanWidthAdaptation(const ValueInfo &value, int64_t lanes);
+
+struct PtoReducerStates {
+  int64_t lanes{0};
+  Map<Var, Buffer> accumulators;
+  Array<PtoFinalizeReducerOp> finalizes;
+  ValueInfoMap storage_values;
+};
+PtoReducerStates CollectReducerStates(const SBlock &vf,
+                                      const ParallelStorageQuery &storage);
+int64_t AnalyzePtoFinalize(const PtoFinalizeReducerOp &op,
+                           const PtoReducerStates &states);
+Optional<Buffer> AnalyzeReducerAccess(const PtoReducerStates &states,
+                                      const Buffer &buffer,
+                                      const Array<PrimExpr> &indices,
+                                      const ParallelStorageQuery &storage,
+                                      arith::Analyzer *analyzer,
+                                      const Map<Var, PrimExpr> &bind_env = {});
 
 /*! Value category of one value-Cast position.  The kind is supplied by the
  * caller (Verify from AnalyzeLaneUse, Vectorize from the converted input
@@ -362,7 +442,7 @@ enum class LaneUse {
 std::string LaneUseToString(LaneUse use);
 
 /*! Analysis context for AnalyzeLaneUse: the unit's loop var, inverse
- * mapping and analyzer, the bind-definition environment, a cache of
+ * mapping, the bind-definition environment, a cache of
  * already-classified bind vars, the set of known external scalar vars
  * (params / buffer data pointers / outer-scope definitions), and the
  * recursion guards of the classification walk. */
@@ -371,12 +451,9 @@ struct LaneUseContext {
   const ValueInfoMap *value_infos = nullptr;
   const pto::ParallelStorageQuery *storage = nullptr;
   For unit;
-  Var loop_var;
-  /*! In a 2D unit the coordinate of the non-vectorized dimension
-   * is a uniform scalar at the program point. Unset for 1D. */
-  Var serial_var;
-  PtoInverseMapping mapping;
   arith::Analyzer *analyzer = nullptr;
+  Var loop_var;
+  PtoInverseMapping mapping;
   Map<Var, PrimExpr> bind_env;
   Map<Var, Integer> classified; // bind var -> 0 uniform / 1 varying
   /*! Known external scalar vars: vars outside the unit that are

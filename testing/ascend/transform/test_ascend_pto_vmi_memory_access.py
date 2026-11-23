@@ -814,6 +814,15 @@ def test_indexed_dtype_view_requires_exact_dynamic_capacity_conversion():
 
 
 @pytest.mark.pto
+def test_indexed_view_requires_integer_instruction_base():
+    owner = _buffer((256,), name="owner")
+    view = tirx.decl_buffer((128,), "float32", data=owner.data, scope="shared", elem_offset=tirx.FloatImm("float32", 0.5))
+    call = _vgather(_load(view, [_int(0)]))
+    with pytest.raises(tvm.error.InternalError, match="requires a scalar integer instruction offset"):
+        _run(_sblock(_evaluate(call), owner))
+
+
+@pytest.mark.pto
 def test_indexed_owner_extent_is_int64_and_preserves_source_types():
     offsets = _vec("offsets", "uint32")
     mask = _mask("mask")

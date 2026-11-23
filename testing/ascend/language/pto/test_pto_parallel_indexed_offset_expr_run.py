@@ -5,6 +5,7 @@ import torch
 
 from test_pto_parallel_gather_scatter_run import _run, npu as _npu
 from test_pto_parallel_indexed_offset_expr import (
+    chunk_division_offset,
     nested_b16_rebased_gather_kernel,
     scalar_floor_coordinate_kernel,
     scalar_select_coordinate_cast_kernel,
@@ -67,3 +68,13 @@ def test_scalar_floor_coordinate_gather_numerics(npu):
         expected,
         npu,
     )
+
+
+@pytest.mark.pto
+def test_chunk_division_offset_numerics(npu):
+    source = torch.arange(512, dtype=torch.int32) - 123
+    columns = torch.arange(256)
+    index = (columns * 37 + 11) % 256
+    output = torch.full((4, 256), -777, dtype=torch.int32)
+    expected = source[index + columns // 128].expand(4, 256).contiguous()
+    _run("chunk_division_offset", chunk_division_offset, [source, index.to(torch.int32), output], expected, npu)

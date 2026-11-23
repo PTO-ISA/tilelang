@@ -1,23 +1,18 @@
 """Automatic indexed memory admission, owner descriptors, and scheduling."""
 
-import importlib.util
-from pathlib import Path
-
 import pytest
 
 import tilelang.ascend.language as T
 from tilelang import tvm
 from testing.ascend.auto_schedule._reuse_utils import _insert_sync_alias_pairs
 
-_spec = importlib.util.spec_from_file_location("indexed_contract_gs", Path(__file__).with_name("test_pto_parallel_gather_scatter.py"))
-gs = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(gs)
+import test_pto_parallel_gather_scatter as gs
 
 
 @pytest.mark.pto
 @pytest.mark.parametrize(
     "payload,index,diagnostic",
-    [("int64", "int32", "element dtype int64"), ("float32", "int64", "element dtype int64"), ("float32", "int8", "16-bit or 32-bit")],
+    [("int64", "int32", "element dtype int64"), ("float32", "int64", "element dtype int64")],
 )
 def test_automatic_indexed_type_limits(payload, index, diagnostic):
     with pytest.raises(Exception, match=diagnostic):

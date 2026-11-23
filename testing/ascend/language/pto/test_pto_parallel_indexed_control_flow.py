@@ -1,8 +1,8 @@
 """Reject conditional indexed accesses in source TIR before legalization.
 
 Construct units at the Verify boundary so earlier simplification cannot erase
-Select/If/predicate operands. PR2 lowering is not present on this branch;
-continuous control-flow neighbors retain their existing unsupported diagnostic.
+Select/If/predicate operands. Continuous control flow and unconditional
+indexed accesses can still pass verification.
 """
 
 import pytest
@@ -127,7 +127,7 @@ def test_select_does_not_protect_indexed_reads(source_module, location):
 
 @pytest.mark.pto
 @pytest.mark.parametrize("kind", ["load", "store", "uniform_store", "predicate_read", "nested_index"])
-def test_access_predicate_reports_conditional_indexed_access(source_module, kind):
+def test_nontrivial_access_predicate_is_rejected(source_module, kind):
     def make_body(i, payload, index, output):
         if kind == "load":
             value = tvm.tirx.BufferLoad(payload, [index[i]], predicate=i < 150)
@@ -143,9 +143,8 @@ def test_access_predicate_reports_conditional_indexed_access(source_module, kind
     with pytest.raises(Exception) as error:
         verify_body(source_module, make_body)
     message = str(error.value)
-    assert "[VerifyParallelToPTO] control flow:" in message
-    assert "access predicate" in message
-    assert f"requires {'scatter' if kind in ('store', 'uniform_store') else 'gather'}" in message
+    buffer = "x" if kind == "load" else "y"
+    assert f"buffer `{buffer}` carries an access predicate that is not provably true" in message
 
 
 @pytest.mark.pto
@@ -165,13 +164,11 @@ def test_unconditional_gather_keeps_its_execution_position(source_module, kind):
             store = tvm.tirx.BufferStore(output, saved, [i], predicate=i < 150)
         return tvm.tirx.SeqStmt([bind, store])
 
-    with pytest.raises(Exception) as error:
+    if kind == "predicate":
+        with pytest.raises(Exception, match="access predicate that is not provably true"):
+            verify_body(source_module, make_body)
+    else:
         verify_body(source_module, make_body)
-    message = str(error.value)
-    assert "[VerifyParallelToPTO] control flow:" not in message
-    assert {"branch": "conditional branches", "select": "Select", "scatter_value_select": "Select", "predicate": "access predicate"}[
-        kind
-    ] in message
 
 
 @pytest.mark.pto
@@ -189,13 +186,12 @@ def test_continuous_control_flow_keeps_existing_contract(source_module, kind):
             value = tvm.tirx.Select(i < 150, payload[i], tvm.tirx.FloatImm("float32", 0))
         return tvm.tirx.BufferStore(output, value, [i])
 
-    with pytest.raises(Exception) as error:
+    if kind in ("predicate", "unsupported_call"):
+        diagnostic = "access predicate that is not provably true" if kind == "predicate" else "unsupported Call"
+        with pytest.raises(Exception, match=diagnostic):
+            verify_body(source_module, make_body)
+    else:
         verify_body(source_module, make_body)
-    message = str(error.value)
-    assert "[VerifyParallelToPTO] control flow:" not in message
-    assert {"branch": "conditional branches", "select": "Select", "predicate": "access predicate", "unsupported_call": "unsupported Call"}[
-        kind
-    ] in message
 
 
 @pytest.mark.pto
@@ -231,10 +227,11 @@ def test_conditional_context_does_not_spread_to_unconditional_accesses(source_mo
         )
         return tvm.tirx.SeqStmt([branch, access])
 
-    with pytest.raises(Exception) as error:
+    if kind == "saved_index_in_select":
+        with pytest.raises(Exception, match="unsupported indexed offset node"):
+            verify_body(source_module, make_body)
+    else:
         verify_body(source_module, make_body)
-    assert "[VerifyParallelToPTO] control flow:" not in str(error.value)
-    assert ("unsupported indexed offset node" if kind == "saved_index_in_select" else "conditional branches") in str(error.value)
 
 
 @pytest.mark.pto
@@ -245,6 +242,18 @@ def test_branch_local_index_alias_is_used_for_access_classification(source_modul
         return tvm.tirx.IfThenElse(i < 150, body, None)
 
     with pytest.raises(Exception, match="buffer `x` load.*requires gather.*IfThenElse then"):
+        verify_body(source_module, make_body)
+
+
+@pytest.mark.pto
+@pytest.mark.parametrize("continuous", [True, False])
+def test_predicated_read_in_view_origin_is_checked_for_scalar_addresses(source_module, continuous):
+    def make_body(i, payload, index, output):
+        origin = tvm.tirx.BufferLoad(index, [0], predicate=i < 150)
+        view = tvm.tirx.decl_buffer(payload.shape, payload.dtype, data=payload.data, elem_offset=origin)
+        return tvm.tirx.BufferStore(output, view[i if continuous else 0], [i])
+
+    with pytest.raises(Exception, match=r"buffer `idx` carries an access predicate that is not provably true"):
         verify_body(source_module, make_body)
 
 

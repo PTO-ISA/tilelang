@@ -6,7 +6,6 @@ are compiled from scalar T.Parallel programs; no hand-written VMI substitution.
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -17,9 +16,7 @@ import torch_npu  # noqa: F401
 
 import tilelang
 
-_spec = importlib.util.spec_from_file_location("pto_parallel_gs_contract", Path(__file__).with_name("test_pto_parallel_gather_scatter.py"))
-gs = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(gs)
+import test_pto_parallel_gather_scatter as gs
 
 
 @pytest.fixture(scope="module")
@@ -159,6 +156,30 @@ def test_design_kernel_numerics(name, npu):
 
 
 @pytest.mark.pto
+@pytest.mark.parametrize("kind", ["gather", "scatter"])
+def test_padded_version_indexed_numerics(kind, npu):
+    gather = kind == "gather"
+    x = torch.arange(4 * (264 if gather else 128), dtype=torch.float32).reshape(4, -1)
+    idx = (torch.arange(128).unsqueeze(0) * 37 + torch.arange(4).unsqueeze(1) * 17 + 256) % 257
+    output = torch.full((4, 128 if gather else 264), -1.0)
+    if gather:
+        expected = x.gather(1, idx)
+    else:
+        expected = output.clone()
+        expected.scatter_(1, idx, x)
+    _run(f"padded_version_{kind}", gs.padded_version_kernel(kind), [x, idx.to(torch.int32), output], expected, npu)
+
+
+@pytest.mark.pto
+def test_padded_version_view_gather_uses_shifted_slot(npu):
+    values = torch.arange(264, dtype=torch.float32)
+    source = torch.stack((values, values + 1000))
+    idx = _permutation(128)
+    output = torch.full((128,), -1.0)
+    _run("shifted_slot_view", gs.padded_version_view_gather(257), [source, idx.to(torch.int32), output], source[1, idx], npu)
+
+
+@pytest.mark.pto
 def test_transpose_with_continuous_load_and_indexed_store(npu):
     source = _payload(1024).reshape(4, 256)
     output = torch.full((256, 4), 211.0)
@@ -209,10 +230,15 @@ def test_dtype_width_tail_and_canary(kind, dtype, lanes, npu):
     padded = 2 * lanes
     owner = max(256, padded)
     torch_dtype = getattr(torch, dtype)
+    index_dtype = torch.int16 if dtype in ("float16", "bfloat16", "int16", "uint16") else torch.int32
     x = _payload(owner, torch_dtype)
     idx = _permutation(padded)
-    if kind == "gather":
-        idx[extent:] = -1
+    # Inactive offsets may lie outside the allocation. For scatter, also
+    # target one in-bounds canary that no active lane writes.
+    canary_index = idx[-1].item()
+    idx[extent:] = -1 if index_dtype == torch.int16 else 0x3FFF0000
+    if kind == "scatter":
+        idx[-1] = canary_index
     out = torch.full((owner,), 211, dtype=torch_dtype)
     expected = out.to(torch.int64)
     if kind == "gather":
@@ -222,7 +248,7 @@ def test_dtype_width_tail_and_canary(kind, dtype, lanes, npu):
     _run(
         f"{kind}_{dtype}_{lanes}_tail",
         gs.indexed_kernel(kind, dtype, lanes, extent),
-        [x, idx.to(torch.int16 if dtype in ("float16", "bfloat16", "int16", "uint16") else torch.int32), out],
+        [x, idx.to(index_dtype), out],
         expected.to(torch_dtype),
         npu,
     )
