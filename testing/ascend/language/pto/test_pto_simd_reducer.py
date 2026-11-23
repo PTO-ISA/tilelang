@@ -8,7 +8,7 @@ from tilelang.engine.lower import lower
 pytestmark = pytest.mark.pto
 
 
-def reducer_kernel(n=257, lanes=128, dtype="float32", op="sum", seed=False, arithmetic=False, conditional=False, private=False):
+def reducer_kernel(n=257, lanes=128, dtype="float32", op="sum", seed=False, arithmetic=False, conditional=False, private=False, uniform=False):
     padded = (n + lanes - 1) // lanes * lanes
 
     @T.prim_func
@@ -37,7 +37,7 @@ def reducer_kernel(n=257, lanes=128, dtype="float32", op="sum", seed=False, arit
                         if a[i] > T.Cast(dtype, 0):
                             T.reducer_update(acc[0], a[i])
                     else:
-                        T.reducer_update(acc[0], a[i])
+                        T.reducer_update(acc[0], a[0 if uniform else i])
                 T.finalize_reducer(acc, result)
                 alias = result[0]
                 out[0] = alias
@@ -130,24 +130,26 @@ def test_reducer_codegen(dtype, op):
 
 
 @pytest.mark.parametrize("seed", [False, True])
-def test_uint32_max_reducer_codegen(seed, monkeypatch):
+@pytest.mark.parametrize("dtype", ["int32", "uint32"])
+@pytest.mark.parametrize("op", ["min", "max"])
+def test_integer_extrema_reducer_codegen(seed, dtype, op, monkeypatch):
     from tilelang import tvm
     from testing.ascend._ir import calls, nodes
 
-    kernel = reducer_kernel(n=65, lanes=64, dtype="uint32", op="max", seed=seed)
+    kernel = reducer_kernel(n=65, lanes=64, dtype=dtype, op=op, seed=seed)
     after = _capture_stages(kernel, monkeypatch)["VectorizeParallelToPTO"]
     binds = nodes(after, tvm.tirx.Bind)
     (compare,) = calls(after, "tl.vmi.vcmp")
-    assert [str(arg.dtype) for arg in compare.args[:2]] == ["uint32x64", "uint32x64"]
-    (horizontal,) = calls(after, "tl.vmi.vcmax")
-    assert str(horizontal.args[0].dtype) == "uint32x64"
+    assert [str(arg.dtype) for arg in compare.args[:2]] == [f"{dtype}x64"] * 2
+    (horizontal,) = calls(after, "tl.vmi.vc" + op)
+    assert str(horizontal.args[0].dtype) == f"{dtype}x64"
     assert int(horizontal.annotations["group"]) == 1
     result = next(bind.var for bind in binds if bind.value.same_as(horizontal))
-    combines = calls(after, "tl.vmi.vmax")
+    combines = calls(after, "tl.vmi.v" + op)
     if seed:
         (combine,) = combines
         assert combine.args[0].same_as(result)
-        assert [str(arg.dtype) for arg in combine.args[:2]] == ["uint32", "uint32"]
+        assert [str(arg.dtype) for arg in combine.args[:2]] == [dtype, dtype]
         seed_broadcast = next(bind.value for bind in binds if bind.var.same_as(combine.args[1]))
         assert seed_broadcast.op.name == "tl.vmi.vbrc"
         seed_load = next(bind.value for bind in binds if bind.var.same_as(seed_broadcast.args[0]))
@@ -159,10 +161,17 @@ def test_uint32_max_reducer_codegen(seed, monkeypatch):
     assert any(store.value.same_as(result) for store in nodes(after, tvm.tirx.BufferStore))
 
 
-@pytest.mark.parametrize("op", ["sum", "min"])
-def test_uint32_other_reducer_ops_rejected(op):
-    with pytest.raises(Exception, match="PTO reducer requires float16/float32 or uint32 with max"):
-        _lower(reducer_kernel(dtype="uint32", op=op))
+@pytest.mark.parametrize("dtype", ["int32", "uint32"])
+@pytest.mark.parametrize("op", ["min", "max"])
+def test_integer_extrema_reducer_uniform_input(dtype, op):
+    kernel = reducer_kernel(n=65, lanes=64, dtype=dtype, op=op, uniform=True)
+    assert f"pto.vmi.vc{op}" in _lower(kernel).kernel_source
+
+
+@pytest.mark.parametrize("dtype", ["int32", "uint32"])
+def test_integer_sum_reducer_rejected(dtype):
+    with pytest.raises(Exception, match="PTO reducer requires float16/float32 or int32/uint32 with min/max"):
+        _lower(reducer_kernel(dtype=dtype, op="sum"))
 
 
 def test_seed_and_one_lane_arithmetic():

@@ -1158,12 +1158,13 @@ private:
   }
 
   bool IsUniform(const PrimExpr &expr) {
-    // Coordinate analysis alone sees slot [0] as uniform. Private storage and
-    // already-converted vector snapshots are varying regardless of address.
+    // Coordinate analysis alone sees slot [0] as uniform. Private storage,
+    // reducer partials and vector snapshots vary regardless of address.
     bool private_value = false;
     PostOrderVisit(expr, [&](const ObjectRef &node) {
       if (const auto *load = node.as<BufferLoadNode>()) {
-        private_value |= storage_.IsPrivate(load->buffer->data);
+        private_value |= storage_.IsPrivate(load->buffer->data) ||
+                         reducers_.accumulators.count(load->buffer->data);
       }
       if (const auto *var = node.as<VarNode>()) {
         auto found = value_map_.find(GetRef<Var>(var));
