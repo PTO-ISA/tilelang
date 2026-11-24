@@ -24,6 +24,7 @@
  */
 
 #include <tvm/tirx/analysis.h>
+#include <tvm/tirx/builtin.h>
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 
@@ -32,6 +33,7 @@
 #include <optional>
 #include <set>
 #include <sstream>
+#include <unordered_set>
 #include <vector>
 
 #include "../../transform/common/attr.h"
@@ -375,12 +377,12 @@ private:
     }
 
     void VisitExpr_(const CallNode *op) final {
-      if (auto call_op = op->op.as<Op>()) {
-        const std::string &name = call_op.value()->name;
-        if (name == "tirx.fabs" || name == "tirx.exp" || name == "tirx.log" ||
-            name == "tirx.sqrt") {
-          StmtExprVisitor::VisitExpr_(op);
-        }
+      Call call = GetRef<Call>(op);
+      if (pto_analysis::GetPtoBitOp(call) != pto_analysis::PtoBitOp::kNone ||
+          pto_analysis::GetPtoMaskLogicOp(call) ||
+          op->op.same_as(builtin::bitwise_not()) ||
+          pto_analysis::GetPtoUnaryOp(call)) {
+        StmtExprVisitor::VisitExpr_(op);
       }
       // Unknown calls (including unsupported conditional intrinsics) keep
       // their existing whitelist diagnostic; do not infer their evaluation.
@@ -407,9 +409,23 @@ private:
       bind_env_ = std::move(saved_env);
     }
 
-    // These forms are rejected by the existing unit whitelist. Do not infer
-    // execution or lexical semantics for them in this narrower check.
-    void VisitStmt_(const ForNode *) final {}
+    void VisitStmt_(const ForNode *op) final {
+      if (op->kind != ForKind::kSerial) {
+        return;
+      }
+      VisitExpr(op->min);
+      VisitExpr(op->extent);
+      if (op->step.defined()) {
+        VisitExpr(op->step.value());
+      }
+      Map<Var, PrimExpr> saved_env = bind_env_;
+      serial_defs_.insert(op->loop_var);
+      VisitStmt(op->body);
+      serial_defs_.erase(op->loop_var);
+      bind_env_ = std::move(saved_env);
+    }
+
+    // These forms are rejected by the existing unit whitelist.
     void VisitStmt_(const WhileNode *) final {}
     void VisitStmt_(const SBlockNode *) final {}
     void VisitStmt_(const SBlockRealizeNode *) final {}
@@ -486,6 +502,7 @@ private:
               var != mapping_.inner_var.get() &&
               var != mapping_.outer_var.get() &&
               !bind_env_.count(GetRef<Var>(var)) &&
+              !serial_defs_.count(GetRef<Var>(var)) &&
               !external_defs_.count(var)) {
             FailAccess(buffer, indices, is_write,
                        "cannot be classified reliably: variable `" +
@@ -515,6 +532,7 @@ private:
     const std::set<const VarNode *> &external_defs_;
     arith::Analyzer analyzer_;
     Map<Var, PrimExpr> bind_env_;
+    std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> serial_defs_;
     std::vector<std::string> contexts_;
   };
 
@@ -1111,8 +1129,7 @@ private:
           return;
         }
         // Min/Max are rewritten to Select by Legalize, but their operands
-        // must still pass the same type rules here (e.g. the
-        // integer-bitwise ban).
+        // must still pass the same type rules here.
         if (const auto *minn = e.as<MinNode>()) {
           // Legalize rewrites Min/Max to Select, which would introduce a
           // bool-ordered comparison and a bool-valued Select after Verify.
@@ -1136,40 +1153,21 @@ private:
           return;
         }
         if (const auto *call = e.as<CallNode>()) {
-          if (auto call_op = call->op.as<Op>()) {
-            const std::string &name = call_op.value()->name;
-            // Boolean mask-combine calls (the shared
-            // tirx.bitwise_* / tir.And|Or|Not admission table) and the
-            // tl/tir.infinity() constant.
-            // A mask combine only has a lowering for bool (lane-mask)
-            // values.
-            if (pto_analysis::MaskLogicVmiOpName(name) != nullptr) {
-              // An integer bitwise call is rejected with a proper
-              // diagnostic; CheckBinaryOpTypes is static, so report via
-              // LOG(FATAL) (the same channel Fail uses).
-              if (!call->dtype.is_bool()) {
-                LOG(FATAL)
-                    << "[VerifyParallelToPTO] type: bitwise mask combine `"
-                    << name
-                    << "` requires bool (lane-mask) operands; an integer "
-                       "bitwise call has no lane-mask lowering";
-              }
-              for (const auto &arg : call->args) {
-                check(arg);
-              }
-              return;
+          Call value_call = GetRef<Call>(call);
+          if (pto_analysis::GetPtoBitOp(value_call) !=
+                  pto_analysis::PtoBitOp::kNone ||
+              pto_analysis::GetPtoMaskLogicOp(value_call)) {
+            for (const PrimExpr &arg : call->args) {
+              check(arg);
             }
-            if (name == "tl.infinity" || name == "tir.infinity") {
-              return;
-            }
-            // The tirx.fabs/exp/log/sqrt unary math table; the original
-            // tirx op name stays the CheckOneUnaryOp key.
-            if (pto_analysis::VectorUnaryVmiOpName(name) != nullptr) {
-              check(call->args[0]);
-              CheckUnaryOpType(name.c_str(), call->dtype, call->args[0]);
-              return;
-            }
+            return;
           }
+          if (pto_analysis::GetPtoUnaryOp(value_call)) {
+            check(call->args[0]);
+            CheckUnaryOpType(Downcast<Op>(call->op)->name.c_str(), call->dtype,
+                             call->args[0]);
+          }
+          return;
         }
         if (const auto *load = e.as<BufferLoadNode>()) {
           // Index arithmetic is address analysis, not value arithmetic.
@@ -1350,6 +1348,28 @@ private:
       checker(expr);
     }
 
+    // Float computations inside an address use the same scalar/vector rules
+    // as store values and Bind RHSs, including for continuous accesses. Stop
+    // at loads: their indices and physical view metadata are checked when the
+    // unit visitor reaches that load.
+    void CheckAddressValues(const PrimExpr &address) {
+      PreOrderVisit(address, [&](const ObjectRef &node) {
+        if (node.as<BufferLoadNode>()) {
+          return false;
+        }
+        if (auto value = node.as<PrimExpr>()) {
+          const auto *cast = value->as<CastNode>();
+          if (!pto_analysis::IsFloatFamily(value->dtype()) &&
+              !(cast && pto_analysis::IsFloatFamily(cast->value.dtype()))) {
+            return true;
+          }
+          CheckComputeValue(*value, "address value");
+          return false;
+        }
+        return true;
+      });
+    }
+
     void VerifyAccess(const Buffer &buffer, const Array<PrimExpr> &indices,
                       bool is_write, const Optional<PrimExpr> &predicate) {
       // The predicate *value* is admitted by AdmitPredicates, which runs once
@@ -1379,6 +1399,9 @@ private:
                                              std::string(buffer->name));
         return;
       }
+      for (const PrimExpr &index : indices) {
+        CheckAddressValues(index);
+      }
       try {
         auto access = pto_analysis::AnalyzeBufferAccess(
             buffer, indices, is_write, loop_var_, mapping_, bind_env_);
@@ -1407,6 +1430,7 @@ private:
           if (expr.as<IntImmNode>())
             return;
           CheckDefinedVars(expr);
+          CheckAddressValues(expr);
           if (!pto_analysis::IsSupportedAddressExpr(expr)) {
             parent_->Fail("expression",
                           "buffer `" + std::string(buffer->name) +

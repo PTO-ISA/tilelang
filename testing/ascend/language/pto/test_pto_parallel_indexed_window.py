@@ -220,7 +220,7 @@ def test_b16_relative_window_rejects_signed_index_wrapping_on_cast():
     # A cast of 32768 to int16 yields -32768, which reaches owner element 0.
     # Reinterpreting the narrow signed carrier would reach 65536 instead.
     kernel = affine_large_window_kernel("gather", "shifted", "wrapped_int16", origin=32768)
-    with pytest.raises(Exception, match="32-bit offsets require implicit narrowing to 16 bits"):
+    with pytest.raises(Exception, match="B16 indexed access cannot prove the input of a vector int32-to-int16 cast fits in int16"):
         # Exercise PTO admission without the scheduler's int16 interval analysis.
         lower_case("signed_large_window_wrap", kernel, auto_schedule=False)
 

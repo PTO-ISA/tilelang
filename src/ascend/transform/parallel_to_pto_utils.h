@@ -259,10 +259,9 @@ PrimExpr MakeIndexedMemoryDescriptor(const IndexedMemoryOwner &owner,
                                      const Optional<PrimExpr> &version = {},
                                      const Optional<PrimExpr> &extent = {});
 
-/*! Scalar instruction base and vector element offsets. The base may reference
- * the mapping's chunk variable. Generated uint16 coordinates may additionally
- * reference its lane variable. Loaded indices retain their source expressions.
- */
+/*! Scalar instruction base and vector element offsets. Computed coordinates
+ * may reference the mapping's chunk or lane variables. Loaded indices retain
+ * their source expressions. */
 struct PtoIndexedAccessPlan {
   PrimExpr base;
   PrimExpr offsets;
@@ -270,8 +269,7 @@ struct PtoIndexedAccessPlan {
    */
   Optional<PrimExpr> version_index;
   PrimExpr descriptor_extent;
-  /*! Generate proved coordinate arithmetic directly with uint16 VMI values. */
-  bool generate_uint16_offsets = false;
+  bool generate_uint16_coordinates = false;
 };
 
 /*! Select a legal scalar base and vector offset encoding for layout
@@ -409,11 +407,8 @@ struct VectorCastPlan {
 
 using CastPlan = std::variant<ScalarCastPlan, VectorCastPlan>;
 
-// Maps a frontend boolean-combine op name (tirx./tir.bitwise_{and,or,not}
-// or tir.{And,Or,Not}) to the PTODSL bitwise vector op whose mask register
-// overload implements the boolean combine ("vand"/"vor"/"vnot"); returns
-// nullptr for any other name.
-const char *MaskLogicVmiOpName(const std::string &tir_op_name);
+// Maps a bool-valued bitwise call to its VMI mask operation.
+const char *GetPtoMaskLogicOp(const tirx::Call &call);
 
 // The tirx.* unary math ops with a VMI mapping (fabs/exp/log/sqrt):
 // returns the VMI op name, or nullptr for any other name.
@@ -424,10 +419,20 @@ const char *VectorUnaryVmiOpName(const std::string &tirx_op_name);
  * elements; vadd/vsub additionally allow i8; vdiv admits f16/f32 only.
  * Unsupported combinations are rejected instead of synthesizing
  * widening chains. */
+const char *GetPtoUnaryOp(const tirx::Call &call);
 bool IsSupportedVectorUnaryOp(const std::string &tirx_op, DataType dtype);
 bool IsSupportedVectorBinaryOp(const std::string &vmi_op, DataType dtype);
 bool ContainsRuntimeValue(const PrimExpr &expr);
 bool IsFloatFamily(DataType dtype);
+
+/*! TIR value calls with a direct bit-preserving or bitwise PTO lowering. */
+enum class PtoBitOp { kNone, kAnd, kOr, kShiftLeft, kShiftRight, kReinterpret };
+
+PtoBitOp GetPtoBitOp(const tirx::Call &call);
+
+/*! Check the operand contract of a supported value call. Returns false for
+ * other calls, which may still be valid scalar address intrinsics. */
+bool CheckPtoValueCall(const tirx::Call &call);
 
 /*! Read-only lane-use classification of a value expression.
  * Shared by the metadata check and the operation type check so both

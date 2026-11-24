@@ -15,6 +15,7 @@ import torch
 import torch_npu  # noqa: F401
 
 import tilelang
+import tilelang.ascend.language as T
 
 import test_pto_parallel_gather_scatter as gs
 
@@ -49,7 +50,7 @@ def _record(name, result):
         file.write(json.dumps(result) + "\n")
 
 
-def _run(name, func, args, expected, device, *, auto_schedule=True):
+def _run(name, func, args, expected, device, *, auto_schedule=True, compare_bits=False):
     captured = {}
     source = None
     try:
@@ -74,6 +75,9 @@ def _run(name, func, args, expected, device, *, auto_schedule=True):
         torch.npu.synchronize()
         actual = device_args[-1].cpu()
         assert actual.dtype == expected.dtype
+        if compare_bits:
+            bits_dtype = {torch.float16: torch.int16, torch.float32: torch.int32}[expected.dtype]
+            actual, expected = actual.view(bits_dtype), expected.view(bits_dtype)
         assert torch.equal(actual, expected), (
             f"{name}: wrong output at {torch.nonzero(actual != expected).tolist()[:10]}\n"
             f"actual={actual.flatten().tolist()[:16]}\nexpected={expected.flatten().tolist()[:16]}"
@@ -481,22 +485,22 @@ def test_native_uint16_indices_keep_high_bit_positions(kind, npu):
         expected[index[:278]] = x[:278]
     index[278:] = 65535
 
-    @gs.T.prim_func
-    def main(A: gs.T.Tensor((40000,), "float16"), I: gs.T.Tensor((384,), "uint16"), C: gs.T.Tensor((40000,), "float16")):
-        with gs.T.Kernel(1):
-            x_ub = gs.T.alloc_shared((40000,), "float16")
-            idx_ub = gs.T.alloc_shared((384,), "uint16")
-            y_ub = gs.T.alloc_shared((40000,), "float16")
-            gs.T.copy(A, x_ub)
-            gs.T.copy(I, idx_ub)
-            gs.T.copy(C, y_ub)
-            with gs.T.SimdVF(lanes=128):
-                for i in gs.T.Parallel(278):
+    @T.prim_func
+    def main(A: T.Tensor((40000,), "float16"), I: T.Tensor((384,), "uint16"), C: T.Tensor((40000,), "float16")):
+        with T.Kernel(1):
+            x_ub = T.alloc_shared((40000,), "float16")
+            idx_ub = T.alloc_shared((384,), "uint16")
+            y_ub = T.alloc_shared((40000,), "float16")
+            T.copy(A, x_ub)
+            T.copy(I, idx_ub)
+            T.copy(C, y_ub)
+            with T.SimdVF(lanes=128):
+                for i in T.Parallel(278):
                     if kind == "gather":
                         y_ub[i] = x_ub[idx_ub[i]]
                     else:
                         y_ub[idx_ub[i]] = x_ub[i]
-            gs.T.copy(y_ub, C)
+            T.copy(y_ub, C)
 
     _run(f"native16_{kind}_uint16_highbit", main, [x, index.to(torch.uint16), output], expected, npu)
 

@@ -49,6 +49,57 @@ def verify_body(mod, make_body):
     assert tvm.ir.structural_equal(mod, result), "Verify must preserve source evaluation and access positions"
 
 
+@pytest.mark.pto
+@pytest.mark.parametrize("serial", [False, True])
+def test_guarded_bitwise_gather(serial):
+    _, captured = lower_case("bitwise_gather", indexed_kernel(dtype="uint32"))
+
+    def make_body(i, payload, index, output):
+        j = tvm.tirx.Var("j", "int32")
+        offset = index[i] + j if serial else index[i]
+        value = payload[0] | (payload[offset] & tvm.tirx.IntImm("uint32", 255))
+        store = tvm.tirx.BufferStore(output, value, [i])
+        branch = tvm.tirx.IfThenElse(i < 150, store, None)
+        return tvm.tirx.For(j, 0, 2, tvm.tirx.ForKind.SERIAL, branch) if serial else branch
+
+    with pytest.raises(Exception, match="buffer `x` load.*requires gather.*IfThenElse then"):
+        verify_body(captured["VerifyParallelToPTO_before"], make_body)
+
+
+@pytest.mark.pto
+@pytest.mark.parametrize("op", ["tirx.bitwise_and", "tirx.bitwise_or"])
+def test_gather_in_bitwise_mask_is_rejected(source_module, op):
+    def make_body(i, payload, index, output):
+        condition = tvm.tirx.call_intrin("bool", tvm.ir.Op.get(op), payload[index[i]] > 0, i < 150)
+        return tvm.tirx.BufferStore(output, tvm.tirx.Select(condition, payload[i], tvm.tirx.FloatImm("float32", 0)), [i])
+
+    with pytest.raises(Exception, match="buffer `x` load.*requires gather.*Select condition"):
+        verify_body(source_module, make_body)
+
+
+@pytest.mark.pto
+@pytest.mark.parametrize("malformed", ["arity", "dtype"])
+def test_malformed_bitwise_mask_fails_verification(source_module, malformed):
+    def make_body(i, payload, index, output):
+        args = [payload[i] > 0]
+        if malformed == "dtype":
+            args.append(index[i])
+        condition = tvm.tirx.call_intrin("bool", tvm.ir.Op.get("tirx.bitwise_and"), *args)
+        return tvm.tirx.BufferStore(output, tvm.tirx.Select(condition, payload[i], tvm.tirx.FloatImm("float32", 0)), [i])
+
+    with pytest.raises(Exception, match=r"tirx\.bitwise_and.*(?:operand count|matching bool)"):
+        verify_body(source_module, make_body)
+
+
+@pytest.mark.pto
+def test_uniform_integer_complement_in_metadata(source_module):
+    def make_body(i, payload, index, output):
+        store = tvm.tirx.BufferStore(output, payload[i], [i])
+        return tvm.tirx.AttrStmt(tvm.tirx.IntImm("int32", 0), "flags", ~index[0], store)
+
+    verify_body(source_module, make_body)
+
+
 def branch_body(kind, location):
     def make_body(i, payload, index, output):
         condition = i < 150

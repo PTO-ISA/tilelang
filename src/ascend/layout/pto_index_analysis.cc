@@ -173,7 +173,8 @@ bool IsPtoIndexDType(DataType dtype) {
 }
 
 bool IsPtoScalarCoordinate(const PrimExpr &expr, const Var &vector_var,
-                           const Map<Var, PrimExpr> &bind_env) {
+                           const Map<Var, PrimExpr> &bind_env,
+                           const Var &lane_var) {
   bool scalar = IsPtoIndexDType(expr.dtype());
   PostOrderVisit(expr, [&](const ObjectRef &node) {
     if (node.as<BufferLoadNode>() || node.as<CallNode>() ||
@@ -182,7 +183,7 @@ bool IsPtoScalarCoordinate(const PrimExpr &expr, const Var &vector_var,
     } else if (const auto *op = node.as<VarNode>()) {
       Var var = GetRef<Var>(op);
       scalar &= var.dtype().lanes() == 1 && !var.same_as(vector_var) &&
-                !bind_env.count(var);
+                !var.same_as(lane_var) && !bind_env.count(var);
     }
   });
   return scalar;
@@ -197,6 +198,11 @@ bool IsSupportedAddressExpr(const PrimExpr &expr) {
     bool supported = true;
     void VisitExpr_(const CallNode *op) final {
       if (!supported) {
+        return;
+      }
+      Call call = GetRef<Call>(op);
+      if (CheckPtoValueCall(call)) {
+        ExprVisitor::VisitExpr_(op);
         return;
       }
       const auto *op_node = op->op.as<OpNode>();
@@ -305,9 +311,9 @@ private:
   }
 
   PrimExpr MakeSymbol(DataType dtype, bool uniform) {
-    if (!IsPtoIndexDType(dtype)) {
-      throw PtoAnalysisError("loaded index values require scalar 8-bit, 16-bit "
-                             "or 32-bit integer elements");
+    if (!IsSupportedElementDType(dtype)) {
+      throw PtoAnalysisError(
+          "unsupported element dtype in a loaded index expression");
     }
     Var symbol("pto_loaded_index", dtype);
     if (uniform) {
@@ -317,7 +323,8 @@ private:
     // zero is not zero. Otherwise a product could incorrectly lose a varying
     // dependence just because the proof substituted lane=0.
     Var slope("pto_loaded_index_stride", dtype);
-    return symbol + slope * Cast(dtype, lane_var_);
+    PrimExpr typed_lane = Cast(dtype, lane_var_);
+    return symbol + slope * typed_lane;
   }
 
   Var vector_var_;
@@ -334,39 +341,43 @@ private:
 // coordinate node merely because continuous scalar addressing can handle it.
 class IndexedExprCheck : public ExprFunctor<bool(const PrimExpr &)> {
 public:
-  IndexedExprCheck(const Var &vector_var, int64_t lanes,
+  IndexedExprCheck(const Var &vector_var, const Var &lane_var, int64_t lanes,
                    const Map<Var, PrimExpr> &bind_env, LoadedValueProof &proof)
-      : vector_var_(vector_var), lanes_(lanes), bind_env_(bind_env),
-        proof_(proof) {}
+      : vector_var_(vector_var), lane_var_(lane_var), lanes_(lanes),
+        bind_env_(bind_env), proof_(proof) {}
 
+  Array<PrimExpr> Check(const PrimExpr &expr) {
+    RequiresVmi(expr);
+    return std::move(signed_narrowing_inputs_);
+  }
+
+private:
   // Validate the expression and return whether conversion emits a VMI value.
   // Algebraic uniformity alone does not turn an operation on VMI operands
   // into a scalar operation.
   bool RequiresVmi(const PrimExpr &expr) {
-    if (!IsPtoIndexDType(expr.dtype())) {
-      throw PtoAnalysisError("indexed element offsets require scalar 8-bit, "
-                             "16-bit or 32-bit integer expressions");
-    }
-    if (IsPtoScalarCoordinate(expr, vector_var_, bind_env_)) {
+    if (IsPtoScalarCoordinate(expr, vector_var_, bind_env_, lane_var_)) {
       return false;
     }
     return VisitExpr(expr);
   }
 
-private:
   bool VisitExpr_(const VarNode *op) final {
     Var var = GetRef<Var>(op);
     if (bind_env_.count(var)) {
+      if (auto cached = bind_requires_vmi_.Get(var)) {
+        return *cached;
+      }
       if (visiting_.count(var) || visiting_.size() >= 64) {
         throw PtoAnalysisError("cyclic or too deep loaded index definition");
       }
       visiting_.insert(var);
-      const PrimExpr &value = bind_env_[var];
-      RequiresVmi(value);
+      bool requires_vmi = RequiresVmi(bind_env_[var]);
       visiting_.erase(var);
-      return !proof_.IsUniform(value);
+      bind_requires_vmi_.Set(var, requires_vmi);
+      return requires_vmi;
     }
-    return var.same_as(vector_var_);
+    return var.same_as(vector_var_) || var.same_as(lane_var_);
   }
 
   bool VisitExpr_(const BufferLoadNode *op) final {
@@ -374,10 +385,6 @@ private:
       throw PtoAnalysisError(
           "gather/scatter indices must be loaded from "
           "ordinary UB buffers; Fragment and GM are unsupported");
-    }
-    if (!IsPtoIndexDType(op->dtype)) {
-      throw PtoAnalysisError("gather/scatter indices must have 8-bit, 16-bit "
-                             "or 32-bit integer elements");
     }
     // This load's address is classified separately. Its coordinates are not
     // values emitted by ConvertExpr (for example, a buffer-version index).
@@ -394,8 +401,26 @@ private:
       throw PtoAnalysisError(
           "indexed offset Cast has no supported conversion: " + why);
     }
+    if (requires_vmi && op->value.dtype() == DataType::Int(32) &&
+        op->dtype == DataType::Int(16)) {
+      signed_narrowing_inputs_.push_back(op->value);
+    }
     return requires_vmi;
   }
+
+  bool VisitExpr_(const CallNode *op) final {
+    Call call = GetRef<Call>(op);
+    if (!CheckPtoValueCall(call)) {
+      return VisitExprDefault_(op);
+    }
+    bool requires_vmi = false;
+    for (const PrimExpr &arg : call->args) {
+      requires_vmi |= RequiresVmi(arg);
+    }
+    return requires_vmi;
+  }
+
+  bool VisitExpr_(const FloatImmNode *) final { return false; }
 
   bool BinaryRequiresVmi(const char *vmi_op, DataType dtype,
                          const PrimExpr &lhs, const PrimExpr &rhs) {
@@ -453,9 +478,12 @@ private:
   }
 
   const Var &vector_var_;
+  const Var &lane_var_;
   int64_t lanes_;
   const Map<Var, PrimExpr> &bind_env_;
   LoadedValueProof &proof_;
+  Array<PrimExpr> signed_narrowing_inputs_;
+  Map<Var, bool> bind_requires_vmi_;
   std::unordered_set<Var, ffi::ObjectPtrHash, ffi::ObjectPtrEqual> visiting_;
 };
 
@@ -471,14 +499,16 @@ bool IsPtoLaneUniform(const PrimExpr &expr, const Var &vector_var,
   return proof.IsUniform(expr);
 }
 
-void CheckPtoIndexedOffsetExpr(const PrimExpr &offset, const Var &vector_var,
-                               const PtoInverseMapping &mapping,
-                               const Map<Var, PrimExpr> &bind_env) {
+Array<PrimExpr> CheckPtoIndexedOffsetExpr(const PrimExpr &offset,
+                                          const Var &vector_var,
+                                          const PtoInverseMapping &mapping,
+                                          const Map<Var, PrimExpr> &bind_env) {
   LoadedValueProof proof(vector_var, mapping.index_expr, mapping.lane_var,
                          mapping.chunk_var, mapping.lanes, mapping.chunk_count,
                          mapping.SerialVar(), mapping.SerialExtent(), bind_env);
-  IndexedExprCheck checker(vector_var, mapping.lanes, bind_env, proof);
-  checker.RequiresVmi(offset);
+  IndexedExprCheck checker(vector_var, mapping.lane_var, mapping.lanes,
+                           bind_env, proof);
+  return checker.Check(offset);
 }
 
 Array<PrimExpr> PtoAddressMetadata(const Buffer &buffer,

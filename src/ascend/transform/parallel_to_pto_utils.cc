@@ -8,6 +8,7 @@
 
 #include <tvm/arith/pattern.h>
 #include <tvm/tirx/analysis.h>
+#include <tvm/tirx/builtin.h>
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/stmt_functor.h>
 
@@ -22,6 +23,7 @@
 #include <memory>
 #include <set>
 #include <sstream>
+#include <string_view>
 #include <utility>
 
 namespace tvm {
@@ -559,7 +561,11 @@ std::string AccessPatternToString(AccessPattern pattern) {
 // dispatch (Verify admission / Vectorize rewriting) cannot drift apart.
 // ---------------------------------------------------------------------------
 
-const char *MaskLogicVmiOpName(const std::string &tir_op_name) {
+const char *GetPtoMaskLogicOp(const Call &call) {
+  const auto *op = call->op.as<OpNode>();
+  if (!op || !call->dtype.is_bool()) {
+    return nullptr;
+  }
   // TileLang `a & b` / `a | b` / `~a` on bool predicates arrive as
   // tirx.bitwise_* calls (plus the tir.bitwise_* and tir.And/Or/Not
   // spellings); Vectorize rewrites them to the PTODSL bitwise vector ops,
@@ -572,7 +578,7 @@ const char *MaskLogicVmiOpName(const std::string &tir_op_name) {
       {"tir.Not", "vnot"},
   };
   for (const auto &entry : kMaskLogicTable) {
-    if (tir_op_name == entry.first) {
+    if (op->name == entry.first) {
       return entry.second;
     }
   }
@@ -1516,12 +1522,17 @@ bool CheckActivePtoLanes(arith::Analyzer *proof,
 // constrain the loaded value.
 class PtoAddressRangeExpr : public ExprMutator {
 public:
-  explicit PtoAddressRangeExpr(arith::Analyzer *proof) : proof_(proof) {}
+  explicit PtoAddressRangeExpr(arith::Analyzer *proof,
+                               const Map<Var, PrimExpr> &bind_env = {})
+      : proof_(proof), bind_env_(bind_env) {}
 
 private:
   PrimExpr VisitExpr(const PrimExpr &expr) final {
     if (expr.as<BufferLoadNode>()) {
       return expr;
+    }
+    if (auto var = expr.as<Var>()) {
+      return VisitExpr_(var->get());
     }
     PrimExpr result = ExprMutator::VisitExpr(expr);
     DataType dtype = result.dtype();
@@ -1538,7 +1549,25 @@ private:
     return Var("offset_range", dtype);
   }
 
+  PrimExpr VisitExpr_(const VarNode *op) final {
+    Var var = GetRef<Var>(op);
+    if (auto mapped = values_.Get(var)) {
+      return *mapped;
+    }
+    if (!bind_env_.count(var) || visiting_.size() >= 64 ||
+        !visiting_.insert(var).second) {
+      return var;
+    }
+    PrimExpr value = VisitExpr(bind_env_[var]);
+    visiting_.erase(var);
+    values_.Set(var, value);
+    return value;
+  }
+
   arith::Analyzer *proof_;
+  Map<Var, PrimExpr> bind_env_;
+  Map<Var, PrimExpr> values_;
+  std::unordered_set<Var, ffi::ObjectPtrHash, ffi::ObjectPtrEqual> visiting_;
 };
 
 // Keep loads and saved scalar/vector values opaque while splitting the
@@ -1732,8 +1761,50 @@ TryPlanPtoOffsets(const MemoryAccess &access, const PrimExpr &offset,
     }
     return native;
   };
+  const Var &lane = mapping.lane_var;
+  std::string base_error;
+  auto valid_rebase = [&](const PrimExpr &base,
+                          const PrimExpr &relative_offsets) {
+    auto *range_proof = offset_proof();
+    // D and the relative offsets add without the source integer's wrapping
+    // semantics. Prove their sum in a wider type.
+    PrimExpr sum = WidenToInt64(base) + WidenToInt64(relative_offsets);
+    const int64_t max_offset = *as_const_int(max_value(offset.dtype()));
+    if (!CheckActivePtoLanes(range_proof, mapping, [&] {
+          PrimExpr value = PtoAddressRangeExpr(range_proof, bind_env)(sum);
+          auto bound = range_proof->const_int_bound(
+              range_proof->rewrite_simplify(value));
+          return bound->min_value >= 0 && bound->max_value <= max_offset;
+        })) {
+      return false;
+    }
+    PrimExpr mapped_base =
+        SubstituteVar(base, loop_var.get(), mapping.index_expr);
+    mapped_base =
+        SubstituteVar(mapped_base, lane.get(), make_zero(lane.dtype()));
+    if (CheckActivePtoLanes(range_proof, mapping, [&] {
+          PrimExpr d = range_proof->rewrite_simplify(
+              PtoAddressRangeExpr(range_proof)(mapped_base));
+          return range_proof->CanProve(d >= 0) &&
+                 range_proof->CanProve(d < descriptor_extent);
+        })) {
+      return true;
+    }
+    std::ostringstream oss;
+    oss << "B16 indexed access requires the scalar instruction base D to be "
+           "provably inside the owner (0 <= D < "
+        << descriptor_extent << "), but the rebased access produces base "
+        << range_proof->rewrite_simplify(mapped_base);
+    base_error = oss.str();
+    return false;
+  };
+
+  // Retain the first source-width conversion as a fallback while looking for
+  // a native carrier or directly generated uint16 coordinates.
+  std::optional<PtoIndexedAccessPlan> narrowed_plan;
+  std::string signed_cast_error;
   std::string encoding_error;
-  auto encode =
+  auto try_candidate =
       [&](const PrimExpr &base,
           const PrimExpr &offsets) -> std::optional<PtoIndexedAccessPlan> {
     if (!IsPtoIndexDType(offsets.dtype())) {
@@ -1741,111 +1812,129 @@ TryPlanPtoOffsets(const MemoryAccess &access, const PrimExpr &offset,
                        "16-bit or 32-bit integer expressions";
       return std::nullopt;
     }
-    const bool narrow = offsets.dtype().bits() > offset_bits;
-    if (narrow &&
-        !CanGenerateUint16Offsets(offsets, mapping, offset_proof(), bind_env)) {
+    PtoIndexedAccessPlan plan{base, offsets, version, descriptor_extent};
+    const bool needs_narrowing = offsets.dtype().bits() > offset_bits;
+    plan.generate_uint16_coordinates =
+        needs_narrowing &&
+        CanGenerateUint16Offsets(offsets, mapping, offset_proof(), bind_env);
+    const bool needs_cast =
+        needs_narrowing && !plan.generate_uint16_coordinates;
+    if (needs_cast && narrowed_plan) {
       return std::nullopt;
     }
-    if (!narrow) {
+    Array<PrimExpr> signed_narrowing_inputs;
+    if (!plan.generate_uint16_coordinates) {
       try {
-        CheckPtoIndexedOffsetExpr(offsets, loop_var, mapping, bind_env);
+        signed_narrowing_inputs =
+            CheckPtoIndexedOffsetExpr(offsets, loop_var, mapping, bind_env);
       } catch (const PtoAnalysisError &err) {
         encoding_error = err.what();
         return std::nullopt;
       }
     }
-    return PtoIndexedAccessPlan{base, offsets, version, descriptor_extent,
-                                narrow};
+    if (offset_bits == 16 && !signed_narrowing_inputs.empty()) {
+      auto *range_proof = offset_proof();
+      // A dense signed int32-to-int16 conversion can saturate even with
+      // NOSAT. Check its input before any later operation bounds the offset.
+      if (!CheckActivePtoLanes(range_proof, mapping, [&] {
+            PtoAddressRangeExpr range(range_proof, bind_env);
+            for (const PrimExpr &input : signed_narrowing_inputs) {
+              auto bound = range_proof->const_int_bound(range(input));
+              if (bound->min_value < std::numeric_limits<int16_t>::min() ||
+                  bound->max_value > std::numeric_limits<int16_t>::max()) {
+                return false;
+              }
+            }
+            return true;
+          })) {
+        signed_cast_error =
+            "B16 indexed access cannot prove the input of a vector "
+            "int32-to-int16 cast fits in int16; bound it before narrowing";
+        return std::nullopt;
+      }
+    }
+    if (needs_cast) {
+      auto *range_proof = offset_proof();
+      if (!CheckActivePtoLanes(range_proof, mapping, [&] {
+            PrimExpr value =
+                PtoAddressRangeExpr(range_proof, bind_env)(offsets);
+            auto bound = range_proof->const_int_bound(value);
+            return bound->min_value >= 0 && bound->max_value <= 65535;
+          })) {
+        return std::nullopt;
+      }
+    }
+    if (!is_zero(base) && !valid_rebase(base, offsets)) {
+      return std::nullopt;
+    }
+    if (needs_cast) {
+      plan.offsets = Cast(DataType::UInt(16), offsets);
+      narrowed_plan = std::move(plan);
+      return std::nullopt;
+    }
+    return plan;
   };
+
   PrimExpr offsets = carrier(offset, /*rebased=*/false);
-  if (auto plan = encode(make_zero(DataType::Int(32)), offsets)) {
+  if (auto plan = try_candidate(make_zero(DataType::Int(32)), offsets)) {
     return *plan;
   }
 
-  std::string base_error;
+  auto try_split =
+      [&](SplitAddressExpr &split) -> std::optional<PtoIndexedAccessPlan> {
+    arith::Analyzer expressions;
+    const Var &chunk = mapping.chunk_var;
+    BindPtoExtent(&expressions, lane, mapping.lanes);
+    BindPtoExtent(&expressions, chunk, mapping.chunk_count);
+    PrimExpr mapped = expressions.Simplify(split(offset));
+
+    PrimExpr base_lane = make_zero(lane.dtype());
+    auto affine = arith::DetectLinearEquation(mapped, {lane});
+    if (!affine.empty() && expressions.CanProve(affine[0] < 0)) {
+      base_lane = IntImm(lane.dtype(), mapping.lanes - 1);
+      if (mapping.tail_lanes != 0) {
+        base_lane = expressions.Simplify(
+            Select(chunk < IntImm(chunk.dtype(), mapping.chunk_count - 1),
+                   base_lane, IntImm(lane.dtype(), mapping.tail_lanes - 1)));
+      }
+    }
+
+    PrimExpr previous_base = make_zero(mapped.dtype());
+    for (bool keep_uniform_values : {false, true}) {
+      PrimExpr split_base = expressions.Simplify(
+          split.AtLane(mapped, base_lane, keep_uniform_values));
+      if (is_zero(split_base) || ExprDeepEqual()(split_base, previous_base)) {
+        continue;
+      }
+      previous_base = split_base;
+      PrimExpr relative =
+          split.Restore(expressions.Simplify(mapped - split_base));
+      PrimExpr relative_offsets = carrier(relative, /*rebased=*/true);
+      PrimExpr base = split.Restore(split_base);
+      if (auto plan = try_candidate(base, relative_offsets)) {
+        return plan;
+      }
+    }
+    return std::nullopt;
+  };
   if (offset_bits == 16 && offset.dtype().bits() == 32) {
-    auto try_rebase =
-        [&](SplitAddressExpr &split) -> std::optional<PtoIndexedAccessPlan> {
-      arith::Analyzer expressions;
-      const Var &lane = mapping.lane_var;
-      const Var &chunk = mapping.chunk_var;
-      BindPtoExtent(&expressions, lane, mapping.lanes);
-      BindPtoExtent(&expressions, chunk, mapping.chunk_count);
-      PrimExpr mapped = expressions.Simplify(split(offset));
-
-      PrimExpr base_lane = make_zero(lane.dtype());
-      auto affine = arith::DetectLinearEquation(mapped, {lane});
-      if (!affine.empty() && expressions.CanProve(affine[0] < 0)) {
-        base_lane = IntImm(lane.dtype(), mapping.lanes - 1);
-        if (mapping.tail_lanes != 0) {
-          base_lane = expressions.Simplify(
-              Select(chunk < IntImm(chunk.dtype(), mapping.chunk_count - 1),
-                     base_lane, IntImm(lane.dtype(), mapping.tail_lanes - 1)));
-        }
-      }
-
-      auto *range_proof = offset_proof();
-      PrimExpr previous_base = make_zero(mapped.dtype());
-      for (bool keep_uniform_values : {false, true}) {
-        PrimExpr split_base = expressions.Simplify(
-            split.AtLane(mapped, base_lane, keep_uniform_values));
-        if (is_zero(split_base) || ExprDeepEqual()(split_base, previous_base)) {
-          continue;
-        }
-        previous_base = split_base;
-        PrimExpr relative =
-            split.Restore(expressions.Simplify(mapped - split_base));
-        PrimExpr relative_offsets = carrier(relative, /*rebased=*/true);
-        PrimExpr base = split.Restore(split_base);
-        auto plan = encode(base, relative_offsets);
-        if (!plan) {
-          continue;
-        }
-        // D and the relative offsets add without the source integer's wrapping
-        // semantics. Prove their sum in a wider type.
-        PrimExpr sum = WidenToInt64(base) + WidenToInt64(relative_offsets);
-        const int64_t max_offset = *as_const_int(max_value(offset.dtype()));
-        if (!CheckActivePtoLanes(range_proof, mapping, [&] {
-              PrimExpr value = PtoAddressRangeExpr(range_proof)(sum);
-              auto bound = range_proof->const_int_bound(
-                  range_proof->rewrite_simplify(value));
-              return bound->min_value >= 0 && bound->max_value <= max_offset;
-            })) {
-          continue;
-        }
-        PrimExpr mapped_base =
-            SubstituteVar(base, loop_var.get(), mapping.index_expr);
-        mapped_base =
-            SubstituteVar(mapped_base, lane.get(), make_zero(lane.dtype()));
-        if (CheckActivePtoLanes(range_proof, mapping, [&] {
-              PrimExpr d = range_proof->rewrite_simplify(
-                  PtoAddressRangeExpr(range_proof)(mapped_base));
-              return range_proof->CanProve(d >= 0) &&
-                     range_proof->CanProve(d < descriptor_extent);
-            })) {
-          return *plan;
-        }
-        std::ostringstream oss;
-        oss << "B16 indexed access requires the scalar instruction base D to "
-               "be "
-               "provably inside the owner (0 <= D < "
-            << descriptor_extent << "), but the rebased access produces base "
-            << expressions.Simplify(mapped_base);
-        base_error = oss.str();
-      }
-      return std::nullopt;
-    };
     SplitAddressExpr split(loop_var, mapping, bind_env, nullptr);
-    if (auto plan = try_rebase(split)) {
+    if (auto plan = try_split(split)) {
       return *plan;
     }
     if (split.HasCast()) {
       SplitAddressExpr proved_split(loop_var, mapping, bind_env,
                                     offset_proof());
-      if (auto plan = try_rebase(proved_split)) {
+      if (auto plan = try_split(proved_split)) {
         return *plan;
       }
     }
+  }
+  if (narrowed_plan) {
+    return *narrowed_plan;
+  }
+  if (!signed_cast_error.empty()) {
+    return signed_cast_error;
   }
   if (!base_error.empty()) {
     return base_error;
@@ -2045,7 +2134,92 @@ bool IsSupportedFloat8(DataType dtype) {
   return dtype.is_float8_e4m3fn() || dtype.is_float8_e5m2();
 }
 
+PtoBitOp GetPtoBitOp(const Call &call) {
+  if (!call->dtype.is_bool() && call->op.same_as(builtin::bitwise_and())) {
+    return PtoBitOp::kAnd;
+  }
+  if (!call->dtype.is_bool() && call->op.same_as(builtin::bitwise_or())) {
+    return PtoBitOp::kOr;
+  }
+  if (call->op.same_as(builtin::shift_left())) {
+    return PtoBitOp::kShiftLeft;
+  }
+  if (call->op.same_as(builtin::shift_right())) {
+    return PtoBitOp::kShiftRight;
+  }
+  if (call->op.same_as(builtin::reinterpret())) {
+    return PtoBitOp::kReinterpret;
+  }
+  return PtoBitOp::kNone;
+}
+
+static void CheckPtoBitOp(const Call &call, PtoBitOp op) {
+  ICHECK(op != PtoBitOp::kNone);
+  const bool reinterpret = op == PtoBitOp::kReinterpret;
+  const std::string name = Downcast<Op>(call->op)->name;
+  if (call->args.size() != (reinterpret ? 1U : 2U) ||
+      !call->annotations.empty()) {
+    throw PtoAnalysisError(name + " expects " +
+                           (reinterpret ? "one operand" : "two operands") +
+                           " and no annotations");
+  }
+
+  const DataType from = call->args[0].dtype();
+  const DataType to = call->dtype;
+  if (reinterpret) {
+    const DataType u32 = DataType::UInt(32);
+    const DataType f32 = DataType::Float(32);
+    const bool supported = (IsPtoIndexDType(from) && IsPtoIndexDType(to) &&
+                            from.bits() == to.bits()) ||
+                           (from == f32 && (to == f32 || to == u32)) ||
+                           (from == u32 && to == f32);
+    if (!supported) {
+      std::ostringstream oss;
+      oss << name << " does not support " << from << " -> " << to
+          << "; expected same-width signed/unsigned 8-, 16- or 32-bit "
+             "integers, uint32 <-> float32, or a supported identity";
+      throw PtoAnalysisError(oss.str());
+    }
+    return;
+  }
+
+  const DataType rhs = call->args[1].dtype();
+  const bool shift = op == PtoBitOp::kShiftLeft || op == PtoBitOp::kShiftRight;
+  const int64_t *count =
+      shift && rhs.is_scalar() && (rhs.is_int() || rhs.is_uint())
+          ? as_const_int(call->args[1])
+          : nullptr;
+  if (!IsPtoIndexDType(to) || from != to || (rhs != to && !count)) {
+    std::ostringstream oss;
+    oss << name
+        << " requires scalar 8-, 16- or 32-bit integer data operands "
+           "and result of the same dtype, got "
+        << from << ", " << rhs << " -> " << to;
+    throw PtoAnalysisError(oss.str());
+  }
+  if (count && (*count < 0 || *count >= to.bits())) {
+    std::ostringstream oss;
+    oss << name << " on " << to << " requires a shift count in [0, "
+        << to.bits() << "), got " << call->args[1];
+    throw PtoAnalysisError(oss.str());
+  }
+}
+
 namespace {
+
+void CheckPtoMaskCall(const Call &call, std::string_view mask_op) {
+  const std::string name = Downcast<Op>(call->op)->name;
+  const size_t arity = mask_op == "vnot" ? 1U : 2U;
+  if (call->args.size() != arity) {
+    throw PtoAnalysisError(name + " has the wrong operand count");
+  }
+  for (const PrimExpr &arg : call->args) {
+    if (arg.dtype() != call->dtype || !arg.dtype().is_scalar()) {
+      throw PtoAnalysisError(
+          name + " requires matching bool scalar operands and result");
+    }
+  }
+}
 
 // Whitelist check for *value* expressions. A
 // BufferLoad's indices belong to address analysis, not value lowering
@@ -2119,44 +2293,29 @@ public:
   void VisitExpr_(const ShuffleNode *) final { MarkUnsupported("Shuffle"); }
   void VisitExpr_(const ReduceNode *) final { MarkUnsupported("Reduce"); }
   void VisitExpr_(const CallNode *op) final {
-    if (auto call_op = op->op.as<Op>()) {
-      const std::string &name = call_op.value()->name;
-      // Boolean combine on lane masks (tirx.bitwise_*; table above).
-      if (MaskLogicVmiOpName(name) != nullptr) {
-        for (const auto &arg : op->args) {
-          VisitExpr(arg);
-        }
-        return;
-      }
-      // The frontend -T.infinity(...) sentinel lowers to
-      // Mul(Call(tl.infinity, dtype), -1); infinity is a compile-time float
-      // constant and lane-uniform.
+    if (const auto *call_op = op->op.as<OpNode>()) {
+      const std::string &name = call_op->name;
+      // The infinity sentinel is lane-uniform and Legalize folds it.
       if (name == "tl.infinity" || name == "tir.infinity") {
         return;
       }
-      // Hardware unary math (table above; dtype matrix in
-      // IsSupportedVectorUnaryOp).
-      if (VectorUnaryVmiOpName(name) != nullptr) {
-        if (op->args.size() != 1U) {
-          if (!unsupported.has_value()) {
-            unsupported = name + " expects exactly one operand";
-          }
-          return;
-        }
-        const DataType arg = op->args[0].dtype();
-        if (!IsSupportedVectorUnaryOp(name, arg)) {
-          if (!unsupported.has_value()) {
-            std::ostringstream oss;
-            oss << arg;
-            unsupported = name + " vectorization does not support " +
-                          oss.str() +
-                          " operands (per the VMI operation matrix)";
-          }
-          return;
-        }
+    }
+    Call call = GetRef<Call>(op);
+    try {
+      if (const char *mask_op = GetPtoMaskLogicOp(call)) {
+        CheckPtoMaskCall(call, mask_op);
         ExprVisitor::VisitExpr_(op);
         return;
       }
+      if (CheckPtoValueCall(call)) {
+        ExprVisitor::VisitExpr_(op);
+        return;
+      }
+    } catch (const PtoAnalysisError &err) {
+      if (!unsupported) {
+        unsupported = err.what();
+      }
+      return;
     }
     {
       std::string name = "call";
@@ -2164,8 +2323,9 @@ public:
         name = op_node->name;
       }
       if (!unsupported.has_value()) {
-        unsupported = "unsupported Call `" + name +
-                      "` (only tirx.fabs/exp/log/sqrt are vectorizable)";
+        unsupported =
+            "unsupported Call `" + name +
+            "` (expected a supported math intrinsic or bit operation)";
       }
     }
   }
@@ -2645,15 +2805,48 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
       return LaneUse::kUnknown;
     }
   }
-  // Hardware-backed unary math shares the whitelist's contract (float32
-  // tirx.fabs/exp/log/sqrt; the shared VectorUnaryVmiOpName table):
-  // recurse into the single operand.
   if (const auto *call = expr.as<CallNode>()) {
-    if (auto call_op = call->op.as<Op>()) {
-      const std::string &name = call_op.value()->name;
-      if (VectorUnaryVmiOpName(name) != nullptr) {
-        return AnalyzeLaneUseImpl(call->args[0], ctx, reason, metadata_mode);
+    Call ref = GetRef<Call>(call);
+    // Metadata keeps the original scalar expression. Integer NOT has no
+    // corresponding Parallel data lowering.
+    if (metadata_mode && call->op.same_as(builtin::bitwise_not()) &&
+        call->args.size() == 1 && call->dtype.is_scalar() &&
+        (call->dtype.is_int() || call->dtype.is_uint())) {
+      return AnalyzeLaneUseImpl(call->args[0], ctx, reason, metadata_mode);
+    }
+    PtoBitOp bit_op = GetPtoBitOp(ref);
+    const char *mask_op = GetPtoMaskLogicOp(ref);
+    if (bit_op != PtoBitOp::kNone || mask_op) {
+      try {
+        if (mask_op) {
+          CheckPtoMaskCall(ref, mask_op);
+        } else {
+          CheckPtoBitOp(ref, bit_op);
+        }
+      } catch (const PtoAnalysisError &err) {
+        if (reason) {
+          *reason = err.what();
+        }
+        return LaneUse::kUnknown;
       }
+      LaneUse use = LaneUse::kUniform;
+      for (const PrimExpr &arg : call->args) {
+        LaneUse arg_use = AnalyzeLaneUseImpl(arg, ctx, reason, metadata_mode);
+        if (arg_use == LaneUse::kUnknown) {
+          return arg_use;
+        }
+        if (arg_use == LaneUse::kVarying) {
+          use = arg_use;
+        }
+      }
+      return use;
+    }
+    if (GetPtoUnaryOp(ref)) {
+      return AnalyzeLaneUseImpl(call->args[0], ctx, reason, metadata_mode);
+    }
+    if (const auto *op = call->op.as<OpNode>();
+        op && (op->name == "tl.infinity" || op->name == "tir.infinity")) {
+      return LaneUse::kUniform;
     }
   }
   // Binary/relational/boolean operators: both value and metadata modes
@@ -2749,38 +2942,6 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
   if (const auto *notn = expr.as<NotNode>()) {
     return AnalyzeLaneUseImpl(notn->a, ctx, reason, metadata_mode);
   }
-  if (const auto *call = expr.as<CallNode>()) {
-    std::string name;
-    if (const auto *op_node = call->op.as<OpNode>()) {
-      name = op_node->name;
-    }
-    auto is_mask_logic = [&](const std::string &n) {
-      return MaskLogicVmiOpName(n) != nullptr;
-    };
-    if (is_mask_logic(name)) {
-      if (call->args.empty()) {
-        if (reason)
-          *reason = "empty mask-logic call";
-        return LaneUse::kUnknown;
-      }
-      LaneUse acc =
-          AnalyzeLaneUseImpl(call->args[0], ctx, reason, metadata_mode);
-      if (acc == LaneUse::kUnknown)
-        return LaneUse::kUnknown;
-      for (size_t i = 1; i < call->args.size(); ++i) {
-        LaneUse u =
-            AnalyzeLaneUseImpl(call->args[i], ctx, reason, metadata_mode);
-        if (u == LaneUse::kUnknown)
-          return LaneUse::kUnknown;
-        if (u == LaneUse::kVarying)
-          acc = LaneUse::kVarying;
-      }
-      return acc;
-    }
-    if (name == "tl.infinity" || name == "tir.infinity") {
-      return LaneUse::kUniform;
-    }
-  }
   if (const auto *sel = expr.as<SelectNode>()) {
     // Select(cond, t, f) -> vsel; lane use is varying if any arm is.
     LaneUse c = AnalyzeLaneUseImpl(sel->condition, ctx, reason, metadata_mode);
@@ -2852,11 +3013,19 @@ ValueInfo AnalyzeComputeValue(const PrimExpr &expr, LaneUseContext *ctx) {
     lhs = &op->a;
     rhs = &op->b;
   }
+  if (const auto *call = expr.as<CallNode>()) {
+    if (call->args.size() == 1) {
+      return AnalyzeComputeValue(call->args[0], ctx);
+    }
+    if (call->args.size() == 2 &&
+        GetPtoBitOp(GetRef<Call>(call)) != PtoBitOp::kNone) {
+      return merge(AnalyzeComputeValue(call->args[0], ctx),
+                   AnalyzeComputeValue(call->args[1], ctx));
+    }
+  }
   if (lhs)
     return merge(AnalyzeComputeValue(*lhs, ctx),
                  AnalyzeComputeValue(*rhs, ctx));
-  if (const auto *call = expr.as<CallNode>(); call && call->args.size() == 1)
-    return AnalyzeComputeValue(call->args[0], ctx);
   std::string reason;
   auto use = AnalyzeLaneUse(expr, ctx, &reason);
   ICHECK(use != LaneUse::kUnknown)
@@ -2873,6 +3042,34 @@ LaneUse AnalyzeLaneUse(const PrimExpr &expr, LaneUseContext *ctx,
 LaneUse AnalyzeLaneUseMeta(const PrimExpr &expr, LaneUseContext *ctx,
                            std::string *reason) {
   return AnalyzeLaneUseImpl(expr, ctx, reason, /*metadata_mode=*/true);
+}
+
+const char *GetPtoUnaryOp(const Call &call) {
+  const auto *op = call->op.as<OpNode>();
+  return op ? VectorUnaryVmiOpName(op->name) : nullptr;
+}
+
+bool CheckPtoValueCall(const Call &call) {
+  PtoBitOp bit_op = GetPtoBitOp(call);
+  if (bit_op != PtoBitOp::kNone) {
+    CheckPtoBitOp(call, bit_op);
+    return true;
+  }
+  if (!GetPtoUnaryOp(call)) {
+    return false;
+  }
+  const std::string name = Downcast<Op>(call->op)->name;
+  if (call->args.size() != 1) {
+    throw PtoAnalysisError(name + " expects exactly one operand");
+  }
+  DataType dtype = call->args[0].dtype();
+  if (call->dtype != dtype || !IsSupportedVectorUnaryOp(name, dtype)) {
+    std::ostringstream oss;
+    oss << name << " vectorization does not support " << dtype << " -> "
+        << call->dtype << " (per the VMI operation matrix)";
+    throw PtoAnalysisError(oss.str());
+  }
+  return true;
 }
 
 bool IsSupportedVectorUnaryOp(const std::string &tirx_op, DataType dtype) {
