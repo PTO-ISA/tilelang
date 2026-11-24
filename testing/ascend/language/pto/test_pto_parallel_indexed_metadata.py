@@ -3,22 +3,26 @@
 import pytest
 
 import tilelang.ascend.language as T
-from test_pto_parallel_gather_scatter import calls, lower_case
+from test_pto_parallel_gather_scatter import calls, lower_case, tvm
 
 
-def index_view_stride_kernel(kind="constant"):
+def index_view_stride_kernel(kind="constant", storage_dtype="int32"):
+    extent = 256 if kind == "chunk" else 128
+
     @T.prim_func
-    def main(A: T.Tensor((256,), "float32"), I: T.Tensor((256,), "int32"), C: T.Tensor((128,), "float32")):
+    def main(A: T.Tensor((256,), "float32"), I: T.Tensor((256,), storage_dtype), C: T.Tensor((extent,), "float32")):
         with T.Kernel(1):
             x = T.alloc_shared((256,), "float32")
-            idx = T.alloc_shared((256,), "int32")
-            y = T.alloc_shared((128,), "float32")
+            idx = T.alloc_shared((256,), storage_dtype)
+            y = T.alloc_shared((extent,), "float32")
             T.copy(A, x)
             T.copy(I, idx)
             with T.SimdVF(lanes=128):
-                for i in T.Parallel(128):
+                for i in T.Parallel(extent):
                     if kind == "indexed":
                         view = T.view(idx, shape=(2, 128), strides=(2 * i, 1))
+                    elif kind == "chunk":
+                        view = T.view(idx, shape=(2, 128), dtype="int32", strides=(i // 128, 1))
                     elif kind == "unused":
                         view = T.view(idx, shape=(2, 128), strides=(i, 1))
                     else:
@@ -33,7 +37,7 @@ def index_view_stride_kernel(kind="constant"):
 
 
 @pytest.mark.pto
-@pytest.mark.parametrize("kind", ["constant", "unused"])
+@pytest.mark.parametrize("kind", ["constant", "unused", "chunk"])
 def test_uniform_index_view_only_uses_participating_metadata(kind):
     _, captured = lower_case(f"index_view_stride_{kind}", index_view_stride_kernel(kind))
     converted = captured["VectorizeParallelToPTO_after"]
@@ -46,6 +50,22 @@ def test_indexed_view_metadata_preserves_varying_nested_reads():
     _, captured = lower_case("indexed_view_stride", index_view_stride_kernel("indexed"))
     converted = captured["VectorizeParallelToPTO_after"]
     assert len(calls(converted, "tl.vmi.vgather")) == 2
+
+
+@T.prim_func
+def nested_view_origin_kernel(A: T.Tensor((512,), "float32"), I: T.Tensor((256,), "int32"), C: T.Tensor((256,), "float32")):
+    with T.Kernel(1):
+        x = T.alloc_shared((512,), "float32")
+        idx = T.alloc_shared((256,), "int32")
+        y = T.alloc_shared((256,), "float32")
+        T.copy(A, x)
+        T.copy(I, idx)
+        with T.SimdVF(lanes=128):
+            for i in T.Parallel(256):
+                idx_view = T.view(idx, shape=(256,), strides=(i // 128,))
+                view = tvm.tirx.decl_buffer((256,), "float32", data=x.data, elem_offset=idx_view[1], scope="shared.dyn")
+                y[i] = view[0]
+        T.copy(y, C)
 
 
 def payload_view_stride_kernel(kind="gather", dtype="float32", owner_size=512, *, loaded_index=True):
@@ -146,6 +166,34 @@ def unused_loaded_stride_kernel(uniform=False):
 @pytest.mark.parametrize("uniform", [False, True])
 def test_unused_view_stride_does_not_require_a_scalar_loaded_value(uniform):
     _, captured = lower_case(f"unused_loaded_stride_{uniform}", unused_loaded_stride_kernel(uniform))
+    converted = captured["VectorizeParallelToPTO_after"]
+    assert not calls(converted, "tl.vmi.vgather")
+    assert len(calls(converted, "tl.vmi.vload")) == int(not uniform)
+
+
+@pytest.mark.pto
+@pytest.mark.parametrize("uniform", [True, False], ids=["uniform", "continuous"])
+def test_zero_stride_view_does_not_require_a_scalar_index(uniform):
+    @T.prim_func
+    def main(A: T.Tensor((256,), "float32"), I: T.Tensor((128,), "int32"), C: T.Tensor((128,), "float32")):
+        with T.Kernel(1):
+            x = T.alloc_shared((256,), "float32")
+            idx = T.alloc_shared((128,), "int32")
+            y = T.alloc_shared((128,), "float32")
+            T.copy(A, x)
+            T.copy(I, idx)
+            view = T.view(x, shape=(2, 128), strides=(0, 1))
+            with T.SimdVF(lanes=128):
+                for i in T.Parallel(128):
+                    old = idx[i]
+                    idx[i] = 0
+                    if uniform:
+                        y[i] = view[old, 0]
+                    else:
+                        y[i] = view[old, i]
+            T.copy(y, C)
+
+    _, captured = lower_case(f"zero_stride_index_{uniform}", main)
     converted = captured["VectorizeParallelToPTO_after"]
     assert not calls(converted, "tl.vmi.vgather")
     assert len(calls(converted, "tl.vmi.vload")) == int(not uniform)

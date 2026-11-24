@@ -146,6 +146,75 @@ def versioned(A: T.Tensor((4, 256), "float32"), I: T.Tensor((4, 256), "int32"), 
             T.copy(y, C[t, :])
 
 
+def padded_version_kernel(kind):
+    gather = kind == "gather"
+    input_width = 264 if gather else 128
+    output_width = 128 if gather else 264
+    input_extent = 257 if gather else 128
+    output_extent = 128 if gather else 257
+
+    @T.prim_func
+    def main(A: T.Tensor((4, input_width), "float32"), I: T.Tensor((4, 128), "int32"), C: T.Tensor((4, output_width), "float32")):
+        with T.Kernel(1):
+            x = T.alloc_shared((input_extent,), "float32")
+            idx = T.alloc_shared((128,), "int32")
+            y = T.alloc_shared((output_extent,), "float32")
+            T.annotate_buffer_versions({x: 2, idx: 2, y: 2})
+            for t in T.Pipelined(4, num_stages=2):
+                T.copy(A[t, :input_extent], x)
+                T.copy(I[t, :], idx)
+                if not gather:
+                    T.copy(C[t, :output_extent], y)
+                with T.SimdVF(lanes=128):
+                    for i in T.Parallel(128):
+                        if gather:
+                            y[i] = x[idx[i]]
+                        else:
+                            y[idx[i]] = x[i]
+                T.copy(y, C[t, :output_extent])
+
+    return main
+
+
+@pytest.mark.pto
+@pytest.mark.parametrize("kind", ["gather", "scatter"])
+def test_padded_version_uses_one_slot_for_indexed_access(kind):
+    _, captured = lower_case(f"padded_version_{kind}", padded_version_kernel(kind))
+    (call,) = calls(captured["VectorizeParallelToPTO_after"], f"tl.vmi.v{kind}")
+    pointer = call.args[0 if kind == "gather" else 1]
+    origin, extent, _ = pointer.args
+    assert [int(dim) for dim in origin.buffer.shape] == [2, 257]
+    assert not isinstance(origin.indices[0], tvm.tirx.IntImm)
+    assert int(origin.indices[1]) == 0
+    assert int(extent) == 257
+
+
+def padded_version_view_gather(origin):
+    @T.prim_func
+    def main(A: T.Tensor((2, 264), "float32"), I: T.Tensor((128,), "int32"), C: T.Tensor((128,), "float32")):
+        with T.Kernel(1):
+            x = T.alloc_shared((2, 257), "float32")
+            T.annotate_manual_multi_buffer(x)
+            idx = T.alloc_shared((128,), "int32")
+            out = T.alloc_shared((128,), "float32")
+            view = tvm.tirx.decl_buffer((2, 128), "float32", strides=(257, 1), elem_offset=origin, data=x.data, scope="shared.dyn")
+            T.copy(A[0, :257], x[0, :])
+            T.copy(A[1, :257], x[1, :])
+            T.copy(I, idx)
+            with T.SimdVF(lanes=128):
+                for i in T.Parallel(128):
+                    out[i] = view[0, idx[i]]
+            T.copy(out, C)
+
+    return main
+
+
+@pytest.mark.pto
+def test_indexed_view_cannot_span_padded_version_slots():
+    with pytest.raises(tvm.error.InternalError, match="single version slot"):
+        lower_case("cross_slot_view", padded_version_view_gather(256))
+
+
 @T.prim_func
 def nested_gather(
     A: T.Tensor((256,), "float32"), I: T.Tensor((256,), "int32"), J: T.Tensor((256,), "int32"), C: T.Tensor((256,), "float32")
@@ -318,6 +387,15 @@ def calls(mod, op_name):
             lambda node: result.append(node) if isinstance(node, tvm.tirx.Call) and getattr(node.op, "name", "") == op_name else None,
         )
     return result
+
+
+def binding_values(mod):
+    bindings = {}
+    for func in mod.functions.values():
+        tvm.tirx.stmt_functor.post_order_visit(
+            func.body, lambda node: bindings.update({node.var: node.value}) if isinstance(node, tvm.tirx.Bind) else None
+        )
+    return bindings
 
 
 @T.prim_func
@@ -501,11 +579,13 @@ def test_design_case_uses_real_parallel_lowering(name):
 def test_indexed_dtype_width_and_tail(lanes, dtype, kind):
     _, captured = lower_case(f"{kind}_{dtype}_{lanes}_tail", indexed_kernel(kind, dtype, lanes, lanes + 2))
     after = captured["VectorizeParallelToPTO_after"]
-    operation = calls(after, "tl.vmi.vgather" if kind == "gather" else "tl.vmi.vscatter")
-    assert operation
-    index = 2 if kind == "gather" else 3
-    assert str(operation[0].args[index].dtype) == f"{'int16' if dtype != 'float32' else 'int32'}x{lanes}"
-    assert calls(after, "tl.vmi.vsel")
+    (operation,) = calls(after, f"tl.vmi.v{kind}")
+    offsets, mask = operation.args[-2:]
+    assert str(offsets.dtype) == f"{'int16' if dtype != 'float32' else 'int32'}x{lanes}"
+    bindings = binding_values(after)
+    load = bindings[offsets]
+    assert load.op.name == "tl.vmi.vload" and load.args[0].args[0].buffer.name == "idx"
+    assert bindings[mask].op.name == "tl.vmi.create_mask"
 
 
 @pytest.mark.pto
@@ -558,9 +638,8 @@ def test_explicit_access_predicate_remains_outside_gather_scatter_scope(access_k
         return None
 
     body = tvm.tirx.stmt_functor.ir_transform(func.body, None, rewrite, ["tirx.BufferLoad", "tirx.BufferStore"])
-    diagnostic = (
-        "buffer `x` load.*requires gather.*BufferStore access predicate" if access_kind == "store" else "non-trivial access predicate"
-    )
+    buffer = "y" if access_kind == "store" else "idx"
+    diagnostic = rf"buffer `{buffer}` carries an access predicate that is not provably true"
     with pytest.raises(Exception, match=diagnostic):
         lower_case(f"rejected_{access_kind}_predicate", func.with_body(body))
 
@@ -622,7 +701,7 @@ def test_b16_window_keeps_native_relative_index():
 @pytest.mark.pto
 @pytest.mark.parametrize("kind", ["gather", "scatter"])
 @pytest.mark.parametrize("extent", [22, 128, 150, 256, 278])
-def test_tail_presence_selects_loop_wide_offset_cleaning(kind, extent):
+def test_indexed_chunks_use_direct_offsets_and_active_mask(kind, extent):
     artifact, captured = lower_case(f"unified_{kind}_{extent}", indexed_kernel(kind, lanes=128, extent=extent))
     mod = captured["VectorizeParallelToPTO_after"]
     loops = []
@@ -637,14 +716,11 @@ def test_tail_presence_selects_loop_wide_offset_cleaning(kind, extent):
         assert masks[0].args[0].buffer.name.startswith("remaining")
     else:
         assert int(masks[0].args[0]) == 128
-    loop_operations = []
-    tvm.tirx.stmt_functor.post_order_visit(
-        loops[0].body, lambda node: loop_operations.append(node.op.name) if isinstance(node, tvm.tirx.Call) else None
-    )
-    assert loop_operations.count("tl.vmi.vsel") == int(has_tail)
-    assert loop_operations.count("tl.vmi.vbrc") == int(has_tail), "only loops with a tail broadcast a cleaning zero"
-    operation = calls(mod, "tl.vmi.vgather" if kind == "gather" else "tl.vmi.vscatter")
-    assert len(operation) == 1, "one shared body handles every chunk"
+    assert not calls(mod, "tl.vmi.vsel")
+    assert not calls(mod, "tl.vmi.vbrc")
+    (operation,) = calls(mod, f"tl.vmi.v{kind}")
+    bindings = binding_values(mod)
+    assert bindings[operation.args[-1]].same_as(masks[0])
     assert artifact.kernel_source
 
 
@@ -671,26 +747,32 @@ def mixed_indexed_units_kernel():
 
 
 @pytest.mark.pto
-def test_sequential_units_choose_offset_cleaning_independently():
+def test_sequential_indexed_units_choose_masks_independently():
     _, captured = lower_case("mixed_indexed_units", mixed_indexed_units_kernel())
     mod = captured["VectorizeParallelToPTO_after"]
     loops = []
     for func in mod.functions.values():
         tvm.tirx.stmt_functor.post_order_visit(func.body, lambda node: loops.append(node) if isinstance(node, tvm.tirx.For) else None)
     assert len(loops) == 3 and all(int(loop.extent) == 2 for loop in loops)
+    bindings = binding_values(mod)
     for loop, has_tail in zip(loops, (True, False, True)):
         operations = []
         tvm.tirx.stmt_functor.post_order_visit(
             loop.body, lambda node, operations=operations: operations.append(node) if isinstance(node, tvm.tirx.Call) else None
         )
         names = [node.op.name for node in operations]
-        assert names.count("tl.vmi.vsel") == int(has_tail)
-        assert names.count("tl.vmi.vbrc") == int(has_tail)
+        assert "tl.vmi.vsel" not in names and "tl.vmi.vbrc" not in names
         assert names.count("tl.vmi.create_mask") == int(has_tail)
         gather = next(node for node in operations if node.op.name == "tl.vmi.vgather")
         add = next(node for node in operations if node.op.name == "tl.vmi.vadd")
         store = next(node for node in operations if node.op.name == "tl.vmi.vstore")
         assert gather.args[3].same_as(add.args[2]) and gather.args[3].same_as(store.args[3])
+        mask = bindings[gather.args[3]]
+        assert mask.op.name == "tl.vmi.create_mask"
+        if has_tail:
+            assert isinstance(mask.args[0], tvm.tirx.BufferLoad) and mask.args[0].buffer.name.startswith("remaining")
+        else:
+            assert int(mask.args[0]) == 128
 
 
 def indexed_2d_tail_kernel(kind="gather"):
@@ -716,15 +798,15 @@ def indexed_2d_tail_kernel(kind="gather"):
 
 @pytest.mark.pto
 @pytest.mark.parametrize("kind", ["gather", "scatter"])
-def test_2d_indexed_tail_cleans_offsets_in_the_shared_loop(kind):
+def test_2d_indexed_tail_uses_direct_offsets_and_active_mask(kind):
     _, captured = lower_case(f"unified_2d_{kind}", indexed_2d_tail_kernel(kind))
     mod = captured["VectorizeParallelToPTO_after"]
-    assert len(calls(mod, "tl.vmi.vsel")) == 1
+    assert not calls(mod, "tl.vmi.vsel")
     masks = calls(mod, "tl.vmi.create_mask")
     assert len(masks) == 1 and isinstance(masks[0].args[0], tvm.tirx.BufferLoad)
     assert masks[0].args[0].buffer.name.startswith("remaining")
-    operations = calls(mod, "tl.vmi.vgather" if kind == "gather" else "tl.vmi.vscatter")
-    assert len(operations) == 1
+    (operation,) = calls(mod, f"tl.vmi.v{kind}")
+    assert binding_values(mod)[operation.args[-1]].same_as(masks[0])
 
 
 def saved_index_loop_kernel():
@@ -753,10 +835,8 @@ def test_unified_loop_keeps_the_saved_index_definition():
     mod = captured["VectorizeParallelToPTO_after"]
     index_loads = [call for call in calls(mod, "tl.vmi.vload") if call.args[0].args[0].buffer.name == "idx"]
     assert len(index_loads) == 1, "every loop iteration reads the old index only at its definition"
-    assert len(calls(mod, "tl.vmi.vgather")) == 1
-    cleaned = calls(mod, "tl.vmi.vsel")
-    assert len(cleaned) == 1
-    assert isinstance(cleaned[0].args[1], tvm.tirx.Var) and cleaned[0].args[1].name == "old"
+    (gather,) = calls(mod, "tl.vmi.vgather")
+    assert isinstance(gather.args[2], tvm.tirx.Var) and gather.args[2].name == "old"
 
 
 def handwritten_signed_offset_kernel(kind="gather", index_dtype="int32", payload_dtype="float32", owner_size=256, *, compact=False):
@@ -799,9 +879,9 @@ def test_handwritten_signed_offsets_reach_ptoas_without_tilelang_reinterpret(kin
 
 @pytest.mark.pto
 @pytest.mark.parametrize("kind", ["gather", "scatter"])
-@pytest.mark.parametrize("index_dtype", ["int16", "uint16"])
+@pytest.mark.parametrize("index_dtype", ["int8", "uint8", "int16", "uint16"])
 @pytest.mark.parametrize("extent", [256, 278])
-def test_native_b16_index_does_not_round_trip_through_int32(kind, index_dtype, extent):
+def test_native_narrow_index_does_not_round_trip_through_int32(kind, index_dtype, extent):
     artifact, captured = lower_case(
         f"native16_{kind}_{index_dtype}_{extent}",
         indexed_kernel(kind, "float16", 128, extent, index_dtype=index_dtype),
@@ -819,9 +899,9 @@ def test_native_b16_index_does_not_round_trip_through_int32(kind, index_dtype, e
 
 @pytest.mark.pto
 @pytest.mark.parametrize("kind", ["gather", "scatter"])
-@pytest.mark.parametrize("index_dtype", ["int16", "uint16"])
+@pytest.mark.parametrize("index_dtype", ["int8", "uint8", "int16", "uint16"])
 @pytest.mark.parametrize("extent", [256, 150])
-def test_b32_memory_delegates_native_int16_index_widening_to_dsl(kind, index_dtype, extent):
+def test_b32_memory_delegates_native_index_widening_to_dsl(kind, index_dtype, extent):
     artifact, captured = lower_case(
         f"b32_native16_{kind}_{index_dtype}_{extent}", indexed_kernel(kind, "float32", 128, extent, index_dtype=index_dtype)
     )
@@ -943,12 +1023,12 @@ def native16_offset_view_kernel(kind="gather", payload_dtype="float16"):
 @pytest.mark.parametrize("kind", ["gather", "scatter"])
 @pytest.mark.parametrize("payload_dtype", ["float16", "float32"])
 def test_native16_address_arithmetic_keeps_wide_intermediates(kind, payload_dtype):
-    if payload_dtype == "float16":
-        with pytest.raises(Exception, match="implicit narrowing"):
-            lower_case(f"native16_{kind}_{payload_dtype}_offset_view", native16_offset_view_kernel(kind, payload_dtype))
-        return
     _, captured = lower_case(f"native16_{kind}_{payload_dtype}_offset_view", native16_offset_view_kernel(kind, payload_dtype))
     mod = captured["VectorizeParallelToPTO_after"]
+    if payload_dtype == "float16":
+        (indexed,) = calls(mod, f"tl.vmi.v{kind}")
+        assert int(indexed.args[-3]) == 40000 and str(indexed.args[-2].dtype) == "uint16x128"
+        return
     additions = calls(mod, "tl.vmi.vadd")
     assert additions and all(str(call.dtype) == "int32x128" for call in additions)
     assert calls(mod, "tl.vmi.vcvt"), "adding the view origin must not wrap in 16-bit arithmetic"

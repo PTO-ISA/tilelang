@@ -4,9 +4,37 @@ import pytest
 import torch
 
 from test_pto_parallel_gather_scatter_run import _run, npu as _npu
-from test_pto_parallel_indexed_metadata import continuous_payload_view_stride, payload_view_stride_kernel, unused_loaded_stride_kernel
+from test_pto_parallel_indexed_metadata import (
+    continuous_payload_view_stride,
+    index_view_stride_kernel,
+    nested_view_origin_kernel,
+    payload_view_stride_kernel,
+    unused_loaded_stride_kernel,
+)
 
 npu = _npu
+
+
+@pytest.mark.pto
+def test_nested_view_origin_uses_each_chunk_index(npu):
+    source = torch.arange(512, dtype=torch.float32)
+    index = torch.arange(256, dtype=torch.int32) + 7
+    output = torch.zeros(256, dtype=torch.float32)
+    expected = source[index[:2].long()].repeat_interleave(128)
+    _run("nested_view_origin", nested_view_origin_kernel, [source, index, output], expected, npu)
+
+
+@pytest.mark.pto
+@pytest.mark.parametrize("storage_dtype", ["int32", "uint32"])
+def test_nested_index_view_uses_each_chunk_stride(storage_dtype, npu):
+    source = torch.arange(256, dtype=torch.float32)
+    index = torch.arange(256, dtype=torch.int32) + 7
+    output = torch.zeros(256, dtype=torch.float32)
+    expected = source[index[:2].long()].repeat_interleave(128)
+    index = index.to(getattr(torch, storage_dtype))
+    _run(
+        f"index_view_chunk_stride_{storage_dtype}", index_view_stride_kernel("chunk", storage_dtype), [source, index, output], expected, npu
+    )
 
 
 @pytest.mark.pto

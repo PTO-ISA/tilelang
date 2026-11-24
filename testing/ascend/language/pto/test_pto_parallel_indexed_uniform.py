@@ -1,16 +1,11 @@
 """Uniform scatter targets preserve scalar addressing and SSA."""
 
-import importlib.util
-from pathlib import Path
-
 import pytest
 
 import tilelang.ascend.language as T
 from tilelang import tvm
 
-_spec = importlib.util.spec_from_file_location("indexed_uniform_gs", Path(__file__).with_name("test_pto_parallel_gather_scatter.py"))
-gs = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(gs)
+import test_pto_parallel_gather_scatter as gs
 
 
 def uniform_store_kernel(value_kind="vector", extent=256, *, select_target=False):
@@ -51,26 +46,22 @@ def test_uniform_store_broadcasts_actual_nonzero_offset(value_kind, extent):
     assert int(scatter.args[2]) == 0
     assert str(scatter.args[0].dtype) == str(scatter.args[3].dtype) == "int32x128"
     assert str(scatter.args[4].dtype) == "boolx128"
-    bindings = {}
-    for func in mod.functions.values():
-        tvm.tirx.stmt_functor.post_order_visit(
-            func.body, lambda node: bindings.update({node.var: node.value}) if isinstance(node, tvm.tirx.Bind) else None
-        )
+    bindings = gs.binding_values(mod)
     offsets = bindings[scatter.args[3]]
-    if extent == 150:
-        assert offsets.op.name == "tl.vmi.vsel"
-        assert offsets.args[0].same_as(scatter.args[4])
-        zero = bindings[offsets.args[2]]
-        assert zero.op.name == "tl.vmi.vbrc" and int(zero.args[0]) == 0
-        offsets = bindings[offsets.args[1]]
     assert offsets.op.name == "tl.vmi.vbrc"
     assert int(offsets.args[0]) == 131, "scatter consumes the real nonzero uniform offset"
+    mask = bindings[scatter.args[4]]
+    assert mask.op.name == "tl.vmi.create_mask"
+    if extent == 150:
+        assert isinstance(mask.args[0], tvm.tirx.BufferLoad) and mask.args[0].buffer.name.startswith("remaining")
+    else:
+        assert int(mask.args[0]) == 128
     if value_kind == "scalar":
         value = bindings[scatter.args[0]]
         assert value.op.name == "tl.vmi.vbrc" and int(value.args[0]) == 7
     loads = gs.calls(mod, "tl.vmi.vload")
     assert len(loads) == int(value_kind == "vector")
-    assert len(gs.calls(mod, "tl.vmi.vsel")) == int(extent == 150), "offset cleaning follows the unit's tail policy"
+    assert not gs.calls(mod, "tl.vmi.vsel")
     assert not gs.calls(mod, "tl.vmi.vgather")
     assert not gs.calls(mod, "tl.vmi.vstore")
 

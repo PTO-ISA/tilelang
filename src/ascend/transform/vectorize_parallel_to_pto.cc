@@ -29,8 +29,8 @@
  *
  * Non-divisible extents use a per-chunk mask in the same loop. Continuous
  * vload is unmasked: the caller must provide initialized readable padding
- * for every complete logical vector. Indexed offsets are sanitized in every
- * iteration when the unit has a tail, and passed directly otherwise.
+ * for every complete logical vector. Indexed gather and scatter consume
+ * the per-chunk mask directly to limit memory accesses to active lanes.
  */
 
 #include <tvm/tirx/analysis.h>
@@ -51,7 +51,7 @@
 
 #include "buffer_version.h"
 #include "parallel_to_pto_utils.h"
-#include "pto_indexed_memory.h"
+#include "transform/common/storage_size.h"
 
 namespace tvm {
 namespace tl {
@@ -281,17 +281,6 @@ private:
     return result;
   }
 
-  // ------------------------------------------------------------------
-  // Unified unit discovery (shared rules with Verify).
-  // A SIMD_VF region contains zero or more *sequential* parallel units.
-  // Each unit is the outermost parallel For of a 1D loop or of a
-  // two-layer adjacent Parallel nest (2D); a third parallel layer (or a
-  // Parallel under an unsupported wrapper) is rejected by Verify and
-  // defensively rejected here too.
-  // ------------------------------------------------------------------
-  // ------------------------------------------------------------------
-  // SIMD_VF block entry
-  // ------------------------------------------------------------------
   Stmt VisitStmt_(const SBlockNode *op) final {
     for (const Buffer &buffer : op->alloc_buffers) {
       active_allocations_.push_back(buffer);
@@ -327,7 +316,7 @@ private:
     full_masks_.clear();
     mask_prelude_.clear();
     for (const auto &[data, info] : reducers_.storage_values) {
-      if (info.kind != pto::ValueKind::kVmi)
+      if (!info.IsVmi())
         continue;
       Buffer old = storage_.Allocation(data);
       vf_buffers_.emplace(
@@ -404,20 +393,19 @@ private:
       if (it != value_infos_.end())
         return it->second;
     }
-    return {value.dtype().lanes() > 1 ? pto::ValueKind::kVmi
-                                      : pto::ValueKind::kScalar,
-            value.dtype().lanes()};
+    return value.dtype().lanes() > 1 ? pto::ValueInfo::Vmi(value.dtype())
+                                     : pto::GetValueInfo(value, value_infos_);
   }
 
   PrimExpr ToVmiWidth(const PrimExpr &source, int64_t width, Array<Stmt> *pre) {
     auto info = Info(source);
-    if (info.kind == pto::ValueKind::kVmi && info.logical_lanes == width)
+    const auto adaptation = pto::PlanWidthAdaptation(info, width);
+    if (adaptation == pto::WidthAdaptation::kKeep)
       return source;
-    ICHECK(info.logical_lanes == 1) << "unsupported PTO value width conversion";
     pto::CheckBroadcastDType(source.dtype().element_of(),
                              "PTO value broadcast");
     Map<String, ObjectRef> attrs{{"size", Integer(width)}};
-    if (info.kind == pto::ValueKind::kVmi)
+    if (adaptation == pto::WidthAdaptation::kBroadcastOneLane)
       attrs.Set("group", Integer(1));
     return EmitBind(
         "broadcast",
@@ -431,7 +419,7 @@ private:
       if (it != vf_buffers_.end()) {
         Var value = EmitBind("result_snapshot",
                              BufferLoad(it->second, load->indices), pre);
-        value_infos_[value] = {pto::ValueKind::kVmi, it->second->dtype.lanes()};
+        value_infos_[value] = pto::ValueInfo::Vmi(it->second->dtype);
         return value;
       }
       return EmitBind("scalar_snapshot", source, pre);
@@ -476,7 +464,7 @@ private:
 
   Stmt LowerDirectReduce(const Call &call, int64_t lanes) {
     pto_analysis::PtoDirectReducePlan plan =
-        pto_analysis::PlanPtoDirectReduce(call, &analyzer_, buffer_versions_);
+        pto_analysis::PlanPtoDirectReduce(call, analyzer_, buffer_versions_);
     bool absolute = plan.operation == "abssum" || plan.operation == "absmax";
     bool sum = plan.operation == "sum" || plan.operation == "abssum";
     bool maximum = plan.operation == "max" || plan.operation == "absmax";
@@ -704,7 +692,7 @@ private:
     if (op->attr_key == tirx::attr::thread_extent) {
       if (const auto *iv = op->node.as<IterVarNode>()) {
         With<arith::ConstraintContext> launch_bounds(
-            &analyzer_, iv->var >= 0 && iv->var < op->value);
+            analyzer_, iv->var >= 0 && iv->var < op->value);
         return StmtExprMutator::VisitStmt_(op);
       }
     }
@@ -732,7 +720,7 @@ private:
 
   Stmt LowerFill(const Call &call, int64_t lanes) {
     pto_analysis::PtoFillPlan plan =
-        pto_analysis::PlanPtoFill(call, &analyzer_, buffer_versions_);
+        pto_analysis::PlanPtoFill(call, analyzer_, buffer_versions_);
     auto i32 = [](int64_t value) { return IntImm(DataType::Int(32), value); };
     Buffer dst = plan.destination->buffer;
     DataType dtype = dst->dtype;
@@ -821,7 +809,7 @@ private:
   }
 
   Stmt VisitStmt_(const ForNode *op) final {
-    analyzer_.Bind(op->loop_var, Range::FromMinExtent(op->min, op->extent));
+    pto_analysis::ScopedPtoLoopBounds loop_bounds(analyzer_, GetRef<For>(op));
     return StmtExprMutator::VisitStmt_(op);
   }
 
@@ -876,8 +864,8 @@ private:
         declarations.push_back(result);
         result = SeqStmt::Flatten(declarations);
       } else {
-        analyzer_.Bind(loop->loop_var,
-                       Range::FromMinExtent(loop->min, loop->extent));
+        pto_analysis::ScopedPtoLoopBounds loop_bounds(analyzer_,
+                                                      GetRef<For>(loop));
         For replacement = GetRef<For>(loop);
         replacement.CopyOnWrite()->body = ConvertRegion(loop->body);
         result = replacement;
@@ -892,8 +880,8 @@ private:
       auto saved_values = value_map_;
       auto saved_infos = value_infos_;
       auto saved_versions = buffer_versions_;
-      if (attr->attr_key == "tl.buffer_version")
-        for (const auto &[data, count] : Downcast<Map<Var, int>>(attr->node))
+      if (attr->attr_key == tl::attr::kBufferVersion)
+        for (const auto &[data, count] : attr->node.cast<BufferVersionMap>())
           buffer_versions_.Set(data, count);
       Stmt body = ConvertRegion(attr->body);
       buffer_versions_ = std::move(saved_versions);
@@ -937,8 +925,7 @@ private:
       for (const auto &site : reducers_.finalizes)
         seed |= site->seed.defined() &&
                 site->seed.value()->buffer->data.same_as(data);
-      if (seed && Info(value).kind == pto::ValueKind::kVmi &&
-          !vf_buffers_.count(data))
+      if (seed && Info(value).IsVmi() && !vf_buffers_.count(data))
         vf_buffers_.emplace(
             data, decl_buffer(store->buffer->shape, store->buffer->dtype,
                               store->buffer->name + "_v", "local.var"));
@@ -946,7 +933,7 @@ private:
       if (target != vf_buffers_.end()) {
         value = ToVmiWidth(value, target->second->dtype.lanes(), &out);
         out.push_back(BufferStore(target->second, value, store->indices));
-      } else if (Info(value).kind == pto::ValueKind::kVmi) {
+      } else if (Info(value).IsVmi()) {
         PrimExpr ptr = Call(DataType::Handle(), tl::access_ptr(),
                             {BufferLoad(store->buffer, store->indices),
                              Integer(1), Integer(2)});
@@ -1010,6 +997,52 @@ private:
     }
     tmp_counter_ = 0;
     unit_mapping_ = mapping;
+    // Only address consumers may request algebraic scalarization of saved
+    // integer coordinates. Ordinary computation uses value classification,
+    // without applying the loaded-index dtype contract to its Cast inputs.
+    address_vars_.clear();
+    std::vector<Bind> definitions;
+    std::unordered_set<BufferLoad, ObjectPtrHash, ObjectPtrEqual> address_loads;
+    std::function<void(const PrimExpr &)> collect_address_vars =
+        [&](const PrimExpr &expr) {
+          PostOrderVisit(expr, [&](const ObjectRef &node) {
+            if (auto var = node.as<Var>()) {
+              address_vars_.insert(*var);
+            } else if (auto load = node.as<BufferLoad>();
+                       load && address_loads.insert(*load).second) {
+              // The ordinary visitor skips view metadata at load sites.
+              for (const PrimExpr &offset :
+                   (*load)->buffer->ElemOffset((*load)->indices)) {
+                collect_address_vars(offset);
+              }
+            }
+          });
+        };
+    auto collect_access = [&](const Buffer &buffer,
+                              const Array<PrimExpr> &indices) {
+      for (const PrimExpr &index : indices) {
+        collect_address_vars(index);
+      }
+      // View strides and origins can capture Bind values too.
+      for (const PrimExpr &offset : buffer->ElemOffset(indices)) {
+        collect_address_vars(offset);
+      }
+    };
+    PostOrderVisit(loop->body, [&](const ObjectRef &node) {
+      if (const auto *bind = node.as<BindNode>()) {
+        definitions.push_back(GetRef<Bind>(bind));
+      } else if (const auto *load = node.as<BufferLoadNode>()) {
+        collect_access(load->buffer, load->indices);
+      } else if (const auto *store = node.as<BufferStoreNode>()) {
+        collect_access(store->buffer, store->indices);
+      }
+    });
+    // In verified SSA every dependency precedes its use.
+    for (auto it = definitions.rbegin(); it != definitions.rend(); ++it) {
+      if (address_vars_.count((*it)->var)) {
+        collect_address_vars((*it)->value);
+      }
+    }
     Optional<For> inner;
     if (const auto *body_for = loop->body.as<ForNode>()) {
       if (body_for->kind == ForKind::kParallel) {
@@ -1020,22 +1053,18 @@ private:
                                                       : mapping.outer_var)
                               : loop->loop_var;
     lanes_ = mapping.lanes;
-    lane_var_ = mapping.lane_var;
-    chunk_analysis_ = mapping.chunk_var;
-    lane_indexed_expr_ = mapping.index_expr;
     Var chunk("q", loop_var_.dtype());
     chunk_index_ = chunk;
-    analyzer_.Bind(chunk, Range::FromMinExtent(
-                              make_zero(chunk.dtype()),
-                              IntImm(chunk.dtype(), mapping.chunk_count)));
-    if (mapping.is_2d) {
-      const Var kept =
-          mapping.select_inner ? mapping.outer_var : mapping.inner_var;
-      const int64_t extent =
-          mapping.select_inner ? mapping.outer_extent : mapping.inner_extent;
-      analyzer_.Bind(kept, Range::FromMinExtent(make_zero(kept.dtype()),
-                                                IntImm(kept.dtype(), extent)));
+    PrimExpr unit_bounds = chunk >= make_zero(chunk.dtype()) &&
+                           chunk < IntImm(chunk.dtype(), mapping.chunk_count);
+    const auto serial = mapping.SerialVar();
+    if (serial) {
+      const Var &serial_var = serial.value();
+      unit_bounds =
+          unit_bounds && serial_var >= make_zero(serial_var.dtype()) &&
+          serial_var < IntImm(serial_var.dtype(), mapping.SerialExtent());
     }
+    With<arith::ConstraintContext> unit_scope(analyzer_, unit_bounds);
 
     // Decide once from the static extent. A tail-bearing unit keeps the
     // existing element-wise remaining-mask loop, including its full chunks.
@@ -1077,114 +1106,54 @@ private:
                               {make_zero(DataType::Int(32))});
       body = SeqStmt::Flatten(init, body);
     }
-    if (inner.defined()) {
+    if (serial) {
       // Reset remaining inside the kept loop so every row/column has the
       // same ceil(E/L) iterations and its own final partial mask.
-      const Var kept_var =
-          mapping.select_inner ? loop->loop_var : inner.value()->loop_var;
-      const int64_t kept_extent =
-          mapping.select_inner ? mapping.outer_extent : mapping.inner_extent;
-      body = For(kept_var, make_zero(kept_var.dtype()),
-                 IntImm(kept_var.dtype(), kept_extent), ForKind::kSerial, body);
+      const Var &serial_var = serial.value();
+      body = For(serial_var, make_zero(serial_var.dtype()),
+                 IntImm(serial_var.dtype(), mapping.SerialExtent()),
+                 ForKind::kSerial, body);
     }
     return has_tail ? SeqStmt::Flatten(AllocBuffer(remaining), body) : body;
   }
 
   // Substitute the analysis chunk placeholder with the unified loop's q.
   PrimExpr BindChunkToQ(const PrimExpr &expr) const {
-    return pto_analysis::SubstituteVar(expr, chunk_analysis_.get(),
+    return pto_analysis::SubstituteVar(expr, unit_mapping_.chunk_var.get(),
                                        chunk_index_);
   }
 
-  // Rewrite Var references inside metadata objects through value_map_
-  // Follows containers (Array/Map) structurally; PrimExprs get a
-  // var substitution.
-  ObjectRef RemapMetadataVars(const ObjectRef &obj) const {
-    if (!obj.defined()) {
-      return obj;
-    }
-    if (const auto *expr = obj.as<PrimExprNode>()) {
-      class RemapVars : public ExprMutator {
-      public:
-        RemapVars(const Map<Var, Var> &vmap) : vmap_(vmap) {}
-        PrimExpr VisitExpr_(const VarNode *op) final {
-          auto it = vmap_.find(GetRef<Var>(op));
-          if (it != vmap_.end()) {
-            return (*it).second;
-          }
-          return GetRef<PrimExpr>(op);
-        }
-
-      private:
-        const Map<Var, Var> &vmap_;
-      };
-      return RemapVars(value_map_)(GetRef<PrimExpr>(expr));
-    }
-    // Containers are rejected by Verify (metadata must be a PrimExpr);
-    // reaching here with one is an internal error.
-    ICHECK(obj.as<PrimExprNode>() == nullptr)
-        << "[VectorizeParallelToPTO] internal error: container metadata "
-           "passed Verify";
-    return obj;
-  }
-
   PrimExpr SubstituteLaneZero(const PrimExpr &expr) const {
-    class ZeroLane : public ExprMutator {
-    public:
-      ZeroLane(const Var &lane) : lane_(lane) {}
-      PrimExpr VisitExpr_(const VarNode *op) final {
-        if (op == lane_.get()) {
-          return make_zero(lane_->dtype);
-        }
-        return ffi::GetRef<PrimExpr>(op);
-      }
-
-    private:
-      Var lane_;
-    };
-    return ZeroLane(lane_var_)(expr);
+    const Var &lane = unit_mapping_.lane_var;
+    return pto_analysis::SubstituteVar(expr, lane.get(),
+                                       make_zero(lane.dtype()));
   }
 
   PrimExpr Broadcast(PrimExpr value, Array<Stmt> *pre) {
-    if (value.dtype().lanes() != 1)
-      return value;
-    pto_analysis::CheckBroadcastDType(value.dtype(),
-                                      "vector store or indexed operand");
-    return EmitBind("broadcast",
-                    Call(VectorDType(value.dtype(), lanes_), VmiOp("vbrc"),
-                         {value},
-                         {{"size", IntImm(DataType::Int(32), lanes_)}}),
-                    pre);
+    return ToVmiWidth(value, lanes_, pre);
   }
 
-  bool IsUniform(const PrimExpr &expr) {
-    // Fixed indices can still refer to private lanes or reducer VMI storage.
-    // A one-lane VMI value also needs value lowering, including through
-    // aliases.
+  bool IsLaneUniformAddressExpr(const PrimExpr &expr) {
+    // Fixed indices can refer to private lanes or VMI storage. Even a one-lane
+    // VMI value still requires value lowering, including through aliases.
+    PrimExpr simplified = analyzer_->Simplify(expr);
     bool needs_vmi = false;
-    PostOrderVisit(expr, [&](const ObjectRef &node) {
+    PostOrderVisit(simplified, [&](const ObjectRef &node) {
       if (const auto *load = node.as<BufferLoadNode>()) {
         needs_vmi |= storage_.IsPrivate(load->buffer->data) ||
                      vf_buffers_.count(load->buffer->data);
       }
       if (const auto *var = node.as<VarNode>()) {
         if (auto mapped = value_map_.Get(GetRef<Var>(var)))
-          needs_vmi |= Info(mapped.value()).kind == pto::ValueKind::kVmi;
+          needs_vmi |= Info(mapped.value()).IsVmi();
       }
     });
     if (needs_vmi)
       return false;
-    Optional<Var> kept_var;
-    int64_t kept_extent = 0;
-    if (unit_mapping_.is_2d) {
-      kept_var = unit_mapping_.select_inner ? unit_mapping_.outer_var
-                                            : unit_mapping_.inner_var;
-      kept_extent = unit_mapping_.select_inner ? unit_mapping_.outer_extent
-                                               : unit_mapping_.inner_extent;
-    }
     return pto_analysis::IsPtoLaneUniform(
-        expr, loop_var_, lane_indexed_expr_, lane_var_, chunk_analysis_, lanes_,
-        unit_mapping_.chunk_count, kept_var, kept_extent, bind_env_);
+        simplified, loop_var_, unit_mapping_.index_expr, unit_mapping_.lane_var,
+        unit_mapping_.chunk_var, lanes_, unit_mapping_.chunk_count,
+        unit_mapping_.SerialVar(), unit_mapping_.SerialExtent(), bind_env_);
   }
 
   PrimExpr ConvertScalarExpr(const PrimExpr &expr) {
@@ -1192,10 +1161,16 @@ private:
     public:
       explicit ScalarRemap(VectorizeParallelToPTOImpl *parent)
           : parent_(parent) {}
+      PrimExpr VisitExpr_(const BufferLoadNode *op) final {
+        // A scalar index can itself be a read from a view whose stride or
+        // origin uses the Parallel coordinate.
+        return parent_->ScalarBufferLoad(op->buffer, op->indices);
+      }
       PrimExpr VisitExpr_(const VarNode *op) final {
         auto it = parent_->value_map_.find(GetRef<Var>(op));
         if (it != parent_->value_map_.end()) {
-          ICHECK_EQ((*it).second.dtype().lanes(), 1);
+          ICHECK(parent_->Info((*it).second).kind ==
+                 pto_analysis::ValueKind::kScalar);
           return (*it).second;
         }
         return GetRef<PrimExpr>(op);
@@ -1205,9 +1180,9 @@ private:
       VectorizeParallelToPTOImpl *parent_;
     } remap(this);
     PrimExpr scalar = pto_analysis::SubstituteVar(
-        expr, loop_var_.get(), BindChunkToQ(lane_indexed_expr_));
-    scalar = analyzer_.Simplify(SubstituteLaneZero(scalar));
-    return analyzer_.Simplify(remap(scalar));
+        expr, loop_var_.get(), BindChunkToQ(unit_mapping_.index_expr));
+    scalar = analyzer_->Simplify(SubstituteLaneZero(scalar));
+    return analyzer_->Simplify(remap(scalar));
   }
 
   PrimExpr ScalarBufferLoad(const Buffer &buffer,
@@ -1215,7 +1190,11 @@ private:
     bool remap_metadata = false;
     auto inspect = [&](const PrimExpr &expr) {
       PostOrderVisit(expr, [&](const ObjectRef &node) {
-        if (const auto *var = node.as<VarNode>()) {
+        if (node.as<BufferLoadNode>()) {
+          // The nested load's view may depend on the Parallel coordinate even
+          // when its logical indices are constant.
+          remap_metadata = true;
+        } else if (const auto *var = node.as<VarNode>()) {
           remap_metadata |=
               var == loop_var_.get() || value_map_.count(GetRef<Var>(var));
         }
@@ -1226,20 +1205,44 @@ private:
     for (const PrimExpr &stride : buffer->strides)
       inspect(stride);
     inspect(buffer->elem_offset);
-    if (remap_metadata) {
-      // Flatten the complete address before remapping it: unused metadata
-      // may mention a vector Bind even when the physical address is scalar.
+    bool has_non_scalar_index = false;
+    for (const PrimExpr &index : indices) {
+      PostOrderVisit(index, [&](const ObjectRef &node) {
+        if (auto var = node.as<Var>()) {
+          auto mapped = value_map_.find(*var);
+          if (mapped != value_map_.end()) {
+            auto info = Info((*mapped).second);
+            has_non_scalar_index |=
+                info.kind != pto_analysis::ValueKind::kScalar;
+          }
+        }
+      });
+    }
+    if (remap_metadata || has_non_scalar_index) {
+      // Simplify the complete address before remapping it. A zero stride
+      // can make a lane-varying logical index irrelevant to a scalar address.
       for (const Buffer &owner : active_allocations_) {
-        if (owner->data.same_as(buffer->data) &&
-            owner->dtype == buffer->dtype) {
+        if (owner->data.same_as(buffer->data)) {
           Buffer flat = owner.GetFlattenedBuffer();
           PrimExpr offset = ConvertScalarExpr(buffer->ElemOffset(indices)[0]);
+          if (flat->dtype != buffer->dtype) {
+            // Scalar and continuous accesses keep the view's element units
+            // when it reinterprets the allocation.
+            PrimExpr extent = analyzer_->Simplify(floordiv(
+                GetBufferStorageSizeBytes(flat), buffer->dtype.bytes()));
+            auto *view = flat.CopyOnWrite();
+            view->dtype = buffer->dtype;
+            view->shape = {extent};
+            view->elem_offset = make_zero(offset.dtype());
+          }
           return BufferLoad(flat,
-                            {analyzer_.Simplify(offset - flat->elem_offset)});
+                            {analyzer_->Simplify(offset - flat->elem_offset)});
         }
       }
     }
-    return BufferLoad(buffer, indices);
+    Array<PrimExpr> scalar_indices = indices.Map(
+        [&](const PrimExpr &index) { return ConvertScalarExpr(index); });
+    return BufferLoad(buffer, scalar_indices);
   }
 
   PrimExpr ConvertUint16Offset(const PrimExpr &expr, Array<Stmt> *pre) {
@@ -1248,12 +1251,18 @@ private:
     if (const auto *integer = expr.as<IntImmNode>()) {
       return make_const(dtype, integer->value);
     }
+    if (expr.as<SelectNode>()) {
+      return cast(dtype, ConvertScalarExpr(expr));
+    }
     if (const auto *var = expr.as<VarNode>()) {
-      if (var == loop_var_.get()) {
-        PrimExpr base = analyzer_.Simplify(
-            BindChunkToQ(SubstituteLaneZero(lane_indexed_expr_)));
+      if (var == loop_var_.get() || var == unit_mapping_.lane_var.get()) {
+        PrimExpr base =
+            var == loop_var_.get()
+                ? BindChunkToQ(SubstituteLaneZero(unit_mapping_.index_expr))
+                : make_zero(dtype);
         return EmitBind("offset_vci",
-                        Call(vector_dtype, VmiOp("vci"), {cast(dtype, base)},
+                        Call(vector_dtype, VmiOp("vci"),
+                             {cast(dtype, analyzer_->Simplify(base))},
                              {{"size", IntImm(DataType::Int(32), lanes_)}}),
                         pre);
       }
@@ -1280,19 +1289,7 @@ private:
     }
     PrimExpr a = ConvertUint16Offset(*lhs, pre);
     PrimExpr b = ConvertUint16Offset(*rhs, pre);
-    if (a.dtype().lanes() == 1 && b.dtype().lanes() == 1) {
-      if (operation == "vadd") {
-        return a + b;
-      }
-      if (operation == "vsub") {
-        return a - b;
-      }
-      return a * b;
-    }
-    return EmitBind("offset",
-                    Call(vector_dtype, VmiOp(operation),
-                         {Broadcast(a, pre), Broadcast(b, pre), mask_var_}),
-                    pre);
+    return EmitBinary(std::move(a), std::move(b), operation, "offset", pre);
   }
 
   struct IndexedOperands {
@@ -1302,35 +1299,29 @@ private:
   };
 
   IndexedOperands LowerIndexed(const pto_analysis::MemoryAccess &access,
-                               const PrimExpr &mask, Array<Stmt> *pre) {
+                               Array<Stmt> *pre) {
+    Buffer allocation = pto_analysis::FindAllocationOwner(
+        active_allocations_, access.buffer, "VectorizeParallelToPTO");
     pto_analysis::IndexedMemoryOwner owner =
-        pto_analysis::GetIndexedMemoryOwner(access.buffer, active_allocations_,
-                                            &analyzer_,
-                                            "VectorizeParallelToPTO");
+        pto_analysis::DescribeIndexedMemoryOwner(access.buffer, allocation);
     pto_analysis::PtoIndexedAccessPlan plan =
         pto_analysis::PlanPtoIndexedAccess(access, owner, loop_var_,
-                                           unit_mapping_, &analyzer_);
-    PrimExpr base = plan.rebased ? ConvertScalarExpr(plan.base) : plan.base;
+                                           unit_mapping_, analyzer_,
+                                           buffer_versions_, bind_env_);
+    PrimExpr base = ConvertScalarExpr(BindChunkToQ(plan.base));
     PrimExpr offsets =
-        Broadcast(plan.uint16_offsets ? ConvertUint16Offset(plan.offsets, pre)
-                                      : ConvertExpr(plan.offsets, pre),
+        Broadcast(plan.generate_uint16_offsets
+                      ? ConvertUint16Offset(BindChunkToQ(plan.offsets), pre)
+                      : ConvertExpr(plan.offsets, pre),
                   pre);
-    // A tail-bearing unit sanitizes offsets in every iteration. Divisible
-    // units pass the loaded/calculated offsets directly, without cleaning.
-    if (unit_mapping_.tail_lanes != 0) {
-      PrimExpr zero =
-          EmitBind("offset_zero",
-                   Call(offsets.dtype(), VmiOp("vbrc"),
-                        {make_zero(offsets.dtype().element_of())},
-                        {{"size", IntImm(DataType::Int(32), lanes_)}}),
-                   pre);
-      offsets = EmitBind(
-          "safe_offsets",
-          Call(offsets.dtype(), VmiOp("vsel"), {mask, offsets, zero}), pre);
+    // VMI gather and scatter only access memory for active lanes, so tail
+    // offsets can be passed directly. PTODSL normalizes the offset carrier.
+    Optional<PrimExpr> version_index;
+    if (plan.version_index) {
+      version_index = ConvertScalarExpr(plan.version_index.value());
     }
-    // PTOAS normalizes signedness and widens narrow offset carriers.
-    // PreparePtoIndexedOffset rejects implicit narrowing before conversion.
-    return {pto_analysis::MakeIndexedMemoryDescriptor(owner, access.is_write),
+    return {pto_analysis::MakeIndexedMemoryDescriptor(
+                owner, access.is_write, version_index, plan.descriptor_extent),
             base, offsets};
   }
 
@@ -1350,12 +1341,13 @@ private:
       return;
     }
     if (const auto *bind = body.as<BindNode>()) {
-      // Whitelist is Verify's job; defensive check here.
       Array<Stmt> pre;
-      PrimExpr value = pto_analysis::IsPtoIndexDType(bind->value.dtype()) &&
-                               IsUniform(bind->value)
-                           ? ConvertScalarExpr(bind->value)
-                           : ConvertExpr(bind->value, &pre);
+      PrimExpr value =
+          address_vars_.count(bind->var) &&
+                  pto_analysis::IsPtoIndexDType(bind->value.dtype()) &&
+                  IsLaneUniformAddressExpr(bind->value)
+              ? ConvertScalarExpr(bind->value)
+              : ConvertExpr(bind->value, &pre);
       // Pre-binds first, then the Bind itself.
       for (const auto &s : pre) {
         out->push_back(s);
@@ -1378,7 +1370,7 @@ private:
       bool accumulator = reducers_.accumulators.count(store->buffer->data);
       if (kind == pto::StorageClass::kPrivate || accumulator) {
         auto slot = storage_.ResolveSlot(store->buffer, store->indices,
-                                         &analyzer_, bind_env_);
+                                         analyzer_, bind_env_);
         Buffer target = accumulator ? vf_buffers_.at(store->buffer->data)
                                     : promoted_.at(store->buffer->data);
         value = ToVmiWidth(value, lanes_, &pre);
@@ -1402,16 +1394,15 @@ private:
           << "PTO external ordinary storage write";
       auto access = pto_analysis::AnalyzeBufferAccess(
           store->buffer, store->indices, /*is_write=*/true, loop_var_,
-          CurrentMapping(), &analyzer_, bind_env_);
+          unit_mapping_, bind_env_);
       value = ToVmiWidth(value, lanes_, &pre);
       PrimExpr call;
       if (access.pattern == pto_analysis::AccessPattern::kContinuous ||
           (access.pattern == pto_analysis::AccessPattern::kLaneUniform &&
-           unit_mapping_.logical_extent == 1)) {
-        Array<PrimExpr> starts;
-        for (const PrimExpr &index : access.start_indices) {
-          starts.push_back(ConvertScalarExpr(BindChunkToQ(index)));
-        }
+           unit_mapping_.logical_extent == 1 &&
+           is_zero(access.original_offset))) {
+        Array<PrimExpr> starts = access.start_indices.Map(
+            [&](const PrimExpr &index) { return BindChunkToQ(index); });
         PrimExpr ptr = Call(DataType::Handle(), tl::access_ptr(),
                             {ScalarBufferLoad(store->buffer, starts),
                              IntImm(DataType::Int(32), lanes_),
@@ -1419,7 +1410,7 @@ private:
         call = Call(DataType::Void(), VmiOp("vstore"),
                     {value, ptr, IntImm(DataType::Int(32), 0), mask_var_});
       } else {
-        IndexedOperands operands = LowerIndexed(access, mask_var_, &pre);
+        IndexedOperands operands = LowerIndexed(access, &pre);
         call = Call(DataType::Void(), VmiOp("vscatter"),
                     {value, operands.pointer, operands.base, operands.offsets,
                      mask_var_});
@@ -1451,15 +1442,10 @@ private:
       // unchanged — the old code wrote back a default-constructed (empty)
       // node when the try_cast failed.
       ffi::Any node = attr->node;
-      if (auto ne = attr->node.try_cast<ObjectRef>()) {
-        if (const auto *pe = ne.value().as<PrimExprNode>()) {
-          node = RemapMetadataVars(GetRef<PrimExpr>(pe));
-        }
+      if (auto expr = attr->node.try_cast<PrimExpr>()) {
+        node = tirx::Substitute(expr.value(), value_map_);
       }
-      PrimExpr value = attr->value;
-      if (const auto *ve = attr->value.as<PrimExprNode>()) {
-        value = RemapMetadataVars(GetRef<PrimExpr>(ve)).as<PrimExpr>().value();
-      }
+      PrimExpr value = tirx::Substitute(attr->value, value_map_);
       out->push_back(AttrStmt(node, attr->attr_key, value, inner));
       return;
     }
@@ -1506,17 +1492,6 @@ private:
                << body->GetTypeKey();
   }
 
-  pto_analysis::PtoInverseMapping CurrentMapping() const {
-    // Return the *complete* inverse mapping saved for this unit.
-    // Rebuilding a 1D-only mapping here dropped is_2d, the two loop vars,
-    // their extents and select_inner, so the shared access proof lost the
-    // kept coordinate's range and Vectorize rejected units Verify had
-    // accepted. The analysis placeholders (chunk/lane vars) are exactly
-    // the ones saved from InvertPtoLaneLayout; only the emitted chunk
-    // loop var q is separate (see BindChunkToQ).
-    return unit_mapping_;
-  }
-
   // ------------------------------------------------------------------
   // Expression conversion (index vars resolve through bind_env_)
   // ------------------------------------------------------------------
@@ -1527,8 +1502,8 @@ private:
       auto kind = storage_.Classify(load->buffer, current_unit_);
       if (kind == pto::StorageClass::kPrivate ||
           kind == pto::StorageClass::kExternal) {
-        auto slot = storage_.ResolveSlot(load->buffer, load->indices,
-                                         &analyzer_, bind_env_);
+        auto slot = storage_.ResolveSlot(load->buffer, load->indices, analyzer_,
+                                         bind_env_);
         Buffer buffer = kind == pto::StorageClass::kPrivate
                             ? promoted_.at(load->buffer->data)
                             : storage_.Allocation(load->buffer->data);
@@ -1538,20 +1513,18 @@ private:
       }
       auto access = pto_analysis::AnalyzeBufferAccess(
           load->buffer, load->indices, /*is_write=*/false, loop_var_,
-          CurrentMapping(), &analyzer_, bind_env_);
+          unit_mapping_, bind_env_);
       if (access.pattern == pto_analysis::AccessPattern::kContinuous ||
           (access.pattern == pto_analysis::AccessPattern::kLaneUniform &&
-           unit_mapping_.logical_extent == 1)) {
-        Array<PrimExpr> start_idx;
-        for (const auto &idx : access.start_indices) {
-          start_idx.push_back(ConvertScalarExpr(BindChunkToQ(idx)));
-        }
+           unit_mapping_.logical_extent == 1 &&
+           is_zero(access.original_offset))) {
+        Array<PrimExpr> starts = access.start_indices.Map(
+            [&](const PrimExpr &index) { return BindChunkToQ(index); });
         PrimExpr ptr =
             Call(DataType::Handle(), tl::access_ptr(),
-                 {ScalarBufferLoad(load->buffer, start_idx),
+                 {ScalarBufferLoad(load->buffer, starts),
                   IntImm(DataType::Int(32), static_cast<int>(lanes_)),
                   IntImm(DataType::Int(32), 1)});
-        // VMI with a return value goes through EmitBind.
         return EmitBind("vload",
                         Call(VectorDType(load->dtype, lanes_), VmiOp("vload"),
                              {ptr, IntImm(DataType::Int(32), 0)},
@@ -1560,13 +1533,29 @@ private:
                         pre);
       }
       if (access.pattern == pto_analysis::AccessPattern::kIndexed) {
-        IndexedOperands operands = LowerIndexed(access, mask_var_, pre);
-        return EmitBind(
+        IndexedOperands operands = LowerIndexed(access, pre);
+        const bool byte_payload = load->dtype.bits() == 8;
+        const DataType result_dtype =
+            byte_payload ? (load->dtype.is_int() ? DataType::Int(16)
+                                                 : DataType::UInt(16))
+                         : load->dtype;
+        PrimExpr gathered = EmitBind(
             "gather",
-            Call(VectorDType(load->dtype, lanes_), VmiOp("vgather"),
+            Call(VectorDType(result_dtype, lanes_), VmiOp("vgather"),
                  {operands.pointer, operands.base, operands.offsets, mask_var_},
                  {{"pmode", StringImm("zero")}}),
             pre);
+        if (byte_payload) {
+          // Byte gathers zero-extend into B16 even for signed sources. Restore
+          // source bits before any user Cast, arithmetic or saved Bind sees it.
+          gathered = EmitBind(
+              "gather_byte",
+              Call(VectorDType(load->dtype, lanes_), VmiOp("vcvt"), {gathered},
+                   {{"to_dtype", StringImm(TvmDtypeName(load->dtype))},
+                    {"saturate", StringImm("NOSAT")}}),
+              pre);
+        }
+        return gathered;
       }
       // lane-uniform scalar load: keep the BufferLoad (lane bound to 0,
       // chunk bound to q — indices resolve through the bind env
@@ -1575,11 +1564,8 @@ private:
       // store values) reference that Var. Each textual occurrence binds
       // separately — no cross-access load reuse. The Var dtype is the
       // buffer's own scalar dtype.
-      Array<PrimExpr> indices;
-      for (const auto &idx : access.indices_after_inverse) {
-        indices.push_back(
-            ConvertScalarExpr(BindChunkToQ(SubstituteLaneZero(idx))));
-      }
+      Array<PrimExpr> indices = access.start_indices.Map(
+          [&](const PrimExpr &index) { return BindChunkToQ(index); });
       return EmitBind("sload", ScalarBufferLoad(load->buffer, indices), pre);
     }
     if (const auto *var = expr.as<VarNode>()) {
@@ -1588,9 +1574,9 @@ private:
         return (*it).second;
       }
       if (var == loop_var_.get()) {
-        // lane_indexed used as a value: explicit vci vector.
-        PrimExpr base = analyzer_.Simplify(
-            BindChunkToQ(SubstituteLaneZero(lane_indexed_expr_)));
+        // The selected coordinate used as a value becomes a VMI vector.
+        PrimExpr base = analyzer_->Simplify(
+            BindChunkToQ(SubstituteLaneZero(unit_mapping_.index_expr)));
         return EmitBind(
             "vci",
             Call(VectorDType(var->dtype, lanes_), VmiOp("vci"), {base},
@@ -1624,15 +1610,15 @@ private:
       // below instead of the scalar coordinate path.
       bool coordinate_uniform = false;
       try {
-        coordinate_uniform = IsUniform(expr);
+        coordinate_uniform = IsLaneUniformAddressExpr(expr);
       } catch (const pto_analysis::PtoAnalysisError &) {
         // The lane-uniform proof met a non-index (value) load: the expression
         // is a value choice, not a coordinate.
         coordinate_uniform = false;
       }
       if (coordinate_uniform) {
-        PrimExpr coordinate = pto_analysis::SubstituteVar(expr, loop_var_.get(),
-                                                          lane_indexed_expr_);
+        PrimExpr coordinate = pto_analysis::SubstituteVar(
+            expr, loop_var_.get(), unit_mapping_.index_expr);
         return ConvertScalarExpr(BindChunkToQ(coordinate));
       }
       // Lane-varying int value choices fall through to the vsel lowering.
@@ -1741,7 +1727,7 @@ private:
             << step.from << ", got " << current.dtype().element_of();
         Map<String, ObjectRef> attrs;
         attrs.Set("to_dtype", StringImm(TvmDtypeName(step.to)));
-        PrimExpr call;
+        Call call;
         if (step.op == pto_analysis::VectorCastOp::kIntegerReinterpret) {
           call = Call(VectorDType(step.to, cast_lanes),
                       VmiOp("vinterpret_cast"), {current}, attrs);
@@ -1934,9 +1920,9 @@ private:
     PrimExpr b = ConvertExpr(rhs, pre);
     // Comparisons participate in the unit mask. Expand a finalized one-lane
     // data register before choosing the scalar or vector comparison form.
-    if (Info(a).kind == pto::ValueKind::kVmi && a.dtype().lanes() == 1)
+    if (Info(a).IsVmi() && a.dtype().lanes() == 1)
       a = ToVmiWidth(a, lanes_, pre);
-    if (Info(b).kind == pto::ValueKind::kVmi && b.dtype().lanes() == 1)
+    if (Info(b).IsVmi() && b.dtype().lanes() == 1)
       b = ToVmiWidth(b, lanes_, pre);
     const pto::RelationalKind *kind = pto::RelationalByName(cmp);
     ICHECK(kind != nullptr)
@@ -1975,10 +1961,15 @@ private:
                          const std::string &vmi_name, Array<Stmt> *pre) {
     PrimExpr a = ConvertExpr(lhs, pre);
     PrimExpr b = ConvertExpr(rhs, pre);
+    return EmitBinary(std::move(a), std::move(b), vmi_name, vmi_name, pre);
+  }
+
+  PrimExpr EmitBinary(PrimExpr a, PrimExpr b, const std::string &vmi_name,
+                      const std::string &result_name, Array<Stmt> *pre) {
     auto lhs_info = Info(a);
     auto rhs_info = Info(b);
-    bool a_vec = lhs_info.kind == pto::ValueKind::kVmi;
-    bool b_vec = rhs_info.kind == pto::ValueKind::kVmi;
+    bool a_vec = lhs_info.IsVmi();
+    bool b_vec = rhs_info.IsVmi();
     if (!a_vec && !b_vec) {
       // Lane-uniform folds stay scalar with the TIR semantics of the node.
       if (vmi_name == "vadd") {
@@ -1999,7 +1990,7 @@ private:
     int64_t width = std::max(lhs_info.logical_lanes, rhs_info.logical_lanes);
     a = ToVmiWidth(a, width, pre);
     b = ToVmiWidth(b, width, pre);
-    return EmitBind(vmi_name,
+    return EmitBind(result_name,
                     Call(a.dtype(), VmiOp(vmi_name),
                          {a, b, width == 1 ? GetFullMask(1) : mask_var_}),
                     pre);
@@ -2052,7 +2043,7 @@ private:
     if (const auto *call = value.as<CallNode>())
       if (const auto *op = call->op.as<OpNode>();
           op && std::string(op->name).rfind("tl.vmi.", 0) == 0)
-        value_infos_[result] = {pto::ValueKind::kVmi, value.dtype().lanes()};
+        value_infos_[result] = pto::ValueInfo::Vmi(value.dtype());
     return result;
   }
 
@@ -2064,16 +2055,12 @@ private:
   pto::ParallelStorageQuery storage_;
   For current_unit_;
   std::unordered_map<Var, Buffer, ObjectPtrHash, ObjectPtrEqual> promoted_;
-  arith::Analyzer analyzer_;
+  arith::Analyzer root_analyzer_;
+  arith::Analyzer *analyzer_ = &root_analyzer_;
 
   // Per-unit state.
   Var loop_var_;
-  PrimExpr chunk_index_; // unified chunk loop Var
-  Var chunk_analysis_;   // analysis placeholder from the inverse mapping
-  Var lane_var_;         // analysis placeholder; never escapes
-  PrimExpr lane_indexed_expr_;
-  /*! The complete inverse mapping of the unit being converted
-   * (2D fields included), consumed by CurrentMapping(). */
+  Var chunk_index_; // emitted chunk loop Var
   pto_analysis::PtoInverseMapping unit_mapping_;
   int64_t lanes_ = 0;
   Var mask_var_;
@@ -2084,6 +2071,7 @@ private:
   BufferVersionMap buffer_versions_;
   Map<Var, PrimExpr> bind_env_; // analysis env: original var -> def expr
   Map<Var, Var> value_map_;     // value env: original var -> converted var
+  std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> address_vars_;
 };
 
 } // namespace

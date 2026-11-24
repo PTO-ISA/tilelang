@@ -7,6 +7,7 @@
 
 #include <tvm/arith/analyzer.h>
 #include <tvm/runtime/logging.h>
+#include <tvm/tirx/analysis.h>
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/stmt_functor.h>
 
@@ -17,6 +18,7 @@
 #include <utility>
 #include <vector>
 
+#include "../transform/parallel_to_pto_utils.h"
 #include "pto_index_analysis.h"
 
 namespace tvm {
@@ -26,7 +28,6 @@ namespace pto {
 using namespace tirx;
 using ffi::Array;
 using ffi::Map;
-using ffi::Optional;
 
 namespace {
 
@@ -75,18 +76,29 @@ public:
      * (binds in scope, mirrors the consumers' lexical rules). */
     Map<Var, PrimExpr> bind_env;
   };
+  struct ValueOperation {
+    PrimExpr expr;
+    std::string op_name;
+    Map<Var, PrimExpr> bind_env;
+  };
   std::vector<Access> accesses;
+  std::vector<ValueOperation> value_operations;
 
   void VisitStmt_(const BufferStoreNode *op) final {
-    if (IsMemory(op->buffer, op->indices))
+    if (IsMemory(op->buffer, op->indices)) {
       accesses.push_back(
           {op->buffer, op->indices, /*is_write=*/true, bind_env_});
+      VisitAddressMetadata(op->buffer, op->indices);
+    }
+    CollectValueOperations_(op->value);
     tirx::StmtExprVisitor::VisitStmt_(op);
   }
   void VisitExpr_(const BufferLoadNode *op) final {
-    if (IsMemory(op->buffer, op->indices))
+    if (IsMemory(op->buffer, op->indices)) {
       accesses.push_back(
           {op->buffer, op->indices, /*is_write=*/false, bind_env_});
+      VisitAddressMetadata(op->buffer, op->indices);
+    }
     tirx::StmtExprVisitor::VisitExpr_(op);
   }
   void VisitStmt_(const BindNode *op) final {
@@ -95,8 +107,13 @@ public:
     // in scope; every bind — including load-valued ones — is registered
     // so ResolveIndexAliases can apply its loaded-value identity rule
     // along alias chains.
+    CollectValueOperations_(op->value);
     tirx::StmtExprVisitor::VisitStmt_(op);
     bind_env_.Set(op->var, op->value);
+  }
+  void VisitStmt_(const EvaluateNode *op) final {
+    CollectValueOperations_(op->value);
+    tirx::StmtExprVisitor::VisitStmt_(op);
   }
   void VisitStmt_(const AttrStmtNode *op) final {
     // Nested statement scope (mirror of the consumers' rule):
@@ -108,20 +125,163 @@ public:
   }
 
 private:
+  void CollectValueOperations_(const PrimExpr &value) {
+    PreOrderVisit(value, [&](const ObjectRef &node) {
+      // Index operations are checked by the address and offset analysis.
+      if (node.as<BufferLoadNode>()) {
+        return false;
+      }
+      std::string name;
+      if (node.as<CastNode>()) {
+        name = "Cast";
+      } else if (node.as<AddNode>()) {
+        name = "vadd";
+      } else if (node.as<SubNode>()) {
+        name = "vsub";
+      } else if (node.as<MulNode>()) {
+        name = "vmul";
+      } else if (node.as<DivNode>()) {
+        name = "vdiv";
+      } else if (const auto *call = node.as<CallNode>()) {
+        if (auto op = call->op.as<Op>();
+            op && IsSupportedVectorUnaryOp(op.value()->name, call->dtype)) {
+          name = op.value()->name;
+        }
+      }
+      if (!name.empty()) {
+        value_operations.push_back(
+            {Downcast<PrimExpr>(node), std::move(name), bind_env_});
+      }
+      return true;
+    });
+  }
+
+  void VisitAddressMetadata(const Buffer &buffer,
+                            const Array<PrimExpr> &indices) {
+    // Buffer visitors see the indices but not metadata at a use site.
+    // A view's address can contain another load with its own offset plan.
+    for (const PrimExpr &expr : PtoAddressMetadata(buffer, indices)) {
+      VisitExpr(expr);
+    }
+  }
+
   Map<Var, PrimExpr> bind_env_;
   const pto::ParallelStorageQuery &storage_;
   For root_;
 };
 
+std::string CheckValueOperation(const PtoAccessCollector::ValueOperation &op,
+                                LaneUseContext *ctx) {
+  ctx->bind_env = op.bind_env;
+  const auto *cast_op = op.expr.as<CastNode>();
+  const LaneUse use =
+      AnalyzeLaneUse(cast_op ? cast_op->value : op.expr, ctx, nullptr);
+  if (use == LaneUse::kUnknown) {
+    // Verify diagnoses unsupported expressions and undefined references.
+    return {};
+  }
+  const bool varying = use == LaneUse::kVarying;
+  if (cast_op) {
+    CastContext cast_context{varying ? CastValueKind::kVectorVmi
+                                     : CastValueKind::kScalar,
+                             varying ? ctx->mapping.lanes : 1};
+    std::string why;
+    if (!PlanValueCast(cast_op, cast_context, &why)) {
+      return "Cast has no supported conversion: " + why;
+    }
+    return {};
+  }
+
+  const DataType dtype = op.expr.dtype();
+  if (!varying && IsFloatFamily(dtype) && ContainsRuntimeValue(op.expr)) {
+    return "runtime lane-uniform float computation requires a scalar float "
+           "ALU inside SIMD_VF";
+  }
+  if (varying) {
+    const bool supported = op.expr.as<CallNode>()
+                               ? IsSupportedVectorUnaryOp(op.op_name, dtype)
+                               : IsSupportedVectorBinaryOp(op.op_name, dtype);
+    if (!supported) {
+      std::ostringstream oss;
+      oss << op.op_name << " on " << dtype
+          << " elements is not supported by the VMI operation matrix";
+      return oss.str();
+    }
+  }
+  return {};
+}
+
+void CheckContinuousStore(const MemoryAccess &access, const Var &loop_var,
+                          const PtoInverseMapping &mapping,
+                          const Map<Var, PrimExpr> &bind_env,
+                          const std::vector<Buffer> &allocations,
+                          const Map<Var, int> &buffer_versions,
+                          arith::Analyzer *analyzer) {
+  const DataType dtype = access.buffer->dtype;
+  const int bits = dtype.bits();
+  if (!dtype.is_scalar() || dtype.is_bool() ||
+      (bits != 8 && bits != 16 && bits != 32)) {
+    return;
+  }
+  // Resolve aliases from the whole address, including view metadata, before
+  // substituting the selected coordinate at lane zero.
+  auto offset = ResolveIndexAliases(access.original_offset, bind_env);
+  if (!offset) {
+    throw PtoAnalysisError("continuous store start is not provably "
+                           "32-byte aligned");
+  }
+  PrimExpr lane_zero = SubstituteVar(mapping.index_expr, mapping.lane_var.get(),
+                                     make_zero(mapping.lane_var.dtype()));
+  PrimExpr start = SubstituteVar(*offset, loop_var.get(), lane_zero);
+  const DataType wide = DataType::Int(64);
+  PrimExpr bit_offset = cast(wide, start) * bits;
+
+  // UB allocation bases are aligned. Version padding can change the slot
+  // start, but it preserves the offset within that slot.
+  constexpr int kAlignmentBits = 256;
+  auto versions = buffer_versions.Get(access.buffer->data);
+  if (versions && *versions > 1) {
+    for (const Buffer &owner : allocations) {
+      if (!owner->data.same_as(access.buffer->data) || owner->shape.empty() ||
+          !analyzer->CanProveEqual(owner->shape[0], *versions)) {
+        continue;
+      }
+      PrimExpr slot_bits =
+          make_const(wide, owner->dtype.bits() * owner->dtype.lanes());
+      for (size_t axis = 1; axis < owner->shape.size(); ++axis) {
+        slot_bits = slot_bits * cast(wide, owner->shape[axis]);
+      }
+      if (!analyzer->CanProveEqual(floormod(slot_bits, kAlignmentBits), 0)) {
+        PrimExpr origin = cast(wide, owner->elem_offset) *
+                          (owner->dtype.bits() * owner->dtype.lanes());
+        PrimExpr within_slot = indexmod(bit_offset - origin, slot_bits);
+        // The access descriptor covers the full vector, including masked
+        // tail lanes. The version layout rewrite cannot remap a span that
+        // crosses the padding between slots.
+        PrimExpr span_bits = make_const(wide, mapping.lanes * bits);
+        if (!analyzer->CanProve(within_slot <= slot_bits - span_bits)) {
+          throw PtoAnalysisError("continuous store descriptor does not "
+                                 "provably fit within one padded version slot");
+        }
+        bit_offset = origin + within_slot;
+      }
+      break;
+    }
+  }
+  if (!analyzer->CanProveEqual(floormod(bit_offset, kAlignmentBits), 0)) {
+    throw PtoAnalysisError("continuous store start is not provably "
+                           "32-byte aligned");
+  }
+}
+
 // 2D layout candidate. Both dimensions are tried with their canonical mapping
 // — selected coordinate `q * L + lane`, the other coordinate left as-is — over
-// the bound lane/chunk/kept ranges. Alias resolution, the loaded-value identity
-// rule, the address-node whitelist and the resource limits are the shared
-// read-only helpers in pto_index_analysis.h — the same implementation
-// AnalyzeBufferAccess uses, so planning and consumption cannot diverge.
+// the bound lane/chunk/kept ranges. Verify and Vectorize consume the same
+// address analysis and indexed offset plan as layout inference.
 // Continuous accesses and uniform loads do not need indexed instructions.
 // Uniform stores use scatter and count as indexed stores.
-// Detailed dtype, owner, mask and offset checks still belong to Verify.
+// Candidates must support offset generation before entering cost comparison.
+// Verify remains responsible for the complete program contract.
 // Layout-inference code reports construct-time failures as
 // LoopLayoutInjectiveException (the type LayoutInference catches to discard
 // an attempt), while the shared padding helper speaks PtoAnalysisError;
@@ -135,54 +295,113 @@ std::pair<int64_t, int64_t> CheckedPaddingForInference(int64_t extent,
   }
 }
 
-int PtoRequiredVectorDim(const For &root, const Var &iv, const Var &jv,
-                         int64_t M, int64_t N, int64_t lanes, std::string *why,
-                         const pto::ParallelStorageQuery &storage) {
+bool ShouldVectorizeInnerAxis(const For &root, const Var &iv, const Var &jv,
+                              int64_t M, int64_t N, int64_t lanes,
+                              const std::vector<Buffer> &active_allocations,
+                              const Map<Var, int> &buffer_versions,
+                              arith::Analyzer *analyzer,
+                              const pto::ParallelStorageQuery &storage) {
   PtoAccessCollector collector(storage, root);
   collector(root->body);
 
+  Array<Var> external_vars;
+  if (!collector.value_operations.empty()) {
+    external_vars = UndefinedVars(root, {});
+  }
+
+  PtoInverseMapping common_mapping;
+  common_mapping.lanes = lanes;
+  common_mapping.is_2d = true;
+  common_mapping.outer_var = iv;
+  common_mapping.inner_var = jv;
+  common_mapping.outer_extent = M;
+  common_mapping.inner_extent = N;
+
   struct Candidate {
-    bool legal = true;
-    int64_t chunks = 0;
+    int64_t chunk_count = 0;
     int64_t indexed_loads = 0;
     int64_t indexed_stores = 0;
-    std::string why;
+    std::string rejection_reason;
   };
   auto analyze_candidate = [&](bool select_inner) {
     Candidate candidate;
     const int64_t selected_extent = select_inner ? N : M;
     const Var &selected_var = select_inner ? jv : iv;
-    const Var &kept_var = select_inner ? iv : jv;
     const int64_t kept_extent = select_inner ? M : N;
     const int64_t padded =
         CheckedPaddingForInference(selected_extent, lanes).second;
-    candidate.chunks = padded / lanes;
+    candidate.chunk_count = padded / lanes;
+    if (kept_extent > std::numeric_limits<int32_t>::max() / padded) {
+      candidate.rejection_reason =
+          "padded flattened extent overflows the int32 index space";
+      return candidate;
+    }
     const DataType dtype = selected_var.dtype();
     Var lane("probe_lane", dtype);
     Var q("probe_q", dtype);
     PrimExpr inverse = q * IntImm(dtype, lanes) + lane;
-    arith::Analyzer analyzer;
+    PtoInverseMapping mapping = common_mapping;
+    mapping.lane_var = lane;
+    mapping.chunk_var = q;
+    mapping.logical_extent = selected_extent;
+    mapping.padded_extent = padded;
+    mapping.chunk_count = candidate.chunk_count;
+    mapping.tail_lanes = selected_extent % lanes;
+    mapping.index_expr = inverse;
+    mapping.select_inner = select_inner;
+    auto store_proof = analyzer->Clone();
+    const Var &kept_var = select_inner ? iv : jv;
+    store_proof->Bind(kept_var, Range(make_zero(kept_var.dtype()),
+                                      IntImm(kept_var.dtype(), kept_extent)));
+    store_proof->Bind(
+        q, Range(make_zero(dtype), IntImm(dtype, mapping.chunk_count)));
     for (const auto &access : collector.accesses) {
       try {
-        PtoAddressAnalysis analysis = AnalyzePtoAddress(
-            access.buffer, access.indices, selected_var, inverse, lane, q,
-            lanes, candidate.chunks, kept_var, kept_extent, access.bind_env,
-            &analyzer);
-        if (analysis.pattern == PtoAddressPattern::kIndexed ||
-            (access.is_write &&
-             analysis.pattern == PtoAddressPattern::kLaneUniform)) {
+        MemoryAccess analysis =
+            AnalyzeBufferAccess(access.buffer, access.indices, access.is_write,
+                                selected_var, mapping, access.bind_env);
+        if (analysis.RequiresIndexedInstruction()) {
+          // A view may be legal for scalar/continuous access but not for an
+          // indexed instruction, e.g. when it reinterprets the owner's dtype.
+          Buffer allocation = FindAllocationOwner(
+              active_allocations, access.buffer, "PTO layout inference");
+          IndexedMemoryOwner owner = CheckIndexedMemoryOwner(
+              access.buffer, allocation, analyzer, "PTO layout inference");
+          PlanPtoIndexedAccess(analysis, owner, selected_var, mapping, analyzer,
+                               buffer_versions, access.bind_env);
           if (access.is_write) {
             ++candidate.indexed_stores;
           } else {
             ++candidate.indexed_loads;
           }
+        } else if (access.is_write &&
+                   IsOrdinaryUbScope(access.buffer.scope())) {
+          CheckContinuousStore(analysis, selected_var, mapping, access.bind_env,
+                               active_allocations, buffer_versions,
+                               store_proof.get());
         }
       } catch (const PtoAnalysisError &err) {
-        candidate.legal = false;
         std::ostringstream oss;
         oss << "buffer `" << access.buffer->name << "` ("
             << (access.is_write ? "store" : "load") << "): " << err.what();
-        candidate.why = oss.str();
+        candidate.rejection_reason = oss.str();
+        return candidate;
+      }
+    }
+    LaneUseContext lane_use;
+    lane_use.loop_var = selected_var;
+    lane_use.mapping = mapping;
+    lane_use.storage = &storage;
+    lane_use.unit = root;
+    lane_use.analyzer = store_proof.get();
+    for (const Var &var : external_vars) {
+      lane_use.external_defs.insert(var.get());
+    }
+    const int lane_use_budget = lane_use.budget;
+    for (const auto &operation : collector.value_operations) {
+      lane_use.budget = lane_use_budget;
+      candidate.rejection_reason = CheckValueOperation(operation, &lane_use);
+      if (!candidate.rejection_reason.empty()) {
         break;
       }
     }
@@ -191,29 +410,29 @@ int PtoRequiredVectorDim(const For &root, const Var &iv, const Var &jv,
 
   Candidate inner = analyze_candidate(true);
   Candidate outer = analyze_candidate(false);
-  if (inner.legal && outer.legal) {
+  if (inner.rejection_reason.empty() && outer.rejection_reason.empty()) {
     const auto inner_cost = std::make_tuple(
-        M * inner.chunks, inner.indexed_loads + inner.indexed_stores,
+        M * inner.chunk_count, inner.indexed_loads + inner.indexed_stores,
         inner.indexed_stores);
     const auto outer_cost = std::make_tuple(
-        N * outer.chunks, outer.indexed_loads + outer.indexed_stores,
+        N * outer.chunk_count, outer.indexed_loads + outer.indexed_stores,
         outer.indexed_stores);
     if (inner_cost != outer_cost) {
-      return inner_cost < outer_cost ? 1 : 0;
+      return inner_cost < outer_cost;
     }
-    return N == 1 && M > 1 ? 0 : 1;
+    return N != 1 || M == 1;
   }
-  if (inner.legal)
-    return 1;
-  if (outer.legal)
-    return 0;
-  const std::string &inner_why = inner.why;
-  const std::string &outer_why = outer.why;
+  if (inner.rejection_reason.empty()) {
+    return true;
+  }
+  if (outer.rejection_reason.empty()) {
+    return false;
+  }
   std::ostringstream oss;
-  oss << "no vectorizable dimension: inner (j) -> " << inner_why
-      << "; outer (i) -> " << outer_why;
-  *why = oss.str();
-  return -1;
+  oss << "[PTO layout inference] the 2D unit has no vectorizable dimension (M="
+      << M << ", N=" << N << ", L=" << lanes << "): inner (j) -> "
+      << inner.rejection_reason << "; outer (i) -> " << outer.rejection_reason;
+  throw LoopLayoutInjectiveException(oss.str());
 }
 
 } // namespace
@@ -231,6 +450,9 @@ int PtoRequiredVectorDim(const For &root, const Var &iv, const Var &jv,
 // VerifyParallelToPTO; the checks below are only the minimal conditions
 // needed to construct a valid layout, reported as layout-inference errors.
 Fragment InferPtoParallelLayout(const For &root, const Range &lane_bounds,
+                                const std::vector<Buffer> &active_allocations,
+                                const Map<Var, int> &buffer_versions,
+                                arith::Analyzer *analyzer,
                                 const ParallelStorageQuery &storage) {
   PtoParallelLoopCollector loop_collector;
   loop_collector(root);
@@ -249,8 +471,9 @@ Fragment InferPtoParallelLayout(const For &root, const Range &lane_bounds,
   std::vector<int64_t> extents;
   for (const auto &iv : loop_vars) {
     const int64_t *ext = as_const_int(iv->dom->extent);
-    ICHECK(ext != nullptr)
-        << "[PTO layout inference] requires compile-time constant loop "
+    ICHECK(ext != nullptr && *ext > 0)
+        << "[PTO layout inference] requires positive compile-time constant "
+           "loop "
            "extents, got "
         << iv->dom->extent << " for loop " << iv->var->name_hint;
     ICHECK(is_zero(iv->dom->min))
@@ -297,36 +520,12 @@ Fragment InferPtoParallelLayout(const For &root, const Range &lane_bounds,
     const int64_t N = extents[1];
     const Var &i_var = loop_vars[0]->var;
     const Var &j_var = loop_vars[1]->var;
-    std::string candidate_why;
-    int required = PtoRequiredVectorDim(root, i_var, j_var, M, N, lanes,
-                                        &candidate_why, storage);
-    if (required < 0) {
-      // Both candidates failed address analysis under the padded domain.
-      // Report the concrete access and reason; -1 never means "no constraint".
-      std::ostringstream oss;
-      oss << "[PTO layout inference] the 2D unit has no vectorizable "
-             "dimension (M="
-          << M << ", N=" << N << ", L=" << lanes << "): " << candidate_why;
-      throw LoopLayoutInjectiveException(oss.str());
-    }
-    const bool select_inner = required == 1;
+    const bool select_inner = ShouldVectorizeInnerAxis(
+        root, i_var, j_var, M, N, lanes, active_allocations, buffer_versions,
+        analyzer, storage);
     const int64_t sel_extent = select_inner ? N : M;
-    const int64_t kept_extent = select_inner ? M : N;
     // Shared checked padding for the selected dimension.
     const auto [pad, P_sel] = CheckedPaddingForInference(sel_extent, lanes);
-    // The flattened product K*P_sel indexes the int32 loop-var space; both
-    // operands of every t = kept * P_sel + sel evaluation must stay
-    // representable.
-    if (P_sel > std::numeric_limits<int32_t>::max() ||
-        kept_extent > std::numeric_limits<int32_t>::max() / P_sel) {
-      std::ostringstream oss;
-      oss << "[PTO layout inference] padded flattened extent " << kept_extent
-          << "*" << P_sel
-          << " overflows the int32 index "
-             "space for lanes "
-          << lanes;
-      throw LoopLayoutInjectiveException(oss.str());
-    }
     frag_vars = loop_vars;
     if (pad != 0) {
       frag_vars.Set(select_inner ? 1 : 0,

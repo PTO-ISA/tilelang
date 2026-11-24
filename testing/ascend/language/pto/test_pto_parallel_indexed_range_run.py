@@ -4,7 +4,12 @@ import pytest
 import torch
 
 from test_pto_parallel_gather_scatter_run import _run, npu as _npu
-from test_pto_parallel_indexed_range import affine_b16_scatter_kernel, b16_transposed_index_kernel, block_coordinate_b16_scatter
+from test_pto_parallel_indexed_range import (
+    AFFINE_B16_SCATTER_CASES,
+    affine_b16_scatter_kernel,
+    b16_transposed_index_kernel,
+    block_coordinate_b16_scatter,
+)
 
 npu = _npu
 
@@ -30,10 +35,7 @@ def test_b16_transposed_index_numerics(force_scatter, npu):
 
 
 @pytest.mark.pto
-@pytest.mark.parametrize(
-    "extent,stride,origin,output_size",
-    [(150, 2, 1, 512), (128, 512, 511, 65536), (127, 516, 519, 65536), (255, 258, 3, 65536), (128, 2, 0, 70000)],
-)
+@pytest.mark.parametrize("extent,stride,origin,output_size", AFFINE_B16_SCATTER_CASES)
 def test_affine_b16_scatter_numerics(extent, stride, origin, output_size, npu):
     source = (torch.arange(256, dtype=torch.float32) % 113 - 56).to(torch.float16)
     output = torch.full((output_size,), 211, dtype=torch.float16)
