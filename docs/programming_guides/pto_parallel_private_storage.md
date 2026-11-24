@@ -116,6 +116,10 @@ broadcast dtype rules, and external ordinary storage stays read-only.
 
 ## SIMD reducer results
 
+PTO SIMD reducers support FP16 and FP32 for sum, max and min, and int32
+and uint32 for max and min. Integer comparisons follow the accumulator
+signedness and preserve the selected value in the result slot.
+
 In a PTO SIMD VF, each active logical iteration contributes once to the single
 output `acc[0]`, including when the contribution comes from a lane-private
 local. Each lane holds a partial initialized to the reduction identity. A tail

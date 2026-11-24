@@ -1158,20 +1158,21 @@ private:
   }
 
   bool IsUniform(const PrimExpr &expr) {
-    // Coordinate analysis alone sees slot [0] as uniform. Private storage and
-    // already-converted vector snapshots are varying regardless of address.
-    bool private_value = false;
+    // Fixed indices can still refer to private lanes or reducer VMI storage.
+    // A one-lane VMI value also needs value lowering, including through
+    // aliases.
+    bool needs_vmi = false;
     PostOrderVisit(expr, [&](const ObjectRef &node) {
       if (const auto *load = node.as<BufferLoadNode>()) {
-        private_value |= storage_.IsPrivate(load->buffer->data);
+        needs_vmi |= storage_.IsPrivate(load->buffer->data) ||
+                     vf_buffers_.count(load->buffer->data);
       }
       if (const auto *var = node.as<VarNode>()) {
-        auto found = value_map_.find(GetRef<Var>(var));
-        private_value |=
-            found != value_map_.end() && (*found).second.dtype().lanes() > 1;
+        if (auto mapped = value_map_.Get(GetRef<Var>(var)))
+          needs_vmi |= Info(mapped.value()).kind == pto::ValueKind::kVmi;
       }
     });
-    if (private_value)
+    if (needs_vmi)
       return false;
     Optional<Var> kept_var;
     int64_t kept_extent = 0;
