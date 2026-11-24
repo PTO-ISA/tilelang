@@ -194,6 +194,9 @@ def integer_reducer_consumer_kernel(mode):
                     if mode == "alias":
                         saved = T.bind(result[0])
                         out[i] = src[i] * saved
+                    elif mode == "bitwise_alias":
+                        saved = T.bind(result[0])
+                        out[i] = src[i] | (saved & T.uint32(0x807FFFFF))
                     elif mode == "max_alias":
                         saved = T.bind(result[0])
                         out[i] = T.max(saved, T.uint32(7))
@@ -204,7 +207,7 @@ def integer_reducer_consumer_kernel(mode):
     return main
 
 
-@pytest.mark.parametrize("mode, operation", [("alias", "vmul"), ("max", "vsel"), ("max_alias", "vsel")])
+@pytest.mark.parametrize("mode, operation", [("alias", "vmul"), ("max", "vsel"), ("max_alias", "vsel"), ("bitwise_alias", "vor")])
 def test_integer_reducer_result_consumer(mode, operation, monkeypatch):
     from tilelang import tvm
     from testing.ascend._ir import calls, nodes
@@ -221,6 +224,10 @@ def test_integer_reducer_result_consumer(mode, operation, monkeypatch):
     broadcast = producers[consumer.args[1]]
     assert broadcast.op.name == "tl.vmi.vbrc" and int(broadcast.annotations["group"]) == 1
     source = producers[broadcast.args[0]]
+    if mode == "bitwise_alias":
+        assert source.op.name == "tl.vmi.vand" and str(source.dtype) == "uint32"
+        assert int(producers[source.args[2]].args[0]) == 1
+        source = producers[source.args[0]]
     if mode.endswith("alias"):
         assert isinstance(source, tvm.tirx.Var)
         source = producers[source]

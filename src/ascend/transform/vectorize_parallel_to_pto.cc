@@ -1624,16 +1624,15 @@ private:
       // Lane-varying int value choices fall through to the vsel lowering.
     }
     if (const auto *call = expr.as<CallNode>()) {
-      // Lane-mask boolean combinations come first. They are not unary
-      // math, so the strict unary-math mapping below must not see them
-      // (it only covers fabs/exp/log/sqrt). The frontend infinity()
-      // constant never arrives here: Legalize rewrites it to FloatImm.
       std::string name;
       if (const auto *op_node = call->op.as<OpNode>()) {
         name = op_node->name;
       }
-      if (const char *mask_op = pto_analysis::MaskLogicVmiOpName(name)) {
-        const bool is_not = std::string_view(mask_op) == "vnot";
+      if (const char *bitwise =
+              pto_analysis::BitwiseVmiOpName(name, call->dtype)) {
+        if (!call->dtype.is_bool())
+          return ConvertBinary(call->args[0], call->args[1], bitwise, pre);
+        const bool is_not = std::string_view(bitwise) == "vnot";
         ICHECK_EQ(call->args.size(), is_not ? 1U : 2U);
         // Convert each operand exactly once, then dispatch on the converted
         // shape. The call itself carries the spelling the frontend used
@@ -1654,7 +1653,7 @@ private:
             [&](const PrimExpr &x, const PrimExpr &y) {
               return Call(expr.dtype(), call->op, {x, y});
             },
-            mask_op, pre);
+            bitwise, pre);
       }
       // Hardware-backed unary math (fabs/exp/log/sqrt); the dtype matrix
       // mirrors the ISA documentation (see IsSupportedVectorUnaryOp).
@@ -1983,6 +1982,10 @@ private:
       }
       if (vmi_name == "vdiv")
         return div(a, b);
+      if (vmi_name == "vand")
+        return bitwise_and(a, b);
+      if (vmi_name == "vor")
+        return bitwise_or(a, b);
       ICHECK(false) << "[VectorizeParallelToPTO] internal error: unknown "
                        "binary op "
                     << vmi_name;

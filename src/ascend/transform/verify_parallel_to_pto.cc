@@ -32,6 +32,7 @@
 #include <optional>
 #include <set>
 #include <sstream>
+#include <string_view>
 #include <vector>
 
 #include "../../transform/common/attr.h"
@@ -1138,25 +1139,21 @@ private:
         if (const auto *call = e.as<CallNode>()) {
           if (auto call_op = call->op.as<Op>()) {
             const std::string &name = call_op.value()->name;
-            // Boolean mask-combine calls (the shared
-            // tirx.bitwise_* / tir.And|Or|Not admission table) and the
-            // tl/tir.infinity() constant.
-            // A mask combine only has a lowering for bool (lane-mask)
-            // values.
-            if (pto_analysis::MaskLogicVmiOpName(name) != nullptr) {
-              // An integer bitwise call is rejected with a proper
-              // diagnostic; CheckBinaryOpTypes is static, so report via
-              // LOG(FATAL) (the same channel Fail uses).
-              if (!call->dtype.is_bool()) {
-                LOG(FATAL)
-                    << "[VerifyParallelToPTO] type: bitwise mask combine `"
-                    << name
-                    << "` requires bool (lane-mask) operands; an integer "
-                       "bitwise call has no lane-mask lowering";
-              }
+            if (const char *vmi_op =
+                    pto_analysis::BitwiseVmiOpName(name, call->dtype)) {
+              const size_t arity = std::string_view(vmi_op) == "vnot" ? 1 : 2;
+              if (call->args.size() != arity)
+                parent_->Fail("type", name + " has the wrong operand count");
               for (const auto &arg : call->args) {
+                if (arg.dtype() != call->dtype)
+                  parent_->Fail(
+                      "type",
+                      name + " requires matching operand and result types");
                 check(arg);
               }
+              if (!call->dtype.is_bool())
+                CheckBinaryOpType(vmi_op, call->dtype, call->args[0],
+                                  call->args[1]);
               return;
             }
             if (name == "tl.infinity" || name == "tir.infinity") {

@@ -831,6 +831,55 @@ def test_verify_runtime_uniform_float_div_rejected():
         _lower(_runtime_uniform_float_kernel(256, 128), target="pto")
 
 
+def _integer_bitwise_kernel(dtype, bits, extent, uniform=False):
+    @T.prim_func
+    def main(A: T.Tensor((128,), dtype), B: T.Tensor((128,), dtype)):
+        with T.Kernel(1):
+            src = T.alloc_shared((128,), dtype)
+            out = T.alloc_shared((128,), dtype)
+            T.copy(A, src)
+            T.copy(B, out)
+            with T.SimdVF(lanes=64):
+                for i in T.Parallel(extent):
+                    out[i] = src[0] | (src[1 if uniform else i] & T.Cast(dtype, bits))
+            T.copy(out, B)
+
+    return main
+
+
+@pytest.mark.pto
+@pytest.mark.parametrize("dtype", ["int8", "uint8", "int16", "uint16", "int32", "uint32"])
+def test_integer_bitwise_data_and_tail_mask(dtype):
+    bits = 0x807FFFFF if dtype == "uint32" else 0x51
+    mod, _ = _lower_capture(_integer_bitwise_kernel(dtype, bits, 65))
+    producers = {bind.var: bind.value for bind in _collect(mod, lambda node: isinstance(node, tvm.tirx.Bind))}
+    (store,) = _vmi_calls(mod)["tl.vmi.vstore"]
+    union = producers[store.args[0]]
+    assert union.op.name == "tl.vmi.vor"
+    seed, masked, active = union.args
+    intersection = producers[masked]
+    assert intersection.op.name == "tl.vmi.vand"
+    word, constant, and_mask = intersection.args
+    assert str(union.dtype) == str(intersection.dtype) == f"{dtype}x64"
+    assert active.same_as(and_mask) and active.same_as(store.args[3])
+    assert producers[active].op.name == "tl.vmi.create_mask"
+    assert producers[active].args[0].buffer.same_as(_remaining_buffers(mod)[0])
+    assert producers[seed].op.name == producers[constant].op.name == "tl.vmi.vbrc"
+    assert producers[word].op.name == "tl.vmi.vload"
+    assert int(producers[constant].args[0]) == bits
+
+
+@pytest.mark.pto
+def test_integer_bitwise_uniform_operands_stay_scalar():
+    mod, _ = _lower_capture(_integer_bitwise_kernel("uint32", 0x807FFFFF, 64, uniform=True))
+    calls = _vmi_calls(mod)
+    assert "tl.vmi.vor" not in calls and "tl.vmi.vand" not in calls
+    (broadcast,) = calls["tl.vmi.vbrc"]
+    scalar = broadcast.args[0]
+    assert scalar.op.name == "tirx.bitwise_or" and scalar.args[1].op.name == "tirx.bitwise_and"
+    assert str(scalar.dtype) == "uint32"
+
+
 def _unary_kernel(n, lanes, kind):
     @T.prim_func
     def main(A: T.Tensor((n,), "float32"), C: T.Tensor((n,), "float32")):
