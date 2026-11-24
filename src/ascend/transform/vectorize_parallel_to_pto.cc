@@ -1986,16 +1986,28 @@ private:
         return bitwise_and(a, b);
       if (vmi_name == "vor")
         return bitwise_or(a, b);
+      if (vmi_name == "vshl")
+        return left_shift(a, b);
+      if (vmi_name == "vshr")
+        return right_shift(a, b);
       ICHECK(false) << "[VectorizeParallelToPTO] internal error: unknown "
                        "binary op "
                     << vmi_name;
     }
     int64_t width = std::max(lhs_info.logical_lanes, rhs_info.logical_lanes);
     a = ToVmiWidth(a, width, pre);
+    PrimExpr mask = width == 1 ? GetFullMask(1) : mask_var_;
+    if (!b_vec && (vmi_name == "vshl" || vmi_name == "vshr")) {
+      // VMI scalar shifts take an i16 count for every data element width.
+      // All defined TIR counts fit in i16 (0 <= count < element bits).
+      const std::string scalar_op = vmi_name + "s";
+      return EmitBind(scalar_op,
+                      Call(a.dtype(), VmiOp(scalar_op),
+                           {a, cast(DataType::Int(16), b), mask}),
+                      pre);
+    }
     b = ToVmiWidth(b, width, pre);
-    return EmitBind(result_name,
-                    Call(a.dtype(), VmiOp(vmi_name),
-                         {a, b, width == 1 ? GetFullMask(1) : mask_var_}),
+    return EmitBind(result_name, Call(a.dtype(), VmiOp(vmi_name), {a, b, mask}),
                     pre);
   }
 

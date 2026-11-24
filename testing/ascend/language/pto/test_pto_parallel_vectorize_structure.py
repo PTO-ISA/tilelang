@@ -880,6 +880,43 @@ def test_integer_bitwise_uniform_operands_stay_scalar():
     assert str(scalar.dtype) == "uint32"
 
 
+@pytest.mark.pto
+@pytest.mark.parametrize("dtype", ["uint32", "int32"])
+@pytest.mark.parametrize("right", [False, True])
+@pytest.mark.parametrize("varying_count", [False, True])
+def test_integer_shift_uses_data_dtype_and_tail_mask(dtype, right, varying_count):
+    @T.prim_func
+    def main(A: T.Tensor((128,), dtype), B: T.Tensor((128,), dtype)):
+        with T.Kernel(1):
+            a = T.alloc_shared((128,), dtype)
+            b = T.alloc_shared((128,), dtype)
+            T.copy(A, a)
+            T.copy(B, b)
+            with T.SimdVF(lanes=64):
+                for i in T.Parallel(65):
+                    for j in T.serial(2):
+                        if varying_count:
+                            count = a[i] & T.Cast(dtype, 7)
+                        else:
+                            count = T.Cast(dtype, j * 8)
+                        if right:
+                            b[i] = a[i] >> count
+                        else:
+                            b[i] = a[i] << count
+            T.copy(b, B)
+
+    mod, _ = _lower_capture(main)
+    producers = {bind.var: bind.value for bind in _collect(mod, lambda node: isinstance(node, tvm.tirx.Bind))}
+    (store,) = _vmi_calls(mod)["tl.vmi.vstore"]
+    shift = producers[store.args[0]]
+    op = "vshr" if right else "vshl"
+    assert shift.op.name == "tl.vmi." + (op if varying_count else op + "s")
+    assert str(shift.dtype) == str(shift.args[0].dtype) == f"{dtype}x64"
+    assert str(shift.args[1].dtype) == (f"{dtype}x64" if varying_count else "int16")
+    assert shift.args[2].same_as(store.args[3])
+    assert producers[shift.args[2]].args[0].buffer.same_as(_remaining_buffers(mod)[0])
+
+
 def _unary_kernel(n, lanes, kind):
     @T.prim_func
     def main(A: T.Tensor((n,), "float32"), C: T.Tensor((n,), "float32")):

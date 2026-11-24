@@ -566,6 +566,12 @@ const char *BitwiseVmiOpName(const std::string &name, DataType dtype) {
     return "vand";
   if (name == "tirx.bitwise_or" || name == "tir.bitwise_or")
     return "vor";
+  if (!dtype.is_bool()) {
+    if (name == "tirx.shift_left" || name == "tir.shift_left")
+      return "vshl";
+    if (name == "tirx.shift_right" || name == "tir.shift_right")
+      return "vshr";
+  }
   if (!dtype.is_bool())
     return nullptr;
   if (name == "tir.And")
@@ -2935,7 +2941,8 @@ bool IsSupportedVectorBinaryOp(const std::string &vmi_op, DataType dtype) {
   const bool is_int_like = dtype.is_int() || dtype.is_uint();
   const bool is_fp_like =
       (dtype.is_float() || dtype.is_bfloat16()) && (bits == 16 || bits == 32);
-  if (vmi_op == "vand" || vmi_op == "vor")
+  if (vmi_op == "vand" || vmi_op == "vor" || vmi_op == "vshl" ||
+      vmi_op == "vshr")
     return is_int_like && (bits == 8 || bits == 16 || bits == 32);
   if (vmi_op == "vmul") {
     return (is_int_like && (bits == 16 || bits == 32)) || is_fp_like;

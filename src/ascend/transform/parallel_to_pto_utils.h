@@ -409,7 +409,7 @@ struct VectorCastPlan {
 
 using CastPlan = std::variant<ScalarCastPlan, VectorCastPlan>;
 
-// Integer data and boolean masks share the bitwise AND/OR call names.
+// Map integer shifts and bitwise calls. Data and masks share AND/OR.
 // The remaining logical spellings (including NOT) are mask-only.
 const char *BitwiseVmiOpName(const std::string &name, DataType dtype);
 

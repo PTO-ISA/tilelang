@@ -5822,18 +5822,18 @@ void CodeGenTileLangPTO::VisitExpr_(const CallNode *op,
   if (is_shift_left || is_shift_right) {
     const char *shift_name = is_shift_left ? "shift_left" : "shift_right";
     int64_t shift = 0;
-    ICHECK(TryGetConstInt(op->args[1], &shift) && shift >= 0)
-        << "PTO codegen only supports constant non-negative " << shift_name;
     DataType dtype = op->args[0].dtype();
     ICHECK(dtype.is_scalar() && (dtype.is_int() || dtype.is_uint()))
         << "PTO " << shift_name << " expects a scalar integer operand, got "
         << dtype;
-    ICHECK_LT(shift, dtype.bits())
-        << "PTO " << shift_name << " amount " << shift
-        << " must be smaller than operand bit width " << dtype.bits();
+    if (TryGetConstInt(op->args[1], &shift)) {
+      ICHECK(shift >= 0 && shift < dtype.bits())
+          << "PTO " << shift_name << " amount " << shift
+          << " must be in [0, " << dtype.bits() << ")";
+    }
 
     PrintBinaryExpr_(is_shift_left ? "<<" : ">>", op->dtype, op->args[0],
-                     IntImm(op->args[1].dtype(), shift), os);
+                     op->args[1], os);
     return;
   }
 
