@@ -2751,6 +2751,12 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
     if (const auto *op_node = call->op.as<OpNode>()) {
       name = op_node->name;
     }
+    // Uniform integer complement in metadata is copied through as a scalar.
+    // It does not require an integer vnot computation in the Parallel body.
+    if (metadata_mode &&
+        (name == "tirx.bitwise_not" || name == "tir.bitwise_not") &&
+        call->args.size() == 1)
+      return AnalyzeLaneUseImpl(call->args[0], ctx, reason, metadata_mode);
     if (BitwiseVmiOpName(name, call->dtype) != nullptr) {
       if (call->args.empty()) {
         if (reason)
