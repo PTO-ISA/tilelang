@@ -5828,8 +5828,8 @@ void CodeGenTileLangPTO::VisitExpr_(const CallNode *op,
         << dtype;
     if (TryGetConstInt(op->args[1], &shift)) {
       ICHECK(shift >= 0 && shift < dtype.bits())
-          << "PTO " << shift_name << " amount " << shift
-          << " must be in [0, " << dtype.bits() << ")";
+          << "PTO " << shift_name << " amount " << shift << " must be in [0, "
+          << dtype.bits() << ")";
     }
 
     PrintBinaryExpr_(is_shift_left ? "<<" : ">>", op->dtype, op->args[0],
