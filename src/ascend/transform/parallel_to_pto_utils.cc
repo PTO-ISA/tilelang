@@ -559,23 +559,28 @@ std::string AccessPatternToString(AccessPattern pattern) {
 // dispatch (Verify admission / Vectorize rewriting) cannot drift apart.
 // ---------------------------------------------------------------------------
 
-const char *MaskLogicVmiOpName(const std::string &tir_op_name) {
-  // TileLang `a & b` / `a | b` / `~a` on bool predicates arrive as
-  // tirx.bitwise_* calls (plus the tir.bitwise_* and tir.And/Or/Not
-  // spellings); Vectorize rewrites them to the PTODSL bitwise vector ops,
-  // whose mask register overload implements the boolean combine.
-  static const std::pair<const char *, const char *> kMaskLogicTable[] = {
-      {"tirx.bitwise_and", "vand"}, {"tir.bitwise_and", "vand"},
-      {"tir.And", "vand"},          {"tirx.bitwise_or", "vor"},
-      {"tir.bitwise_or", "vor"},    {"tir.Or", "vor"},
-      {"tirx.bitwise_not", "vnot"}, {"tir.bitwise_not", "vnot"},
-      {"tir.Not", "vnot"},
-  };
-  for (const auto &entry : kMaskLogicTable) {
-    if (tir_op_name == entry.first) {
-      return entry.second;
-    }
+const char *BitwiseVmiOpName(const std::string &name, DataType dtype) {
+  if (!dtype.is_int() && !dtype.is_uint() && !dtype.is_bool())
+    return nullptr;
+  if (name == "tirx.bitwise_and" || name == "tir.bitwise_and")
+    return "vand";
+  if (name == "tirx.bitwise_or" || name == "tir.bitwise_or")
+    return "vor";
+  if (!dtype.is_bool()) {
+    if (name == "tirx.shift_left" || name == "tir.shift_left")
+      return "vshl";
+    if (name == "tirx.shift_right" || name == "tir.shift_right")
+      return "vshr";
   }
+  if (!dtype.is_bool())
+    return nullptr;
+  if (name == "tir.And")
+    return "vand";
+  if (name == "tir.Or")
+    return "vor";
+  if (name == "tirx.bitwise_not" || name == "tir.bitwise_not" ||
+      name == "tir.Not")
+    return "vnot";
   return nullptr;
 }
 
@@ -2091,7 +2096,7 @@ public:
                     "` (admits buffer loads, constants, scalars, loop "
                     "indices, Add, Sub, Mul, Div, fabs/exp/log/sqrt, Cast, "
                     "Select, comparisons, Min/Max, And/Or/Not and the "
-                    "bitwise mask-combine calls)";
+                    "bitwise calls)";
     }
   }
   void VisitExpr_(const ModNode *) final { MarkUnsupported("Mod"); }
@@ -2121,8 +2126,7 @@ public:
   void VisitExpr_(const CallNode *op) final {
     if (auto call_op = op->op.as<Op>()) {
       const std::string &name = call_op.value()->name;
-      // Boolean combine on lane masks (tirx.bitwise_*; table above).
-      if (MaskLogicVmiOpName(name) != nullptr) {
+      if (BitwiseVmiOpName(name, op->dtype) != nullptr) {
         for (const auto &arg : op->args) {
           VisitExpr(arg);
         }
@@ -2164,8 +2168,7 @@ public:
         name = op_node->name;
       }
       if (!unsupported.has_value()) {
-        unsupported = "unsupported Call `" + name +
-                      "` (only tirx.fabs/exp/log/sqrt are vectorizable)";
+        unsupported = "unsupported Call `" + name + "`";
       }
     }
   }
@@ -2754,13 +2757,16 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
     if (const auto *op_node = call->op.as<OpNode>()) {
       name = op_node->name;
     }
-    auto is_mask_logic = [&](const std::string &n) {
-      return MaskLogicVmiOpName(n) != nullptr;
-    };
-    if (is_mask_logic(name)) {
+    // Uniform integer complement in metadata is copied through as a scalar.
+    // It does not require an integer vnot computation in the Parallel body.
+    if (metadata_mode &&
+        (name == "tirx.bitwise_not" || name == "tir.bitwise_not") &&
+        call->args.size() == 1)
+      return AnalyzeLaneUseImpl(call->args[0], ctx, reason, metadata_mode);
+    if (BitwiseVmiOpName(name, call->dtype) != nullptr) {
       if (call->args.empty()) {
         if (reason)
-          *reason = "empty mask-logic call";
+          *reason = "empty bitwise call";
         return LaneUse::kUnknown;
       }
       LaneUse acc =
@@ -2851,6 +2857,13 @@ ValueInfo AnalyzeComputeValue(const PrimExpr &expr, LaneUseContext *ctx) {
   } else if (const auto *op = expr.as<DivNode>()) {
     lhs = &op->a;
     rhs = &op->b;
+  } else if (const auto *call = expr.as<CallNode>();
+             call && call->args.size() == 2 && !call->dtype.is_bool()) {
+    const auto *op = call->op.as<OpNode>();
+    if (op && BitwiseVmiOpName(op->name, call->dtype)) {
+      return merge(AnalyzeComputeValue(call->args[0], ctx),
+                   AnalyzeComputeValue(call->args[1], ctx));
+    }
   }
   if (lhs)
     return merge(AnalyzeComputeValue(*lhs, ctx),
@@ -2928,6 +2941,9 @@ bool IsSupportedVectorBinaryOp(const std::string &vmi_op, DataType dtype) {
   const bool is_int_like = dtype.is_int() || dtype.is_uint();
   const bool is_fp_like =
       (dtype.is_float() || dtype.is_bfloat16()) && (bits == 16 || bits == 32);
+  if (vmi_op == "vand" || vmi_op == "vor" || vmi_op == "vshl" ||
+      vmi_op == "vshr")
+    return is_int_like && (bits == 8 || bits == 16 || bits == 32);
   if (vmi_op == "vmul") {
     return (is_int_like && (bits == 16 || bits == 32)) || is_fp_like;
   }

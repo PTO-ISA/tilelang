@@ -49,6 +49,32 @@ def verify_body(mod, make_body):
     assert tvm.ir.structural_equal(mod, result), "Verify must preserve source evaluation and access positions"
 
 
+@pytest.mark.pto
+@pytest.mark.parametrize("serial", [False, True])
+def test_guarded_bitwise_gather(serial):
+    _, captured = lower_case("bitwise_gather", indexed_kernel(dtype="uint32"))
+
+    def make_body(i, payload, index, output):
+        j = tvm.tirx.Var("j", "int32")
+        offset = index[i] + j if serial else index[i]
+        value = payload[0] | (payload[offset] & tvm.tirx.IntImm("uint32", 255))
+        store = tvm.tirx.BufferStore(output, value, [i])
+        branch = tvm.tirx.IfThenElse(i < 150, store, None)
+        return tvm.tirx.For(j, 0, 2, tvm.tirx.ForKind.SERIAL, branch) if serial else branch
+
+    with pytest.raises(Exception, match="buffer `x` load.*requires gather.*IfThenElse then"):
+        verify_body(captured["VerifyParallelToPTO_before"], make_body)
+
+
+@pytest.mark.pto
+def test_uniform_integer_complement_in_metadata(source_module):
+    def make_body(i, payload, index, output):
+        store = tvm.tirx.BufferStore(output, payload[i], [i])
+        return tvm.tirx.AttrStmt(tvm.tirx.IntImm("int32", 0), "flags", ~index[0], store)
+
+    verify_body(source_module, make_body)
+
+
 def branch_body(kind, location):
     def make_body(i, payload, index, output):
         condition = i < 150

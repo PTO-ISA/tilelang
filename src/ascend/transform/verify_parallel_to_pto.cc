@@ -32,6 +32,7 @@
 #include <optional>
 #include <set>
 #include <sstream>
+#include <string_view>
 #include <vector>
 
 #include "../../transform/common/attr.h"
@@ -377,8 +378,8 @@ private:
     void VisitExpr_(const CallNode *op) final {
       if (auto call_op = op->op.as<Op>()) {
         const std::string &name = call_op.value()->name;
-        if (name == "tirx.fabs" || name == "tirx.exp" || name == "tirx.log" ||
-            name == "tirx.sqrt") {
+        if (pto_analysis::VectorUnaryVmiOpName(name) ||
+            pto_analysis::BitwiseVmiOpName(name, op->dtype)) {
           StmtExprVisitor::VisitExpr_(op);
         }
       }
@@ -407,9 +408,19 @@ private:
       bind_env_ = std::move(saved_env);
     }
 
+    void VisitStmt_(const ForNode *op) final {
+      if (op->kind != ForKind::kSerial)
+        return;
+      Map<Var, PrimExpr> saved_env = bind_env_;
+      const bool inserted = external_defs_.insert(op->loop_var.get()).second;
+      VisitStmt(op->body);
+      bind_env_ = std::move(saved_env);
+      if (inserted)
+        external_defs_.erase(op->loop_var.get());
+    }
+
     // These forms are rejected by the existing unit whitelist. Do not infer
     // execution or lexical semantics for them in this narrower check.
-    void VisitStmt_(const ForNode *) final {}
     void VisitStmt_(const WhileNode *) final {}
     void VisitStmt_(const SBlockNode *) final {}
     void VisitStmt_(const SBlockRealizeNode *) final {}
@@ -512,7 +523,7 @@ private:
     VerifyParallelToPTOImpl *parent_;
     Var loop_var_;
     const pto_analysis::PtoInverseMapping &mapping_;
-    const std::set<const VarNode *> &external_defs_;
+    std::set<const VarNode *> external_defs_;
     arith::Analyzer analyzer_;
     Map<Var, PrimExpr> bind_env_;
     std::vector<std::string> contexts_;
@@ -1138,25 +1149,21 @@ private:
         if (const auto *call = e.as<CallNode>()) {
           if (auto call_op = call->op.as<Op>()) {
             const std::string &name = call_op.value()->name;
-            // Boolean mask-combine calls (the shared
-            // tirx.bitwise_* / tir.And|Or|Not admission table) and the
-            // tl/tir.infinity() constant.
-            // A mask combine only has a lowering for bool (lane-mask)
-            // values.
-            if (pto_analysis::MaskLogicVmiOpName(name) != nullptr) {
-              // An integer bitwise call is rejected with a proper
-              // diagnostic; CheckBinaryOpTypes is static, so report via
-              // LOG(FATAL) (the same channel Fail uses).
-              if (!call->dtype.is_bool()) {
-                LOG(FATAL)
-                    << "[VerifyParallelToPTO] type: bitwise mask combine `"
-                    << name
-                    << "` requires bool (lane-mask) operands; an integer "
-                       "bitwise call has no lane-mask lowering";
-              }
+            if (const char *vmi_op =
+                    pto_analysis::BitwiseVmiOpName(name, call->dtype)) {
+              const size_t arity = std::string_view(vmi_op) == "vnot" ? 1 : 2;
+              if (call->args.size() != arity)
+                parent_->Fail("type", name + " has the wrong operand count");
               for (const auto &arg : call->args) {
+                if (arg.dtype() != call->dtype)
+                  parent_->Fail(
+                      "type",
+                      name + " requires matching operand and result types");
                 check(arg);
               }
+              if (!call->dtype.is_bool())
+                CheckBinaryOpType(vmi_op, call->dtype, call->args[0],
+                                  call->args[1]);
               return;
             }
             if (name == "tl.infinity" || name == "tir.infinity") {
