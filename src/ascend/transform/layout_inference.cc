@@ -1199,9 +1199,10 @@ private:
           // Even an annotation-only Fragment view constrains the threads
           // owning the shared register storage.
           Array<Buffer> aliases = buffer_data_to_buffers_[buffer->data];
-          if (std::none_of(
-                  aliases.begin(), aliases.end(),
-                  [&](const Buffer &alias) { return alias.same_as(buffer); })) {
+          if (std::none_of(aliases.begin(), aliases.end(),
+                           [buffer = buffer](const Buffer &alias) {
+                             return alias.same_as(buffer);
+                           })) {
             aliases.push_back(buffer);
             buffer_data_to_buffers_.Set(buffer->data, aliases);
           }

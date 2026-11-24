@@ -25,6 +25,7 @@ namespace tvm {
 namespace tl {
 namespace pto {
 
+using ffi::Array;
 using ffi::Map;
 using ffi::Optional;
 using tirx::Var;
@@ -65,7 +66,8 @@ bool IsPtoIndexDType(DataType dtype);
  * compiler-generated buffer-version coordinates, instead of converting them to
  * vector values. */
 bool IsPtoScalarCoordinate(const PrimExpr &expr, const Var &vector_var,
-                           const ffi::Map<Var, PrimExpr> &bind_env);
+                           const ffi::Map<Var, PrimExpr> &bind_env,
+                           const Var &lane_var = Var());
 
 struct MemoryAccess;
 
@@ -83,10 +85,12 @@ bool IsPtoLaneUniform(const PrimExpr &expr, const tirx::Var &vector_var,
 struct PtoInverseMapping;
 
 /*! Check that the planned offset has a supported scalar/VMI expression
- * lowering under the selected lane mapping. */
-void CheckPtoIndexedOffsetExpr(const PrimExpr &offset, const Var &vector_var,
-                               const PtoInverseMapping &mapping,
-                               const Map<Var, PrimExpr> &bind_env);
+ * lowering under the selected lane mapping. Return inputs of its vector
+ * int32-to-int16 casts for the B16 range check. */
+Array<PrimExpr> CheckPtoIndexedOffsetExpr(const PrimExpr &offset,
+                                          const Var &vector_var,
+                                          const PtoInverseMapping &mapping,
+                                          const Map<Var, PrimExpr> &bind_env);
 
 /*! View metadata used by the physical address at this access. */
 ffi::Array<PrimExpr> PtoAddressMetadata(const tirx::Buffer &buffer,

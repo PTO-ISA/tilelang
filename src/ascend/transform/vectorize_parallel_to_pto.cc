@@ -155,6 +155,8 @@ private:
         "tl.vmi.vcmp",   "tl.vmi.vcmps",
         "tl.vmi.vsel",   "tl.vmi.vand",
         "tl.vmi.vor",    "tl.vmi.vnot",
+        "tl.vmi.vshl",   "tl.vmi.vshr",
+        "tl.vmi.vshls",  "tl.vmi.vshrs",
         "tl.access_ptr",
     };
     bool discardable = true;
@@ -162,7 +164,9 @@ private:
       if (const auto *call = n.as<CallNode>()) {
         const auto *op = call->op.as<OpNode>();
         const std::string name = op != nullptr ? op->name : "";
-        if (kDiscardable.count(name) == 0) {
+        if (kDiscardable.count(name) == 0 &&
+            pto_analysis::GetPtoBitOp(GetRef<Call>(call)) ==
+                pto_analysis::PtoBitOp::kNone) {
           discardable = false;
         }
       }
@@ -1309,11 +1313,11 @@ private:
                                            unit_mapping_, analyzer_,
                                            buffer_versions_, bind_env_);
     PrimExpr base = ConvertScalarExpr(BindChunkToQ(plan.base));
-    PrimExpr offsets =
-        Broadcast(plan.generate_uint16_offsets
-                      ? ConvertUint16Offset(BindChunkToQ(plan.offsets), pre)
-                      : ConvertExpr(plan.offsets, pre),
-                  pre);
+    PrimExpr offset_expr = BindChunkToQ(plan.offsets);
+    PrimExpr offsets = plan.generate_uint16_coordinates
+                           ? ConvertUint16Offset(offset_expr, pre)
+                           : ConvertExpr(offset_expr, pre);
+    offsets = Broadcast(offsets, pre);
     // VMI gather and scatter only access memory for active lanes, so tail
     // offsets can be passed directly. PTODSL normalizes the offset carrier.
     Optional<PrimExpr> version_index;
@@ -1573,10 +1577,12 @@ private:
       if (it != value_map_.end()) {
         return (*it).second;
       }
-      if (var == loop_var_.get()) {
+      if (var == loop_var_.get() || var == unit_mapping_.lane_var.get()) {
         // The selected coordinate used as a value becomes a VMI vector.
-        PrimExpr base = analyzer_->Simplify(
-            BindChunkToQ(SubstituteLaneZero(unit_mapping_.index_expr)));
+        PrimExpr base = var == loop_var_.get()
+                            ? analyzer_->Simplify(BindChunkToQ(
+                                  SubstituteLaneZero(unit_mapping_.index_expr)))
+                            : make_zero(var->dtype);
         return EmitBind(
             "vci",
             Call(VectorDType(var->dtype, lanes_), VmiOp("vci"), {base},
@@ -1624,15 +1630,16 @@ private:
       // Lane-varying int value choices fall through to the vsel lowering.
     }
     if (const auto *call = expr.as<CallNode>()) {
+      Call value_call = GetRef<Call>(call);
+      auto bit_op = pto_analysis::GetPtoBitOp(value_call);
+      if (bit_op != pto_analysis::PtoBitOp::kNone) {
+        return ConvertBitOp(value_call, bit_op, pre);
+      }
       // Lane-mask boolean combinations come first. They are not unary
       // math, so the strict unary-math mapping below must not see them
       // (it only covers fabs/exp/log/sqrt). The frontend infinity()
       // constant never arrives here: Legalize rewrites it to FloatImm.
-      std::string name;
-      if (const auto *op_node = call->op.as<OpNode>()) {
-        name = op_node->name;
-      }
-      if (const char *mask_op = pto_analysis::MaskLogicVmiOpName(name)) {
+      if (const char *mask_op = pto_analysis::GetPtoMaskLogicOp(value_call)) {
         const bool is_not = std::string_view(mask_op) == "vnot";
         ICHECK_EQ(call->args.size(), is_not ? 1U : 2U);
         // Convert each operand exactly once, then dispatch on the converted
@@ -1656,22 +1663,13 @@ private:
             },
             mask_op, pre);
       }
-      // Hardware-backed unary math (fabs/exp/log/sqrt); the dtype matrix
-      // mirrors the ISA documentation (see IsSupportedVectorUnaryOp).
-      auto call_op = call->op.as<Op>();
-      ICHECK(call_op.has_value())
-          << "[VectorizeParallelToPTO] internal error: non-Op call passed "
-             "Verify: "
-          << expr;
-      const char *unary =
-          pto_analysis::VectorUnaryVmiOpName(call_op.value()->name);
-      ICHECK(unary != nullptr)
-          << "[VectorizeParallelToPTO] internal error: call passed Verify "
-             "without a VMI mapping: "
-          << call_op.value()->name;
+      const char *unary = pto_analysis::GetPtoUnaryOp(value_call);
+      ICHECK(unary) << "[VectorizeParallelToPTO] call without a VMI mapping: "
+                    << call->op;
       PrimExpr a = ConvertExpr(call->args[0], pre);
-      if (Info(a).kind == pto::ValueKind::kScalar)
+      if (Info(a).kind == pto::ValueKind::kScalar) {
         return Call(expr.dtype(), call->op, {a});
+      }
       auto width = Info(a).logical_lanes;
       return EmitBind(unary,
                       Call(VectorDType(expr.dtype().element_of(), width),
@@ -1751,7 +1749,8 @@ private:
           << VectorDType(cast->dtype, cast_lanes);
       return current;
     }
-    if (pto_analysis::IsPtoScalarCoordinate(expr, loop_var_, bind_env_)) {
+    if (pto_analysis::IsPtoScalarCoordinate(expr, loop_var_, bind_env_,
+                                            unit_mapping_.lane_var)) {
       return ConvertScalarExpr(expr);
     }
     if (const auto *andn = expr.as<AndNode>()) {
@@ -1955,6 +1954,49 @@ private:
     return EmitBind(
         "vcmp", Call(mask_ty, VmiOp("vcmp"), {a, b, mask_var_, StringImm(cmp)}),
         pre);
+  }
+
+  PrimExpr ConvertBitOp(const Call &call, pto_analysis::PtoBitOp op,
+                        Array<Stmt> *pre) {
+    using pto_analysis::PtoBitOp;
+    PrimExpr value = ConvertExpr(call->args[0], pre);
+    pto::ValueInfo value_info = Info(value);
+    const bool vector = value_info.IsVmi();
+    const DataType dtype = call->dtype;
+    if (op == PtoBitOp::kReinterpret) {
+      if (dtype == call->args[0].dtype()) {
+        return value;
+      }
+      if (!vector) {
+        return Call(dtype, call->op, {value}, call->span);
+      }
+      return EmitBind("reinterpret",
+                      Call(VectorDType(dtype, value_info.logical_lanes),
+                           VmiOp("vinterpret_cast"), {value},
+                           {{"to_dtype", StringImm(TvmDtypeName(dtype))}}),
+                      pre);
+    }
+    PrimExpr rhs = ConvertExpr(call->args[1], pre);
+    const bool rhs_vector = Info(rhs).IsVmi();
+    if (!vector && !rhs_vector) {
+      return Call(dtype, call->op, {value, rhs}, call->span);
+    }
+    const char *name;
+    if (op == PtoBitOp::kAnd || op == PtoBitOp::kOr) {
+      name = op == PtoBitOp::kAnd ? "vand" : "vor";
+    } else if (rhs_vector) {
+      name = op == PtoBitOp::kShiftLeft ? "vshl" : "vshr";
+    } else {
+      // The VMI scalar-shift ABI uses an i16 count for all data widths.
+      name = op == PtoBitOp::kShiftLeft ? "vshls" : "vshrs";
+      int64_t width = value_info.logical_lanes;
+      return EmitBind(name,
+                      Call(VectorDType(dtype, width), VmiOp(name),
+                           {value, cast(DataType::Int(16), rhs),
+                            width == 1 ? GetFullMask(1) : mask_var_}),
+                      pre);
+    }
+    return EmitBinary(std::move(value), std::move(rhs), name, name, pre);
   }
 
   PrimExpr ConvertBinary(const PrimExpr &lhs, const PrimExpr &rhs,
