@@ -234,6 +234,69 @@ private:
   }
 };
 
+// Follow a finalize destination backwards from its consumers to find writes
+// that must leave a runtime loop. The entering value survives zero trips.
+class ReducerLoopResults : public StmtExprMutator {
+public:
+  explicit ReducerLoopResults(Buffer slot) : slot_(std::move(slot)) {}
+  bool NeedsInitialValue() const { return has_carry_ && live_; }
+
+private:
+  PrimExpr VisitExpr_(const BufferLoadNode *op) final {
+    if (op->buffer->data.same_as(slot_->data))
+      live_ = true;
+    return StmtExprMutator::VisitExpr_(op);
+  }
+
+  Stmt VisitStmt_(const BufferStoreNode *op) final {
+    if (op->buffer->data.same_as(slot_->data)) {
+      live_ = false;
+      ++writes_;
+    }
+    return StmtExprMutator::VisitStmt_(op);
+  }
+
+  Stmt VisitStmt_(const SeqStmtNode *op) final {
+    Array<Stmt> seq = op->seq;
+    for (size_t i = seq.size(); i > 0; --i)
+      seq.Set(i - 1, VisitStmt(seq[i - 1]));
+    return SeqStmt::Flatten(seq);
+  }
+
+  Stmt VisitStmt_(const IfThenElseNode *op) final {
+    const bool after = live_;
+    Stmt then_case = VisitStmt(op->then_case);
+    const bool then_live = live_;
+    live_ = after;
+    Optional<Stmt> else_case;
+    if (op->else_case.defined())
+      else_case = VisitStmt(op->else_case.value());
+    live_ |= then_live;
+    return IfThenElse(VisitExpr(op->condition), then_case, else_case);
+  }
+
+  Stmt VisitStmt_(const ForNode *op) final {
+    const bool after = live_;
+    const size_t before = writes_;
+    For loop = Downcast<For>(StmtExprMutator::VisitStmt_(op));
+    live_ |= after;
+    if (after && writes_ != before) {
+      Array<Var> slots;
+      if (auto old = loop->annotations.Get(attr::kPtoReducerLoopResults))
+        slots = Downcast<Array<Var>>(old.value());
+      slots.push_back(slot_->data);
+      loop.CopyOnWrite()->annotations.Set(attr::kPtoReducerLoopResults, slots);
+      has_carry_ = true;
+    }
+    return loop;
+  }
+
+  Buffer slot_;
+  size_t writes_{0};
+  bool live_{false};
+  bool has_carry_{false};
+};
+
 class VectorizeParallelToPTOImpl : public StmtExprMutator {
 public:
   static PrimFunc Substitute(PrimFunc f) {
@@ -326,6 +389,19 @@ private:
                       info.logical_lanes == 1 ? "local.var" : "local"));
     }
     Stmt body = ConvertRegion(region);
+    std::unordered_set<const VarNode *> visited_results;
+    for (const auto &site : reducers_.finalizes) {
+      const Buffer &slot = vf_buffers_.at(site->result->buffer->data);
+      if (!visited_results.insert(slot->data.get()).second)
+        continue;
+      ReducerLoopResults carry(slot);
+      body = carry(body);
+      if (carry.NeedsInitialValue()) {
+        // vreg declares a type. The runtime loop needs an entering SSA value.
+        auto zero = ToVmiWidth(make_zero(slot->dtype), 1, &mask_prelude_);
+        mask_prelude_.push_back(BufferStore(slot, zero, {Integer(0)}));
+      }
+    }
     const auto residual = pto_analysis::ScanPtoRegion(body);
     ICHECK(!residual.has_direct_reduce && !residual.has_fill)
         << "[VectorizeParallelToPTO] direct tileops "
@@ -1395,7 +1471,6 @@ private:
       auto access = pto_analysis::AnalyzeBufferAccess(
           store->buffer, store->indices, /*is_write=*/true, loop_var_,
           unit_mapping_, bind_env_);
-      value = ToVmiWidth(value, lanes_, &pre);
       PrimExpr call;
       if (access.pattern == pto_analysis::AccessPattern::kContinuous ||
           (access.pattern == pto_analysis::AccessPattern::kLaneUniform &&
@@ -1403,13 +1478,22 @@ private:
            is_zero(access.original_offset))) {
         Array<PrimExpr> starts = access.start_indices.Map(
             [&](const PrimExpr &index) { return BindChunkToQ(index); });
+        // A single iteration can store an existing one-lane VMI value
+        // directly, just like a region-level reducer result writeback.
+        const bool point_store =
+            unit_mapping_.logical_extent == 1 &&
+            Info(value).kind == pto::ValueKind::kOneLaneVmi;
+        const int64_t extent = point_store ? 1 : lanes_;
         PrimExpr ptr = Call(DataType::Handle(), tl::access_ptr(),
                             {ScalarBufferLoad(store->buffer, starts),
-                             IntImm(DataType::Int(32), lanes_),
-                             IntImm(DataType::Int(32), 2)});
-        call = Call(DataType::Void(), VmiOp("vstore"),
-                    {value, ptr, IntImm(DataType::Int(32), 0), mask_var_});
+                             Integer(extent), Integer(2)});
+        Array<PrimExpr> args = {ToVmiWidth(value, extent, &pre), ptr,
+                                Integer(0)};
+        if (!point_store)
+          args.push_back(mask_var_);
+        call = Call(DataType::Void(), VmiOp("vstore"), args);
       } else {
+        value = ToVmiWidth(value, lanes_, &pre);
         IndexedOperands operands = LowerIndexed(access, &pre);
         call = Call(DataType::Void(), VmiOp("vscatter"),
                     {value, operands.pointer, operands.base, operands.offsets,

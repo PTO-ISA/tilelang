@@ -54,7 +54,7 @@ def reducer_kernel(
     return main
 
 
-def result_consumer_kernel(mode, dtype="float32"):
+def result_consumer_kernel(mode, dtype="float32", op="sum", offset=0):
     cast_dtype = "float16" if dtype == "float32" else "float32"
     out_dtype = cast_dtype if mode.startswith("cast") else dtype
 
@@ -66,7 +66,7 @@ def result_consumer_kernel(mode, dtype="float32"):
             T.copy(A, a)
             T.copy(Out, out)
             with T.SimdVF(lanes=128):
-                acc = T.alloc_reducer((1,), dtype, op="sum")
+                acc = T.alloc_reducer((1,), dtype, op=op)
                 result = T.alloc_local((1,), dtype)
                 T.reducer_init(acc)
                 for i in T.Parallel(257):
@@ -92,6 +92,12 @@ def result_consumer_kernel(mode, dtype="float32"):
                     out[0] = result[0]
                     if out[0] > 0:
                         out[1] = result[0]
+                elif mode == "point" or mode == "point_alias":
+                    for i in T.Parallel(1):
+                        if mode == "point":
+                            out[i + offset] = result[0]
+                        else:
+                            out[i + offset] = alias2
                 elif mode == "cast_alias":
                     for i in T.Parallel(257):
                         out[i] = T.Cast(cast_dtype, alias2)
@@ -101,6 +107,127 @@ def result_consumer_kernel(mode, dtype="float32"):
             T.copy(out, Out)
 
     return main
+
+
+@pytest.mark.parametrize("mode", ["point", "point_alias"])
+@pytest.mark.parametrize("dtype,op,horizontal_op", [("float32", "sum", "tl.vmi.vcadd"), ("uint32", "max", "tl.vmi.vcmax")])
+def test_parallel_point_writeback(mode, dtype, op, horizontal_op, monkeypatch):
+    from tilelang import tvm
+    from testing.ascend._ir import calls, nodes
+
+    after = _capture_stages(result_consumer_kernel(mode, dtype, op), monkeypatch)["VectorizeParallelToPTO"]
+    (store,) = calls(after, "tl.vmi.vstore")
+    value, ptr, offset = store.args
+    assert int(ptr.args[1]) == 1 and int(offset) == 0
+
+    binds = {b.var: b.value for b in nodes(after, tvm.tirx.Bind)}
+    while isinstance(value, tvm.tirx.Var):
+        value = binds[value]
+    (horizontal,) = calls(after, horizontal_op)
+    assert str(horizontal.dtype) == dtype
+    (write,) = [s for s in nodes(after, tvm.tirx.BufferStore) if s.buffer.same_as(value.buffer)]
+    assert binds[write.value].same_as(horizontal)
+
+
+def test_parallel_point_nonzero_uniform_offset(monkeypatch):
+    from testing.ascend._ir import calls
+
+    after = _capture_stages(result_consumer_kernel("point", "uint32", "max", offset=1), monkeypatch)["VectorizeParallelToPTO"]
+    (scatter,) = calls(after, "tl.vmi.vscatter")
+    assert scatter.args[0].dtype.lanes == 128
+    assert not calls(after, "tl.vmi.vstore")
+
+
+def reducer_2d_consumer(mode):
+    out_dtype = "float16" if mode == "cast" else "float32"
+
+    @T.prim_func
+    def main(A: T.Tensor((2, 128), "float32"), Out: T.Tensor((2, 128), out_dtype)):
+        with T.Kernel(1):
+            a = T.alloc_shared((2, 128), "float32")
+            out = T.alloc_shared((2, 128), out_dtype)
+            T.copy(A, a)
+            with T.SimdVF(lanes=128):
+                acc = T.alloc_reducer((1,), "float32", op="sum")
+                result = T.alloc_local((1,), "float32")
+                T.reducer_init(acc)
+                for i, j in T.Parallel(2, 128):
+                    T.reducer_update(acc[0], a[i, j])
+                T.finalize_reducer(acc, result)
+                alias = T.bind(result[0])
+                for i, j in T.Parallel(2, 128):
+                    if mode == "direct":
+                        out[i, j] = result[0] / T.float32(256)
+                    elif mode == "alias":
+                        out[i, j] = alias / T.float32(256)
+                    elif mode == "scaled":
+                        out[i, j] = a[i, j] * (result[0] / T.float32(256))
+                    elif mode == "uniform":
+                        out[i, j] = a[0, 0] / T.float32(256)
+                    elif mode == "cast":
+                        inner_alias = T.bind(alias)
+                        out[i, j] = T.Cast("float16", inner_alias)
+                    else:
+                        out[i, j] = a[i, j] + result[0]
+            T.copy(out, Out)
+
+    return main
+
+
+def reducer_after_serial():
+    @T.prim_func
+    def main(A: T.Tensor((2, 2, 128), "float32"), Out: T.Tensor((2, 128), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((2, 2, 128), "float32")
+            out = T.alloc_shared((2, 128), "float32")
+            T.copy(A, a)
+            with T.SimdVF(lanes=128):
+                acc = T.alloc_reducer((1,), "float32", op="sum")
+                result = T.alloc_local((1,), "float32")
+                for k in T.serial(2):
+                    T.reducer_init(acc)
+                    for i, j in T.Parallel(2, 128):
+                        T.reducer_update(acc[0], a[k, i, j])
+                    T.finalize_reducer(acc, result)
+                for i, j in T.Parallel(2, 128):
+                    out[i, j] = result[0] / T.float32(256)
+            T.copy(out, Out)
+
+    return main
+
+
+@pytest.mark.parametrize("mode", ["direct", "alias", "scaled", "add", "after_serial"])
+def test_2d_reducer_consumer(mode, monkeypatch):
+    from tilelang import tvm
+    from testing.ascend._ir import calls, nodes
+
+    kernel = reducer_after_serial() if mode == "after_serial" else reducer_2d_consumer(mode)
+    mod = _capture_stages(kernel, monkeypatch)["VectorizeParallelToPTO"]
+    binds = {b.var: b.value for b in nodes(mod, tvm.tirx.Bind)}
+    (store,) = calls(mod, "tl.vmi.vstore")
+    consumer = binds[store.args[0]]
+    if mode in ("scaled", "add"):
+        assert consumer.op.name == ("tl.vmi.vmul" if mode == "scaled" else "tl.vmi.vadd")
+        consumer = binds[consumer.args[1]]
+    assert consumer.op.name == "tl.vmi.vbrc"
+    assert int(consumer.annotations["size"]) == 128 and int(consumer.annotations["group"]) == 1
+    value = consumer.args[0]
+    if mode != "add":
+        div = binds[value]
+        assert div.op.name == "tl.vmi.vdiv" and div.dtype.lanes == 1
+        mask = binds[div.args[2]]
+        assert mask.op.name == "tl.vmi.create_mask" and int(mask.annotations["size"]) == int(mask.args[0]) == 1
+        value = div.args[0]
+    while isinstance(value, tvm.tirx.Var):
+        value = binds[value]
+    writes = [s for s in nodes(mod, tvm.tirx.BufferStore) if s.buffer.same_as(value.buffer)]
+    assert [binds[s.value].op.name for s in writes] == (["tl.vmi.vbrc", "tl.vmi.vcadd"] if mode == "after_serial" else ["tl.vmi.vcadd"])
+
+
+@pytest.mark.parametrize("mode,reason", [("uniform", "scalar float ALU"), ("cast", "casting a one-lane VMI value")])
+def test_2d_reducer_candidate_rejections(mode, reason):
+    with pytest.raises(Exception, match=rf"PTO layout inference.*inner .*{reason}.*outer .*{reason}"):
+        _lower(reducer_2d_consumer(mode))
 
 
 @pytest.mark.parametrize("mode,wrapper", [("if_result", "If"), ("while_result", "While")])
