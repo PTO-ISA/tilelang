@@ -3,6 +3,58 @@ from __future__ import annotations
 from ptodsl import pto
 
 
+def vmi_integer_floor(lhs, rhs, mask, *, lanes, bits, signed, remainder):
+    """Emit exact integer floor division or modulo on logical VMI registers."""
+    quotient, rest = _vmi_integer_floor(
+        lhs, rhs, mask, lanes=lanes, bits=bits, signed=signed, want_quotient=not remainder, want_remainder=remainder
+    )
+    return rest if remainder else quotient
+
+
+def vmi_integer_divmod(lhs, rhs, mask, *, lanes, bits, signed):
+    """Emit the floor quotient and remainder from one logical VMI division."""
+    return _vmi_integer_floor(lhs, rhs, mask, lanes=lanes, bits=bits, signed=signed, want_quotient=True, want_remainder=True)
+
+
+def _vmi_integer_floor(lhs, rhs, mask, *, lanes, bits, signed, want_quotient, want_remainder):
+    vmi = pto.vmi
+    work_bits = max(bits, 16)
+    if work_bits == 16:
+        work_type = pto.si16 if signed else pto.ui16
+    else:
+        work_type = pto.si32 if signed else pto.ui32
+    if bits == 8:
+        lhs = vmi.vcvt(lhs, to_dtype=work_type)
+        rhs = vmi.vcvt(rhs, to_dtype=work_type)
+    quotient = vmi.vdiv(lhs, rhs, mask)
+    rest = None
+    if signed or want_remainder:
+        rest = vmi.vsub(lhs, vmi.vmul(rhs, quotient, mask), mask)
+        nonzero_divisor = vmi.vcmps(rhs, 0, mask, "ne")
+    if want_remainder:
+        # The asc-devkit 950PR/950DT FloorMod sample uses -1 for a zero divisor.
+        default = vmi.vbrc(work_type(-1 if signed else (1 << work_bits) - 1), size=lanes)
+        rest = vmi.vsel(nonzero_divisor, rest, default)
+    if signed:
+        sign_bit = vmi.vbrc(work_type(-(1 << (work_bits - 1))), size=lanes)
+        rest_sign = vmi.vand(rest, sign_bit, mask)
+        rhs_sign = vmi.vand(rhs, sign_bit, mask)
+        opposite_signs = vmi.vcmp(rest_sign, rhs_sign, mask, "ne")
+        nonzero_rest = vmi.vcmps(rest, 0, nonzero_divisor, "ne")
+        adjust = vmi.vand(opposite_signs, nonzero_rest)
+        if want_quotient:
+            quotient = vmi.vsel(adjust, vmi.vadd(quotient, -1, mask), quotient)
+        if want_remainder:
+            rest = vmi.vsel(adjust, vmi.vadd(rest, rhs, mask), rest)
+    if bits == 8:
+        byte_type = pto.si8 if signed else pto.ui8
+        if want_quotient:
+            quotient = vmi.vcvt(quotient, to_dtype=byte_type, saturate="NOSAT")
+        if want_remainder:
+            rest = vmi.vcvt(rest, to_dtype=byte_type, saturate="NOSAT")
+    return quotient if want_quotient else None, rest if want_remainder else None
+
+
 def vdiv_precise_f32(src0, src1, mask):
     """Emit precise f32 vector division matching Ascend ``vdiv_precise``."""
     div_z0 = pto.vdiv(src0, src1, mask)

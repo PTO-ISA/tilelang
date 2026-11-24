@@ -5336,7 +5336,8 @@ CodeGenTileLangPTO::PtoValueKind CodeGenTileLangPTO::ClassifyVmiCallResult_(
     return PtoValueKind::kVmiMask;
   }
   if (name == "tl.vmi.vintlv" || name == "tl.vmi.vdintlv" ||
-      name == "tl.vmi.vunzip" || name == "tl.vmi.vmull") {
+      name == "tl.vmi.vunzip" || name == "tl.vmi.vmull" ||
+      op->op.same_as(tl::vmi_vfloordivmod())) {
     return PtoValueKind::kVmiPair;
   }
   if (name == "tl.vmi.vload") {
@@ -5361,27 +5362,21 @@ CodeGenTileLangPTO::PtoValueKind CodeGenTileLangPTO::ClassifyVmiCallResult_(
     return PtoValueKind::kVoid;
   }
   static const std::unordered_set<std::string> kDataOps = {
-      "tl.vmi.vci",     "tl.vmi.vbrc",
-      "tl.vmi.vzip",    "tl.vmi.vadd",
-      "tl.vmi.vsub",    "tl.vmi.vmul",
-      "tl.vmi.vdiv",    "tl.vmi.vmax",
-      "tl.vmi.vmin",    "tl.vmi.vand",
-      "tl.vmi.vor",     "tl.vmi.vxor",
-      "tl.vmi.vshl",    "tl.vmi.vshr",
-      "tl.vmi.vabs",    "tl.vmi.vneg",
-      "tl.vmi.vrelu",   "tl.vmi.vexp",
-      "tl.vmi.vln",     "tl.vmi.vsqrt",
-      "tl.vmi.vnot",    "tl.vmi.vadds",
-      "tl.vmi.vmuls",   "tl.vmi.vmaxs",
-      "tl.vmi.vmins",   "tl.vmi.vshls",
-      "tl.vmi.vshrs",   "tl.vmi.vsel",
-      "tl.vmi.vselr",   "tl.vmi.vcadd",
-      "tl.vmi.vcmax",   "tl.vmi.vcmin",
-      "tl.vmi.vcvt",    "tl.vmi.vinterpret_cast",
-      "tl.vmi.vexpdif", "tl.vmi.vaxpy",
-      "tl.vmi.vlrelu",  "tl.vmi.vprelu",
-      "tl.vmi.vmula",   "tl.vmi.vdhist",
-      "tl.vmi.vchist",  "tl.vmi.vgather",
+      "tl.vmi.vci",       "tl.vmi.vbrc",    "tl.vmi.vzip",
+      "tl.vmi.vadd",      "tl.vmi.vsub",    "tl.vmi.vmul",
+      "tl.vmi.vdiv",      "tl.vmi.vmax",    "tl.vmi.vfloordiv",
+      "tl.vmi.vfloormod", "tl.vmi.vmin",    "tl.vmi.vand",
+      "tl.vmi.vor",       "tl.vmi.vxor",    "tl.vmi.vshl",
+      "tl.vmi.vshr",      "tl.vmi.vabs",    "tl.vmi.vneg",
+      "tl.vmi.vrelu",     "tl.vmi.vexp",    "tl.vmi.vln",
+      "tl.vmi.vsqrt",     "tl.vmi.vnot",    "tl.vmi.vadds",
+      "tl.vmi.vmuls",     "tl.vmi.vmaxs",   "tl.vmi.vmins",
+      "tl.vmi.vshls",     "tl.vmi.vshrs",   "tl.vmi.vsel",
+      "tl.vmi.vselr",     "tl.vmi.vcadd",   "tl.vmi.vcmax",
+      "tl.vmi.vcmin",     "tl.vmi.vcvt",    "tl.vmi.vinterpret_cast",
+      "tl.vmi.vexpdif",   "tl.vmi.vaxpy",   "tl.vmi.vlrelu",
+      "tl.vmi.vprelu",    "tl.vmi.vmula",   "tl.vmi.vdhist",
+      "tl.vmi.vchist",    "tl.vmi.vgather",
   };
   if (kDataOps.count(name) != 0U) {
     return PtoValueKind::kVmiData;
@@ -5479,6 +5474,23 @@ void CodeGenTileLangPTO::PrintPtoVmiCall_(const CallNode *op,
   std::string op_name = opt_call_op.value()->name;
   ICHECK(StartsWith(op_name, "tl.vmi."))
       << "Expected a tl.vmi.* call, got " << op_name;
+
+  const bool divmod = op->op.same_as(tl::vmi_vfloordivmod());
+  const bool remainder = op->op.same_as(tl::vmi_vfloormod());
+  if (divmod || remainder || op->op.same_as(tl::vmi_vfloordiv())) {
+    ICHECK_EQ(op->args.size(), 3U) << op_name << " expects (lhs, rhs, mask)";
+    const DataType dtype = op->dtype.element_of();
+    os << (divmod ? "tl.vmi_integer_divmod(" : "tl.vmi_integer_floor(")
+       << PrintExpr_(op->args[0]) << ", " << PrintExpr_(op->args[1]) << ", "
+       << PrintExpr_(op->args[2]) << ", lanes=" << op->dtype.lanes()
+       << ", bits=" << dtype.bits()
+       << ", signed=" << (dtype.is_int() ? "True" : "False");
+    if (!divmod) {
+      os << ", remainder=" << (remainder ? "True" : "False");
+    }
+    os << ")";
+    return;
+  }
 
   // vload/vstore accept no dist_mode annotation, and their access shape is
   // described only by stride, block_stride and group.  The descriptor pass also

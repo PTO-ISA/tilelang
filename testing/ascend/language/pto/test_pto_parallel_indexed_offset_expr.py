@@ -162,15 +162,84 @@ def test_nested_b16_gathers_verify_metadata_without_rewalking_source_indices():
     assert len(calls(converted, "tl.vmi.vload")) == 1
 
 
-# FloorDiv/FloorMod in indexed offsets are not adapted: any form that
-# depends on the vectorized lane coordinate has no gather/scatter lowering
-# and is rejected directly. Only pure scalar coordinates independent of the
-# unit's values (launch variables and compiler-generated buffer-version
-# coordinates such as `t % stages`) are preserved as scalars; see the
-# `versioned` design case in test_pto_parallel_gather_scatter.py.
+def nd_to_nz_kernel(access):
+    @T.prim_func
+    def main(A: T.Tensor((16, 32), "float16"), C: T.Tensor((2, 16, 16), "float16")):
+        with T.Kernel(1):
+            nd = T.alloc_shared((512,), "float16")
+            nz = T.alloc_shared((512,), "float16")
+            T.copy(A, nd)
+            if access == "scatter":
+                T.copy(C, nz)
+            with T.SimdVF(lanes=128):
+                for i in T.Parallel(512):
+                    if access == "gather":
+                        nz[i] = nd[(i % 256 // 16) * 32 + (i // 256) * 16 + i % 16]
+                    else:
+                        nz[(i % 32 // 16) * 256 + (i // 32) * 16 + i % 16] = nd[i]
+            T.copy(nz, C)
+
+    return main
 
 
-def varying_floor_offset_kernel(kind):
+@pytest.mark.pto
+@pytest.mark.parametrize("access", ["gather", "scatter"])
+def test_nd_to_nz_indexes_are_vectorized(access):
+    _, captured = lower_case(f"simd_parallel_nd_to_nz_{access}", nd_to_nz_kernel(access))
+    converted = captured["VectorizeParallelToPTO_after"]
+    assert len(calls(converted, f"tl.vmi.v{access}")) == 1
+
+
+def floor_divmod_kernel(dtype, divisor, lanes, operand_mode="repeated", *, extent=None):
+    extent = 2 * lanes if extent is None else extent
+    outputs = 1 if operand_mode == "remainder_only" else 2
+
+    @T.prim_func
+    def main(A: T.Tensor((extent,), dtype), B: T.Tensor((extent,), dtype), C: T.Tensor((outputs, extent), dtype)):
+        with T.Kernel(1):
+            x = T.alloc_shared((extent,), dtype)
+            d = T.alloc_shared((extent,), dtype)
+            y = T.alloc_shared((outputs, extent), dtype)
+            x_view = T.view(x, shape=(extent,))
+            T.copy(A, x)
+            if divisor is None:
+                T.copy(B, d)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(extent):
+                    if divisor is not None:
+                        y[0, i] = x[i] // T.cast(divisor, dtype)
+                        y[1, i] = x[i] % T.cast(divisor, dtype)
+                    elif operand_mode == "remainder_only":
+                        y[0, i] = x[i] % d[i]
+                    elif operand_mode == "bound":
+                        lhs = x[i]
+                        rhs = d[i]
+                        y[0, i] = lhs // rhs
+                        y[1, i] = lhs % rhs
+                    else:
+                        y[0, i] = x[i] // d[i]
+                        if operand_mode == "overwritten":
+                            x_view[i] = x[i] + 1
+                        y[1, i] = x[i] % d[i]
+            T.copy(y, C)
+
+    return main
+
+
+@pytest.mark.pto
+@pytest.mark.parametrize("operand_mode", ["repeated", "bound", "overwritten"])
+def test_floor_divmod_shares_the_loop_for_unchanged_operands(operand_mode):
+    artifact, _ = lower_case(f"simd_parallel_floor_divmod_{operand_mode}", floor_divmod_kernel("int32", None, 64, operand_mode))
+    source = artifact.kernel_source
+    if operand_mode == "overwritten":
+        assert "tl.vmi_integer_divmod(" not in source
+        assert source.count("tl.vmi_integer_floor(") == 2
+    else:
+        assert source.count("tl.vmi_integer_divmod(") == 1
+        assert "tl.vmi_integer_floor(" not in source
+
+
+def varying_floor_offset_kernel(kind, divisor):
     @T.prim_func
     def main(A: T.Tensor((256,), "float32"), I: T.Tensor((256,), "int32"), C: T.Tensor((256,), "float32")):
         with T.Kernel(1):
@@ -183,17 +252,17 @@ def varying_floor_offset_kernel(kind):
             with T.SimdVF(lanes=128):
                 for i in T.Parallel(256):
                     if kind == "gather_floordiv":
-                        y[i] = x[i // 2]
+                        y[i] = x[i // divisor]
                     elif kind == "gather_floormod":
-                        y[i] = x[idx[i] + i % 3]
+                        y[i] = x[idx[i] + i % divisor]
                     elif kind == "gather_chunk_floordiv":
                         view = T.view(x, shape=(2, 128), strides=(128, 1))
-                        y[i] = view[i // 128, idx[i]]
+                        y[i] = view[i // divisor, idx[i]]
                     elif kind == "scatter_floordiv":
-                        y[i // 2] = x[i]
+                        y[idx[i] // divisor] = x[i]
                     else:
                         assert kind == "stride_floormod"
-                        view = T.view(x, shape=(2, 128), strides=(i % 3, 1))
+                        view = T.view(x, shape=(2, 128), strides=(i % divisor, 1))
                         y[i] = view[1, 0]
             T.copy(y, C)
 
@@ -202,27 +271,19 @@ def varying_floor_offset_kernel(kind):
 
 @pytest.mark.pto
 @pytest.mark.parametrize(
-    "kind",
-    ["gather_floordiv", "gather_floormod", "gather_chunk_floordiv", "stride_floormod"],
+    "kind,divisor,access",
+    [
+        ("gather_floordiv", 2, "gather"),
+        ("gather_floordiv", 3, "gather"),
+        ("gather_floormod", 3, "gather"),
+        ("gather_chunk_floordiv", 128, "gather"),
+        ("scatter_floordiv", 3, "scatter"),
+        ("stride_floormod", 3, "gather"),
+    ],
 )
-def test_varying_floor_offsets_are_rejected_without_adaptation(kind):
-    # The address diagnostic identifies the payload buffer of the failing load.
-    with pytest.raises(
-        Exception,
-        match=r"memory access: buffer `(?:x|view)`: unsupported indexed offset node tirx.Floor(Div|Mod)",
-    ):
-        lower_case(f"rejected_floor_{kind}", varying_floor_offset_kernel(kind))
-
-
-@pytest.mark.pto
-def test_varying_floor_scatter_target_is_rejected_with_buffer_context():
-    # A store whose own index fails reports through the memory-access
-    # diagnostic; the buffer context comes from the reporting site.
-    with pytest.raises(
-        Exception,
-        match=r"memory access: buffer `y`: unsupported indexed offset node tirx.FloorDiv",
-    ):
-        lower_case("rejected_floor_scatter_floordiv", varying_floor_offset_kernel("scatter_floordiv"))
+def test_varying_floor_offsets_are_vectorized(kind, divisor, access):
+    _, captured = lower_case(f"varying_floor_{kind}_{divisor}", varying_floor_offset_kernel(kind, divisor))
+    assert len(calls(captured["VectorizeParallelToPTO_after"], f"tl.vmi.v{access}")) == 1
 
 
 def scalar_floor_coordinate_kernel(kind):

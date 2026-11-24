@@ -449,6 +449,13 @@ private:
     return BinaryRequiresVmi("vdiv", op->dtype, op->a, op->b);
   }
 
+  bool VisitExpr_(const FloorDivNode *op) final {
+    return BinaryRequiresVmi("vfloordiv", op->dtype, op->a, op->b);
+  }
+  bool VisitExpr_(const FloorModNode *op) final {
+    return BinaryRequiresVmi("vfloormod", op->dtype, op->a, op->b);
+  }
+
   bool CheckScalarCoordinate(const PrimExpr &expr, const PrimExpr &lhs,
                              const PrimExpr &rhs) {
     if (!proof_.IsUniform(expr)) {

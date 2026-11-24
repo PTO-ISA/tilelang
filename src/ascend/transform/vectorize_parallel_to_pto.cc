@@ -145,19 +145,20 @@ private:
     // are rejected there, and opaque calls are already excluded
     // from addresses.
     static const std::set<std::string> kDiscardable = {
-        "tl.vmi.vload", "tl.vmi.vgather",
-        "tl.vmi.vbrc",  "tl.vmi.vci",
-        "tl.vmi.vadd",  "tl.vmi.vsub",
-        "tl.vmi.vmul",  "tl.vmi.vdiv",
-        "tl.vmi.vabs",  "tl.vmi.vexp",
-        "tl.vmi.vln",   "tl.vmi.vsqrt",
-        "tl.vmi.vcvt",  "tl.vmi.vinterpret_cast",
-        "tl.vmi.vcmp",  "tl.vmi.vcmps",
-        "tl.vmi.vsel",  "tl.vmi.vand",
-        "tl.vmi.vor",   "tl.vmi.vnot",
-        "tl.vmi.vshl",  "tl.vmi.vshr",
-        "tl.vmi.vshls", "tl.vmi.vshrs",
-        "tl.vmi.vxor",  "tl.access_ptr",
+        "tl.vmi.vload",     "tl.vmi.vgather",
+        "tl.vmi.vbrc",      "tl.vmi.vci",
+        "tl.vmi.vadd",      "tl.vmi.vsub",
+        "tl.vmi.vmul",      "tl.vmi.vdiv",
+        "tl.vmi.vfloordiv", "tl.vmi.vfloormod",
+        "tl.vmi.vabs",      "tl.vmi.vexp",
+        "tl.vmi.vln",       "tl.vmi.vsqrt",
+        "tl.vmi.vcvt",      "tl.vmi.vinterpret_cast",
+        "tl.vmi.vcmp",      "tl.vmi.vcmps",
+        "tl.vmi.vsel",      "tl.vmi.vand",
+        "tl.vmi.vor",       "tl.vmi.vnot",
+        "tl.vmi.vshl",      "tl.vmi.vshr",
+        "tl.vmi.vshls",     "tl.vmi.vshrs",
+        "tl.vmi.vxor",      "tl.access_ptr",
     };
     bool discardable = true;
     PostOrderVisit(rhs, [&](const ObjectRef &n) {
@@ -1162,8 +1163,11 @@ private:
 
     Array<Stmt> statements;
     const Stmt &source = inner.defined() ? inner.value()->body : loop->body;
+    floor_groups_.clear();
+    available_floor_groups_.clear();
     ConvertBody(source, &statements);
     Stmt converted = DeadBindElim()(SeqStmt::Flatten(statements));
+    converted = ShareFloorDivMod(converted);
     Array<Stmt> chunk_body;
     if (has_tail) {
       PrimExpr count = BufferLoad(remaining, {make_zero(DataType::Int(32))});
@@ -1408,6 +1412,145 @@ private:
   // ------------------------------------------------------------------
   // Statement conversion (pre-binds first, then the statement)
   // ------------------------------------------------------------------
+  struct FloorGroup {
+    PrimExpr lhs;
+    PrimExpr rhs;
+    Array<Var> reads;
+    Array<Var> results;
+  };
+
+  bool HasLocalAllocation(const Var &data) const {
+    return std::any_of(
+        active_allocations_.begin(), active_allocations_.end(),
+        [&](const Buffer &buffer) { return buffer->data.same_as(data); });
+  }
+
+  bool TrackFloorOperand(const PrimExpr &expr, Array<Var> *reads) const {
+    if (const auto *load = expr.as<BufferLoadNode>()) {
+      if (!HasLocalAllocation(load->buffer->data) ||
+          load->predicate.defined()) {
+        return false;
+      }
+      for (const PrimExpr &offset : load->buffer->ElemOffset(load->indices)) {
+        if (SideEffect(offset) != CallEffectKind::kPure) {
+          return false;
+        }
+      }
+      reads->push_back(load->buffer->data);
+      return true;
+    }
+    return SideEffect(expr) == CallEffectKind::kPure;
+  }
+
+  static bool SameFloorOperand_(const PrimExpr &lhs, const PrimExpr &rhs) {
+    if (const auto *lhs_load = lhs.as<BufferLoadNode>()) {
+      const auto *rhs_load = rhs.as<BufferLoadNode>();
+      // Structural equality can map different Buffer data vars to each other.
+      return rhs_load && lhs_load->buffer.same_as(rhs_load->buffer) &&
+             StructuralEqual()(lhs_load->indices, rhs_load->indices);
+    }
+    return StructuralEqual()(lhs, rhs);
+  }
+
+  void TrackFloorResult(const PrimExpr &lhs, const PrimExpr &rhs,
+                        const Var &result) {
+    Array<Var> reads;
+    if (!TrackFloorOperand(lhs, &reads) || !TrackFloorOperand(rhs, &reads)) {
+      return;
+    }
+    for (size_t index : available_floor_groups_) {
+      FloorGroup &group = floor_groups_[index];
+      if (SameFloorOperand_(group.lhs, lhs) &&
+          SameFloorOperand_(group.rhs, rhs)) {
+        group.results.push_back(result);
+        return;
+      }
+    }
+    available_floor_groups_.push_back(floor_groups_.size());
+    floor_groups_.push_back({lhs, rhs, std::move(reads), {result}});
+  }
+
+  void InvalidateFloorReads(const Var &data) {
+    const bool known_allocation =
+        HasLocalAllocation(data) || promoted_.count(data);
+    auto invalid = [&](size_t index) {
+      const Array<Var> &reads = floor_groups_[index].reads;
+      return std::any_of(reads.begin(), reads.end(), [&](const Var &read) {
+        return !known_allocation || read.same_as(data);
+      });
+    };
+    available_floor_groups_.erase(
+        std::remove_if(available_floor_groups_.begin(),
+                       available_floor_groups_.end(), invalid),
+        available_floor_groups_.end());
+  }
+
+  Stmt ShareFloorDivMod(const Stmt &body) {
+    if (std::none_of(
+            floor_groups_.begin(), floor_groups_.end(),
+            [](const FloorGroup &group) { return group.results.size() > 1; })) {
+      return body;
+    }
+    using BindMap =
+        std::unordered_map<Var, Bind, ObjectPtrHash, ObjectPtrEqual>;
+    using Replacements =
+        std::unordered_map<Var, Stmt, ObjectPtrHash, ObjectPtrEqual>;
+    BindMap live_floors;
+    PostOrderVisit(body, [&](const ObjectRef &node) {
+      const auto *bind = node.as<BindNode>();
+      const auto *call = bind ? bind->value.as<CallNode>() : nullptr;
+      if (call && (call->op.same_as(VmiOp("vfloordiv")) ||
+                   call->op.same_as(VmiOp("vfloormod")))) {
+        live_floors.emplace(bind->var, GetRef<Bind>(bind));
+      }
+    });
+
+    Replacements replacements;
+    for (const FloorGroup &group : floor_groups_) {
+      std::vector<Bind> binds;
+      bool has_quotient = false;
+      bool has_remainder = false;
+      for (const Var &result : group.results) {
+        auto it = live_floors.find(result);
+        if (it == live_floors.end()) {
+          continue;
+        }
+        const auto *call = it->second->value.as<CallNode>();
+        has_quotient |= call->op.same_as(VmiOp("vfloordiv"));
+        has_remainder |= call->op.same_as(VmiOp("vfloormod"));
+        binds.push_back(it->second);
+      }
+      if (!has_quotient || !has_remainder) {
+        continue;
+      }
+      const auto *first = binds.front()->value.as<CallNode>();
+      Var pair("divmod_" + std::to_string(tmp_counter_++), first->dtype);
+      Bind compute(pair,
+                   Call(first->dtype, VmiOp("vfloordivmod"), first->args));
+      for (const Bind &bind : binds) {
+        const auto *call = bind->value.as<CallNode>();
+        const bool is_mod = call->op.same_as(VmiOp("vfloormod"));
+        Bind project(bind->var, Call(call->dtype, VmiOp("pair_get"),
+                                     {pair, Integer(is_mod ? 1 : 0)}));
+        replacements.emplace(bind->var, bind.same_as(binds.front())
+                                            ? SeqStmt::Flatten(compute, project)
+                                            : Stmt(project));
+      }
+    }
+    if (replacements.empty()) {
+      return body;
+    }
+    Stmt shared = IRTransform(
+        body, nullptr,
+        ffi::Function::FromTyped([&](const ObjectRef &node) -> ObjectRef {
+          const auto *bind = node.as<BindNode>();
+          auto it = replacements.find(bind->var);
+          return it == replacements.end() ? node : it->second;
+        }),
+        Array<String>{"tirx.Bind"});
+    return DeadBindElim()(shared);
+  }
+
   void ConvertBody(const Stmt &body, Array<Stmt> *out) {
     if (const auto *alloc = body.as<AllocBufferNode>()) {
       ICHECK(storage_.Classify(alloc->buffer, current_unit_) ==
@@ -1466,6 +1609,7 @@ private:
             << "PTO private Store dtype/lanes mismatch";
         for (const Stmt &stmt : pre)
           out->push_back(stmt);
+        InvalidateFloorReads(store->buffer->data);
         out->push_back(
             BufferStore(target, value, {IntImm(DataType::Int(32), slot.slot)}));
         return;
@@ -1505,6 +1649,7 @@ private:
       }
       for (const Stmt &stmt : pre)
         out->push_back(stmt);
+      InvalidateFloorReads(store->buffer->data);
       out->push_back(Evaluate(call));
       return;
     }
@@ -1521,7 +1666,9 @@ private:
       // the unit visitor's scope handling).
       Map<Var, PrimExpr> saved_env = bind_env_;
       Map<Var, Var> saved_map = value_map_;
+      available_floor_groups_.clear();
       ConvertBody(attr->body, &stmts);
+      available_floor_groups_.clear();
       bind_env_ = std::move(saved_env);
       value_map_ = std::move(saved_map);
       Stmt inner = SeqStmt::Flatten(stmts);
@@ -1563,7 +1710,9 @@ private:
       Array<Stmt> inner;
       Map<Var, PrimExpr> saved_env = bind_env_;
       Map<Var, Var> saved_map = value_map_;
+      available_floor_groups_.clear();
       ConvertBody(loop->body, &inner);
+      available_floor_groups_.clear();
       bind_env_ = std::move(saved_env);
       value_map_ = std::move(saved_map);
       // Keep the shell's step (and annotations): the step only changes the
@@ -1690,6 +1839,12 @@ private:
     }
     if (const auto *div = expr.as<DivNode>()) {
       return ConvertBinary(div->a, div->b, "vdiv", pre);
+    }
+    if (const auto *div = expr.as<FloorDivNode>()) {
+      return ConvertFloor(div->a, div->b, /*is_mod=*/false, pre);
+    }
+    if (const auto *mod = expr.as<FloorModNode>()) {
+      return ConvertFloor(mod->a, mod->b, /*is_mod=*/true, pre);
     }
     if ((expr.as<ModNode>() || expr.as<MinNode>() || expr.as<MaxNode>() ||
          expr.as<SelectNode>()) &&
@@ -2102,6 +2257,38 @@ private:
     return EmitBinary(std::move(a), std::move(b), vmi_name, vmi_name, pre);
   }
 
+  PrimExpr ConvertFloor(const PrimExpr &lhs, const PrimExpr &rhs, bool is_mod,
+                        Array<Stmt> *pre) {
+    PrimExpr a = ConvertExpr(lhs, pre);
+    PrimExpr b = ConvertExpr(rhs, pre);
+    const pto::ValueInfo lhs_info = Info(a);
+    if (!lhs_info.IsVmi() && !Info(b).IsVmi()) {
+      return is_mod ? floormod(a, b) : floordiv(a, b);
+    }
+
+    int shift;
+    if (!is_const_power_of_two_integer(b, &shift)) {
+      const char *name = is_mod ? "vfloormod" : "vfloordiv";
+      Var result = Downcast<Var>(EmitBinary(a, b, name, name, pre));
+      TrackFloorResult(lhs, rhs, result);
+      return result;
+    }
+
+    // VMI shifts signed data arithmetically and unsigned data logically.
+    // Masking the low bits gives the floor remainder for either sign.
+    if (is_mod) {
+      return EmitBinary(
+          a, make_const(a.dtype().element_of(), (int64_t{1} << shift) - 1),
+          "vand", "floormod", pre);
+    }
+    return EmitBind(
+        "floordiv",
+        Call(a.dtype(), VmiOp("vshrs"),
+             {a, IntImm(DataType::Int(16), shift),
+              lhs_info.logical_lanes == 1 ? GetFullMask(1) : mask_var_}),
+        pre);
+  }
+
   PrimExpr EmitBinary(PrimExpr a, PrimExpr b, const std::string &vmi_name,
                       const std::string &result_name, Array<Stmt> *pre) {
     auto lhs_info = Info(a);
@@ -2210,6 +2397,8 @@ private:
   Map<Var, PrimExpr> bind_env_; // analysis env: original var -> def expr
   Map<Var, Var> value_map_;     // value env: original var -> converted var
   std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> address_vars_;
+  std::vector<FloorGroup> floor_groups_;
+  std::vector<size_t> available_floor_groups_;
 };
 
 } // namespace

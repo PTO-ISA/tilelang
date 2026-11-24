@@ -2238,7 +2238,7 @@ def test_region_level_store_predicate_with_undefined_variable_is_rejected():
 def test_predicate_with_an_unadmitted_node_is_rejected():
     """A predicate is an expression position: `True | ...` must not launder it.
 
-    The oracle folds `True | (P % 2 == 0)` to True, so a truth-check-only
+    The oracle folds `True | (truncmod(P, 2) == 0)` to True, so a truth-check-only
     admission would drop the whole predicate -- and with it an expression the
     vectorizer has no lowering for.
     """
@@ -2249,12 +2249,12 @@ def test_predicate_with_an_unadmitted_node_is_rejected():
         "load",
         lambda: tvm.tirx.Or(
             tvm.tirx.const(True, "bool"),
-            tvm.tirx.EQ(tvm.tirx.floormod(param, 2), tvm.tirx.IntImm("int32", 0)),
+            tvm.tirx.EQ(tvm.tirx.truncmod(param, 2), tvm.tirx.IntImm("int32", 0)),
         ),
     )
     _, error = _lower_capture(func, expect_error=True)
     assert error is not None, "an unadmitted node in a predicate must be rejected"
-    assert "FloorMod" in str(error), f"unexpected diagnostic: {error}"
+    assert "`Mod`" in str(error), f"unexpected diagnostic: {error}"
 
 
 @pytest.mark.pto

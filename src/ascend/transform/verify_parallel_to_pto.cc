@@ -1022,7 +1022,7 @@ private:
     /*! The two-operand value nodes, one shared recursion shape: both
      * operands run through the same check, and the arithmetic kinds
      * additionally apply the VMI operation matrix. `vmi_op` carries the
-     * kind's VMI op for Add/Sub/Mul/Div (vadd/vsub/vmul/vdiv) and is
+     * kind's VMI op for arithmetic and is
      * nullptr for the relational / boolean kinds that Legalize and
      * Vectorize express as vcmp+vsel / vand|vor|vnot (recursion only).
      * The unary Not and the three-operand Select are handled separately
@@ -1046,6 +1046,12 @@ private:
       }
       if (const auto *n = e.as<DivNode>()) {
         return BinaryOperands{"vdiv", n->dtype, n->a, n->b};
+      }
+      if (const auto *n = e.as<FloorDivNode>()) {
+        return BinaryOperands{"vfloordiv", n->dtype, n->a, n->b};
+      }
+      if (const auto *n = e.as<FloorModNode>()) {
+        return BinaryOperands{"vfloormod", n->dtype, n->a, n->b};
       }
       PrimExpr rel_a;
       PrimExpr rel_b;
@@ -2024,7 +2030,7 @@ private:
         });
         // The predicate is an expression position like any other, and it is
         // dropped after admission. An unadmitted node that the analyzer folds
-        // away (`True | call_extern(...)`, `True | (p % 2 == 0)`) would
+        // away (e.g. `True | call_extern(...)`) would
         // therefore never be seen by a later pass -- an external call could
         // even carry a side effect that the removal silently discards. Run the
         // same whitelist the compute-value positions run, on the original tree
