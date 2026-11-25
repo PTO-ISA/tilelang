@@ -3,7 +3,12 @@
 import pytest
 import torch
 import tilelang
-from testing.ascend.language.pto.test_pto_simd_reducer import reducer_kernel, seed_snapshot_kernel
+from testing.ascend.language.pto.test_pto_simd_reducer import (
+    reducer_2d_consumer,
+    reducer_after_serial,
+    reducer_kernel,
+    seed_snapshot_kernel,
+)
 
 pytestmark = pytest.mark.pto
 
@@ -146,3 +151,26 @@ def test_result_store_in_scalar_control_flow(mode):
     expected = torch.full_like(a, -123)
     expected[: 2 if mode == "ub_condition" else 1] = a[:257].sum()
     torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("mode", ["direct", "alias", "scaled", "add"])
+def test_2d_reducer_consumer_numerics(mode):
+    cpu = torch.arange(256, dtype=torch.float32).reshape(2, 128) - 100
+    if mode == "scaled":
+        expected = cpu * cpu.mean()
+    elif mode == "add":
+        expected = cpu + cpu.sum()
+    else:
+        expected = cpu.mean().expand_as(cpu)
+    out = torch.full_like(cpu, float("nan")).npu()
+    kernel = tilelang.compile(reducer_2d_consumer(mode), target="pto")
+    kernel(cpu.npu(), out)
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+
+
+def test_finalized_result_after_serial():
+    cpu = torch.arange(512, dtype=torch.float32).reshape(2, 2, 128)
+    out = torch.full_like(cpu[1], float("nan")).npu()
+    kernel = tilelang.compile(reducer_after_serial(), target="pto")
+    kernel(cpu.npu(), out)
+    torch.testing.assert_close(out.cpu(), cpu[1].mean().expand_as(cpu[1]), rtol=0, atol=0)

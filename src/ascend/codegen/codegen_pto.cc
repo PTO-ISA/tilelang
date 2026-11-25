@@ -8203,6 +8203,15 @@ void CodeGenTileLangPTO::VisitStmt_(const ForNode *op) {
     PrintIndent();
     stream << vid << " = pto.cast(" << range_vid << ", "
            << ScalarType(op->loop_var.dtype()) << ")\n";
+    // Native range infers iter_args from reads before writes. A finalize
+    // overwrites its slot but a later consumer needs the last iteration.
+    if (auto carry = op->annotations.Get(tl::attr::kPtoReducerLoopResults)) {
+      for (const Var &slot : Downcast<Array<Var>>(carry.value())) {
+        const auto name = LocalVarID(slot.get());
+        PrintIndent();
+        stream << name << " = " << name << "\n";
+      }
+    }
   }
   ++native_loop_depth_;
   PrintStmt_(op->body);

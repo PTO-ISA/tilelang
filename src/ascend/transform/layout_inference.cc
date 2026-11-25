@@ -252,8 +252,25 @@ public:
     const size_t allocation_mark = active_allocations_.size();
     BufferVersionMap saved_versions = buffer_versions_;
     IRVisitorWithAnalyzer::VisitStmt(stmt);
+    if (InsidePtoSimdVF()) {
+      auto &results = pto_simd_ctx_stack_.back().values.results;
+      for (size_t i = allocation_mark; i < active_allocations_.size(); ++i)
+        results.erase(active_allocations_[i]->data);
+    }
     active_allocations_.resize(allocation_mark);
     buffer_versions_ = std::move(saved_versions);
+  }
+
+  void VisitStmt_(const SeqStmtNode *op) final {
+    if (!InsidePtoSimdVF()) {
+      IRVisitorWithAnalyzer::VisitStmt_(op);
+      return;
+    }
+    // Bind aliases are lexical. A finalize can write an enclosing allocation
+    // whose consumers follow this sequence (e.g. after a serial loop).
+    auto saved_aliases = pto_simd_ctx_stack_.back().values.aliases;
+    IRVisitorWithAnalyzer::VisitStmt_(op);
+    pto_simd_ctx_stack_.back().values.aliases = std::move(saved_aliases);
   }
 
   void VisitStmt_(const AllocBufferNode *op) final {
@@ -826,7 +843,7 @@ private:
         << lanes;
     Range lane_bounds = Range::FromMinExtent(make_zero(DataType::Int(32)),
                                              IntImm(DataType::Int(32), lanes));
-    pto_simd_ctx_stack_.push_back({lane_bounds});
+    pto_simd_ctx_stack_.push_back({lane_bounds, {}});
     return true;
   }
 
@@ -895,9 +912,11 @@ private:
     // PTO finalization has an independent ordinary-local destination. Its
     // virtual partial layout is supplied by the PTO update sites below.
     if (InsidePtoSimdVF() && op->op.same_as(FinalizeReducerV2Op::Get())) {
-      Buffer reducer =
-          Downcast<BufferLoad>(Downcast<Call>(op->args[0])->args[0])->buffer;
-      pto_reducer_bounds_.Set(reducer, CurrentPtoLaneBounds());
+      auto finalize =
+          Downcast<FinalizeReducerV2Op>(ParseOperator(GetRef<Call>(op)));
+      pto_simd_ctx_stack_.back().values.results[finalize->dst->data] =
+          pto::ValueInfo::Vmi(1);
+      pto_reducer_bounds_.Set(finalize->reducer, CurrentPtoLaneBounds());
       return;
     }
     TileOperator p;
@@ -1078,7 +1097,8 @@ private:
         pto_loop_layouts_.Set(root, pto::InferPtoParallelLayout(
                                         root, CurrentPtoLaneBounds(),
                                         active_allocations_, buffer_versions_,
-                                        &analyzer_, pto_storage_));
+                                        &analyzer_, pto_storage_,
+                                        pto_simd_ctx_stack_.back().values));
         return;
       }
 
@@ -1262,6 +1282,16 @@ private:
     // This enables tracking fragment buffer accesses through Bind values.
     bind_var_to_expr_.Set(op->var, op->value);
     IRVisitorWithAnalyzer::VisitStmt_(op);
+    if (InsidePtoSimdVF()) {
+      auto &values = pto_simd_ctx_stack_.back().values;
+      if (const auto *load = op->value.as<BufferLoadNode>()) {
+        if (values.results.count(load->buffer->data))
+          values.aliases[op->var] = pto::ValueInfo::Vmi(1);
+      } else if (auto var = op->value.as<Var>();
+                 var && values.aliases.count(var.value())) {
+        values.aliases[op->var] = pto::ValueInfo::Vmi(1);
+      }
+    }
   }
 
   // Helper: recursively collect fragment buffers from an expression,
@@ -1515,6 +1545,7 @@ private:
   // AscendC SIMD path is untouched.
   struct PtoSimdVFContext {
     Range lane_bounds;
+    pto::ReducerLayoutValues values;
   };
   std::vector<PtoSimdVFContext> pto_simd_ctx_stack_;
   // Whether the whole function targets PTO (keys contain "pto").

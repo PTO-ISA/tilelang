@@ -35,6 +35,8 @@ constexpr const char *kPtoParallelLoopLayout = "pto_parallel_loop_layout";
 
 namespace pto {
 
+struct ReducerLayoutValues;
+
 /*!
  * \brief Build the PTO lane Fragment for one T.Parallel unit.
  *
@@ -51,12 +53,11 @@ namespace pto {
  * modified; only the Fragment input extent of the vectorized dimension is
  * padded when the logical extent is not a multiple of L.
  */
-Fragment
-InferPtoParallelLayout(const tirx::For &root, const Range &lane_bounds,
-                       const std::vector<tirx::Buffer> &active_allocations,
-                       const ffi::Map<tirx::Var, int> &buffer_versions,
-                       arith::Analyzer *analyzer,
-                       const ParallelStorageQuery &storage);
+Fragment InferPtoParallelLayout(
+    const tirx::For &root, const Range &lane_bounds,
+    const std::vector<tirx::Buffer> &active_allocations,
+    const ffi::Map<tirx::Var, int> &buffer_versions, arith::Analyzer *analyzer,
+    const ParallelStorageQuery &storage, const ReducerLayoutValues &values);
 
 } // namespace pto
 } // namespace tl

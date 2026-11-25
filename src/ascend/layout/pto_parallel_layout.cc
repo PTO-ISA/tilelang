@@ -80,6 +80,7 @@ public:
     PrimExpr expr;
     std::string op_name;
     Map<Var, PrimExpr> bind_env;
+    Optional<Var> binding;
   };
   std::vector<Access> accesses;
   std::vector<ValueOperation> value_operations;
@@ -109,6 +110,7 @@ public:
     // along alias chains.
     CollectValueOperations_(op->value);
     tirx::StmtExprVisitor::VisitStmt_(op);
+    value_operations.push_back({op->value, {}, bind_env_, op->var});
     bind_env_.Set(op->var, op->value);
   }
   void VisitStmt_(const EvaluateNode *op) final {
@@ -149,8 +151,8 @@ private:
         }
       }
       if (!name.empty()) {
-        value_operations.push_back(
-            {Downcast<PrimExpr>(node), std::move(name), bind_env_});
+        value_operations.push_back({Downcast<PrimExpr>(node), std::move(name),
+                                    bind_env_, std::nullopt});
       }
       return true;
     });
@@ -171,20 +173,22 @@ private:
 };
 
 std::string CheckValueOperation(const PtoAccessCollector::ValueOperation &op,
-                                LaneUseContext *ctx) {
+                                LaneUseContext *ctx, ValueInfoMap *bindings) {
   ctx->bind_env = op.bind_env;
   const auto *cast_op = op.expr.as<CastNode>();
-  const LaneUse use =
-      AnalyzeLaneUse(cast_op ? cast_op->value : op.expr, ctx, nullptr);
+  const PrimExpr &input = cast_op ? cast_op->value : op.expr;
+  const LaneUse use = AnalyzeLaneUse(input, ctx, nullptr);
   if (use == LaneUse::kUnknown) {
     // Verify diagnoses unsupported expressions and undefined references.
     return {};
   }
-  const bool varying = use == LaneUse::kVarying;
+  const auto info = AnalyzeComputeValue(input, ctx);
+  if (op.binding) {
+    (*bindings)[op.binding.value()] = info;
+    return {};
+  }
   if (cast_op) {
-    CastContext cast_context{varying ? CastValueKind::kVectorVmi
-                                     : CastValueKind::kScalar,
-                             varying ? ctx->mapping.lanes : 1};
+    CastContext cast_context{info.kind, info.logical_lanes};
     std::string why;
     if (!PlanValueCast(cast_op, cast_context, &why)) {
       return "Cast has no supported conversion: " + why;
@@ -193,11 +197,11 @@ std::string CheckValueOperation(const PtoAccessCollector::ValueOperation &op,
   }
 
   const DataType dtype = op.expr.dtype();
-  if (!varying && IsFloatFamily(dtype) && ContainsRuntimeValue(op.expr)) {
+  if (!info.IsVmi() && IsFloatFamily(dtype) && ContainsRuntimeValue(op.expr)) {
     return "runtime lane-uniform float computation requires a scalar float "
            "ALU inside SIMD_VF";
   }
-  if (varying) {
+  if (info.IsVmi()) {
     const bool supported = op.expr.as<CallNode>()
                                ? IsSupportedVectorUnaryOp(op.op_name, dtype)
                                : IsSupportedVectorBinaryOp(op.op_name, dtype);
@@ -300,7 +304,8 @@ bool ShouldVectorizeInnerAxis(const For &root, const Var &iv, const Var &jv,
                               const std::vector<Buffer> &active_allocations,
                               const Map<Var, int> &buffer_versions,
                               arith::Analyzer *analyzer,
-                              const pto::ParallelStorageQuery &storage) {
+                              const pto::ParallelStorageQuery &storage,
+                              const ReducerLayoutValues &values) {
   PtoAccessCollector collector(storage, root);
   collector(root->body);
 
@@ -388,7 +393,10 @@ bool ShouldVectorizeInnerAxis(const For &root, const Var &iv, const Var &jv,
         return candidate;
       }
     }
+    auto bindings = values.aliases;
     LaneUseContext lane_use;
+    lane_use.value_infos = &bindings;
+    lane_use.storage_values = &values.results;
     lane_use.loop_var = selected_var;
     lane_use.mapping = mapping;
     lane_use.storage = &storage;
@@ -400,7 +408,8 @@ bool ShouldVectorizeInnerAxis(const For &root, const Var &iv, const Var &jv,
     const int lane_use_budget = lane_use.budget;
     for (const auto &operation : collector.value_operations) {
       lane_use.budget = lane_use_budget;
-      candidate.rejection_reason = CheckValueOperation(operation, &lane_use);
+      candidate.rejection_reason =
+          CheckValueOperation(operation, &lane_use, &bindings);
       if (!candidate.rejection_reason.empty()) {
         break;
       }
@@ -453,7 +462,8 @@ Fragment InferPtoParallelLayout(const For &root, const Range &lane_bounds,
                                 const std::vector<Buffer> &active_allocations,
                                 const Map<Var, int> &buffer_versions,
                                 arith::Analyzer *analyzer,
-                                const ParallelStorageQuery &storage) {
+                                const ParallelStorageQuery &storage,
+                                const ReducerLayoutValues &values) {
   PtoParallelLoopCollector loop_collector;
   loop_collector(root);
   const Array<IterVar> &loop_vars = loop_collector.loop_vars;
@@ -522,7 +532,7 @@ Fragment InferPtoParallelLayout(const For &root, const Range &lane_bounds,
     const Var &j_var = loop_vars[1]->var;
     const bool select_inner = ShouldVectorizeInnerAxis(
         root, i_var, j_var, M, N, lanes, active_allocations, buffer_versions,
-        analyzer, storage);
+        analyzer, storage, values);
     const int64_t sel_extent = select_inner ? N : M;
     // Shared checked padding for the selected dimension.
     const auto [pad, P_sel] = CheckedPaddingForInference(sel_extent, lanes);

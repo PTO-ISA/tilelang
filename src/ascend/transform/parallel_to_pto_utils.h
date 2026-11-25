@@ -324,6 +324,13 @@ ValueInfo GetValueInfo(const PrimExpr &value, const ValueInfoMap &bindings);
 
 enum class WidthAdaptation { kKeep, kBroadcastScalar, kBroadcastOneLane };
 
+// Visible source-level reducer results and their bound values before
+// ReducerPlanAndMaterialize introduces the internal reducer buffers.
+struct ReducerLayoutValues {
+  ValueInfoMap results;
+  ValueInfoMap aliases;
+};
+
 /*! Adapt only scalar or one-lane values to a consumer's logical width.
  * Arbitrary vector resizing requires an explicit future conversion rule. */
 WidthAdaptation PlanWidthAdaptation(const ValueInfo &value, int64_t lanes);
