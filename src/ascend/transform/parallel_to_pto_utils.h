@@ -426,7 +426,16 @@ bool ContainsRuntimeValue(const PrimExpr &expr);
 bool IsFloatFamily(DataType dtype);
 
 /*! TIR value calls with a direct bit-preserving or bitwise PTO lowering. */
-enum class PtoBitOp { kNone, kAnd, kOr, kShiftLeft, kShiftRight, kReinterpret };
+enum class PtoBitOp {
+  kNone,
+  kAnd,
+  kOr,
+  kXor,
+  kNot,
+  kShiftLeft,
+  kShiftRight,
+  kReinterpret
+};
 
 PtoBitOp GetPtoBitOp(const tirx::Call &call);
 

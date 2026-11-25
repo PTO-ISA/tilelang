@@ -96,6 +96,24 @@ def right_shift_kernel(bits):
     return main
 
 
+def uint32_bitwise_kernel(uniform):
+    @T.prim_func
+    def main(A: T.Tensor((128,), "uint32"), C: T.Tensor((2, 128), "uint32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((128,), "uint32")
+            c = T.alloc_shared((2, 128), "uint32")
+            T.copy(A, a)
+            T.copy(C, c)
+            with T.SimdVF(lanes=64):
+                for i in T.Parallel(65):
+                    x = a[0 if uniform else i]
+                    c[0, i] = (x >> 23) ^ x
+                    c[1, i] = T.bitwise_not(x)
+            T.copy(c, C)
+
+    return main
+
+
 def scale_pack_kernel(accumulate_invalid):
     output_dtype = "uint32" if accumulate_invalid else "uint16"
 
@@ -362,6 +380,18 @@ def test_uniform_integer_bit_ops_can_compute_before_broadcast():
     assert not calls(mod, "tl.vmi.vshrs")
     assert not calls(mod, "tl.vmi.vand")
     assert not calls(mod, "tl.vmi.vor")
+
+
+@pytest.mark.pto
+def test_uint32_bitwise_xor_and_not_keep_dtype_and_tail_mask():
+    mod = vectorized(uint32_bitwise_kernel(uniform=False))
+    (xor,) = calls(mod, "tl.vmi.vxor")
+    (complement,) = calls(mod, "tl.vmi.vnot")
+    xor_store, not_store = calls(mod, "tl.vmi.vstore")
+    assert str(xor.dtype) == str(xor.args[0].dtype) == str(xor.args[1].dtype) == "uint32x64"
+    assert str(complement.dtype) == str(complement.args[0].dtype) == "uint32x64"
+    assert xor.args[2].same_as(xor_store.args[3])
+    assert complement.args[1].same_as(not_store.args[3])
 
 
 @pytest.mark.pto

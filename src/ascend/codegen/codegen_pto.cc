@@ -5817,6 +5817,26 @@ void CodeGenTileLangPTO::VisitExpr_(const CallNode *op,
     return;
   }
 
+  if (op->op.same_as(builtin::bitwise_not()) && op->dtype.is_scalar() &&
+      !op->dtype.is_bool()) {
+    ICHECK_EQ(op->args.size(), 1U);
+    ICHECK(op->dtype.is_int() || op->dtype.is_uint())
+        << "PTO bitwise-not requires integer data, got " << op->dtype;
+    CheckPtoScalarOperand_(op->args[0], "PTO bitwise-not operand");
+    if (op->dtype == DataType::UInt(64)) {
+      // PTODSL materializes i64 constants through a signed 64-bit API.
+      os << "(";
+      PrintExpr_(op->args[0], os);
+      os << " ^ pto.const(-1, dtype=pto.ui64))";
+      return;
+    }
+    // PTODSL scalar values support XOR with a typed all-ones value.
+    PrimExpr all_ones =
+        op->dtype.is_uint() ? max_value(op->dtype) : make_const(op->dtype, -1);
+    PrintBinaryExpr_("^", op->dtype, op->args[0], all_ones, os);
+    return;
+  }
+
   const bool is_shift_left = op->op.same_as(builtin::shift_left());
   const bool is_shift_right = op->op.same_as(builtin::shift_right());
   if (is_shift_left || is_shift_right) {

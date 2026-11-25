@@ -17,6 +17,7 @@ from test_pto_parallel_pack import (
     scale_bits_kernel,
     scale_pack_kernel,
     signed_b16_index_kernel,
+    uint32_bitwise_kernel,
     uniform_bits,
     varying_shift_kernel,
 )
@@ -57,6 +58,19 @@ def test_signed_and_unsigned_right_shift_high_bit(bits, npu):
     output = torch.empty((2, lanes), dtype=dtype)
     expected = torch.stack((values >> 3, (values % (1 << bits)) >> 3)).to(dtype)
     _run(f"pack_right_shift_{bits}", right_shift_kernel(bits), [values.to(dtype), output], expected, npu)
+
+
+@pytest.mark.pto
+@pytest.mark.parametrize("uniform", [False, True], ids=["varying", "uniform"])
+def test_uint32_bitwise_xor_and_not_preserve_bits_and_tail(uniform, npu):
+    values = (torch.arange(128, dtype=torch.int64) * 0x9E3779B9) & 0xFFFFFFFF
+    values[:4] = torch.tensor([0x80000000, 0, 0xFFFFFFFF, 0xAAAAAAAA])
+    output = torch.full((2, 128), 43, dtype=torch.uint32)
+    expected = output.to(torch.int64)
+    x = values[:1] if uniform else values[:65]
+    expected[0, :65] = (x >> 23) ^ x
+    expected[1, :65] = x ^ 0xFFFFFFFF
+    _run(f"uint32_bitwise_{uniform}", uint32_bitwise_kernel(uniform), [values.to(output.dtype), output], expected.to(output.dtype), npu)
 
 
 @pytest.mark.pto
