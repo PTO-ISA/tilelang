@@ -145,19 +145,19 @@ private:
     // are rejected there, and opaque calls are already excluded
     // from addresses.
     static const std::set<std::string> kDiscardable = {
-        "tl.vmi.vload",  "tl.vmi.vgather",
-        "tl.vmi.vbrc",   "tl.vmi.vci",
-        "tl.vmi.vadd",   "tl.vmi.vsub",
-        "tl.vmi.vmul",   "tl.vmi.vdiv",
-        "tl.vmi.vabs",   "tl.vmi.vexp",
-        "tl.vmi.vln",    "tl.vmi.vsqrt",
-        "tl.vmi.vcvt",   "tl.vmi.vinterpret_cast",
-        "tl.vmi.vcmp",   "tl.vmi.vcmps",
-        "tl.vmi.vsel",   "tl.vmi.vand",
-        "tl.vmi.vor",    "tl.vmi.vnot",
-        "tl.vmi.vshl",   "tl.vmi.vshr",
-        "tl.vmi.vshls",  "tl.vmi.vshrs",
-        "tl.access_ptr",
+        "tl.vmi.vload", "tl.vmi.vgather",
+        "tl.vmi.vbrc",  "tl.vmi.vci",
+        "tl.vmi.vadd",  "tl.vmi.vsub",
+        "tl.vmi.vmul",  "tl.vmi.vdiv",
+        "tl.vmi.vabs",  "tl.vmi.vexp",
+        "tl.vmi.vln",   "tl.vmi.vsqrt",
+        "tl.vmi.vcvt",  "tl.vmi.vinterpret_cast",
+        "tl.vmi.vcmp",  "tl.vmi.vcmps",
+        "tl.vmi.vsel",  "tl.vmi.vand",
+        "tl.vmi.vor",   "tl.vmi.vnot",
+        "tl.vmi.vshl",  "tl.vmi.vshr",
+        "tl.vmi.vshls", "tl.vmi.vshrs",
+        "tl.vmi.vxor",  "tl.access_ptr",
     };
     bool discardable = true;
     PostOrderVisit(rhs, [&](const ObjectRef &n) {
@@ -2060,13 +2060,25 @@ private:
                            {{"to_dtype", StringImm(TvmDtypeName(dtype))}}),
                       pre);
     }
+    if (op == PtoBitOp::kNot) {
+      if (!vector) {
+        return Call(dtype, call->op, {value}, call->span);
+      }
+      int64_t width = value_info.logical_lanes;
+      return EmitBind("vnot",
+                      Call(VectorDType(dtype, width), VmiOp("vnot"),
+                           {value, width == 1 ? GetFullMask(1) : mask_var_}),
+                      pre);
+    }
     PrimExpr rhs = ConvertExpr(call->args[1], pre);
     const bool rhs_vector = Info(rhs).IsVmi();
     if (!vector && !rhs_vector) {
       return Call(dtype, call->op, {value, rhs}, call->span);
     }
     const char *name;
-    if (op == PtoBitOp::kAnd || op == PtoBitOp::kOr) {
+    if (op == PtoBitOp::kXor) {
+      name = "vxor";
+    } else if (op == PtoBitOp::kAnd || op == PtoBitOp::kOr) {
       name = op == PtoBitOp::kAnd ? "vand" : "vor";
     } else if (rhs_vector) {
       name = op == PtoBitOp::kShiftLeft ? "vshl" : "vshr";

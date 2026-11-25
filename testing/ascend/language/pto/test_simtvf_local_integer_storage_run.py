@@ -236,3 +236,23 @@ def test_simtvf_shared_integer_access_control(npu, dtype, torch_dtype):
     out = kernel(a.to(npu))
     torch.npu.synchronize()
     assert torch.equal(out.cpu(), a)
+
+
+@pytest.mark.pto
+def test_simtvf_uint64_bitwise_not(npu):
+    @T.prim_func
+    def main(A: T.Tensor((32,), "uint64"), C: T.Tensor((2, 32), "uint64")):
+        with T.Kernel(1), T.SimtVF(threads=32):
+            i = T.get_thread_binding()
+            C[0, i] = ~T.uint64(42)
+            C[1, i] = ~A[i]
+
+    # Use int64 views to compare the full bit pattern, including the high bit.
+    values = torch.tensor([0, 42, -1, -(1 << 63), (1 << 63) - 1, 0x123456789ABCDEF0, -2, 1], dtype=torch.int64).repeat(4)
+    expected = torch.stack((torch.full_like(values, -43), ~values))
+    output = torch.empty_like(expected, device=npu)
+
+    kernel = tilelang.compile(main, target="pto")
+    kernel(values.to(npu).view(torch.uint64), output.view(torch.uint64))
+    torch.npu.synchronize()
+    assert torch.equal(output.cpu(), expected)

@@ -380,7 +380,6 @@ private:
       Call call = GetRef<Call>(op);
       if (pto_analysis::GetPtoBitOp(call) != pto_analysis::PtoBitOp::kNone ||
           pto_analysis::GetPtoMaskLogicOp(call) ||
-          op->op.same_as(builtin::bitwise_not()) ||
           pto_analysis::GetPtoUnaryOp(call)) {
         StmtExprVisitor::VisitExpr_(op);
       }

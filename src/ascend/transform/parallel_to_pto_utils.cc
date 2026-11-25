@@ -2141,6 +2141,12 @@ PtoBitOp GetPtoBitOp(const Call &call) {
   if (!call->dtype.is_bool() && call->op.same_as(builtin::bitwise_or())) {
     return PtoBitOp::kOr;
   }
+  if (!call->dtype.is_bool() && call->op.same_as(builtin::bitwise_xor())) {
+    return PtoBitOp::kXor;
+  }
+  if (!call->dtype.is_bool() && call->op.same_as(builtin::bitwise_not())) {
+    return PtoBitOp::kNot;
+  }
   if (call->op.same_as(builtin::shift_left())) {
     return PtoBitOp::kShiftLeft;
   }
@@ -2155,18 +2161,17 @@ PtoBitOp GetPtoBitOp(const Call &call) {
 
 static void CheckPtoBitOp(const Call &call, PtoBitOp op) {
   ICHECK(op != PtoBitOp::kNone);
-  const bool reinterpret = op == PtoBitOp::kReinterpret;
+  const bool unary = op == PtoBitOp::kNot || op == PtoBitOp::kReinterpret;
   const std::string name = Downcast<Op>(call->op)->name;
-  if (call->args.size() != (reinterpret ? 1U : 2U) ||
-      !call->annotations.empty()) {
+  if (call->args.size() != (unary ? 1U : 2U) || !call->annotations.empty()) {
     throw PtoAnalysisError(name + " expects " +
-                           (reinterpret ? "one operand" : "two operands") +
+                           (unary ? "one operand" : "two operands") +
                            " and no annotations");
   }
 
   const DataType from = call->args[0].dtype();
   const DataType to = call->dtype;
-  if (reinterpret) {
+  if (op == PtoBitOp::kReinterpret) {
     const DataType u32 = DataType::UInt(32);
     const DataType f32 = DataType::Float(32);
     const bool supported = (IsPtoIndexDType(from) && IsPtoIndexDType(to) &&
@@ -2183,7 +2188,7 @@ static void CheckPtoBitOp(const Call &call, PtoBitOp op) {
     return;
   }
 
-  const DataType rhs = call->args[1].dtype();
+  const DataType rhs = unary ? from : call->args[1].dtype();
   const bool shift = op == PtoBitOp::kShiftLeft || op == PtoBitOp::kShiftRight;
   const int64_t *count =
       shift && rhs.is_scalar() && (rhs.is_int() || rhs.is_uint())
@@ -2194,7 +2199,11 @@ static void CheckPtoBitOp(const Call &call, PtoBitOp op) {
     oss << name
         << " requires scalar 8-, 16- or 32-bit integer data operands "
            "and result of the same dtype, got "
-        << from << ", " << rhs << " -> " << to;
+        << from;
+    if (!unary) {
+      oss << ", " << rhs;
+    }
+    oss << " -> " << to;
     throw PtoAnalysisError(oss.str());
   }
   if (count && (*count < 0 || *count >= to.bits())) {
@@ -2807,8 +2816,8 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
   }
   if (const auto *call = expr.as<CallNode>()) {
     Call ref = GetRef<Call>(call);
-    // Metadata keeps the original scalar expression. Integer NOT has no
-    // corresponding Parallel data lowering.
+    // Metadata keeps the original scalar expression, so it may use integer
+    // widths outside the VMI data contract.
     if (metadata_mode && call->op.same_as(builtin::bitwise_not()) &&
         call->args.size() == 1 && call->dtype.is_scalar() &&
         (call->dtype.is_int() || call->dtype.is_uint())) {
