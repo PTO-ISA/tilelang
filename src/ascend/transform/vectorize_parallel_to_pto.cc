@@ -861,10 +861,8 @@ private:
                         {{"to_dtype", StringImm(TvmDtypeName(*conversion))}}),
                    &statements);
     }
-    PrimExpr mask = EmitBind("fill_mask",
-                             Call(DataType::Bool(lanes), VmiOp("create_mask"),
-                                  {i32(lanes)}, {{"size", i32(lanes)}}),
-                             &statements);
+    int64_t full_chunks = plan.run_extent / lanes;
+    int64_t tail_lanes = plan.run_extent % lanes;
     Var row("fill_row", DataType::Int(32));
     Var chunk("fill_chunk", DataType::Int(32));
     Array<PrimExpr> indices;
@@ -874,17 +872,37 @@ private:
     if (plan.outer_axis >= 0) {
       indices.Set(plan.outer_axis, row);
     }
-    indices.Set(plan.continuous_axis, chunk * i32(lanes));
-    PrimExpr pointer = Call(DataType::Handle(), tl::access_ptr(),
-                            {BufferLoad(dst, indices), i32(lanes), i32(2)});
-    Stmt body = Evaluate(Call(DataType::Void(), VmiOp("vstore"),
-                              {vector, pointer, i32(0), mask}));
-    body = For(chunk, i32(0), i32(plan.run_extent / lanes), ForKind::kSerial,
-               body);
-    if (plan.outer_axis >= 0) {
-      body = For(row, i32(0), i32(plan.outer_extent), ForKind::kSerial, body);
+    auto store = [&](const PrimExpr &offset, const PrimExpr &mask) {
+      Array<PrimExpr> at = indices;
+      at.Set(plan.continuous_axis, offset);
+      PrimExpr pointer = Call(DataType::Handle(), tl::access_ptr(),
+                              {BufferLoad(dst, at), i32(lanes), i32(2)});
+      return Evaluate(Call(DataType::Void(), VmiOp("vstore"),
+                           {vector, pointer, i32(0), mask}));
+    };
+    Array<Stmt> body;
+    if (full_chunks > 0) {
+      PrimExpr mask = EmitBind("fill_mask",
+                               Call(DataType::Bool(lanes), VmiOp("create_mask"),
+                                    {i32(lanes)}, {{"size", i32(lanes)}}),
+                               &statements);
+      body.push_back(For(chunk, i32(0), i32(full_chunks), ForKind::kSerial,
+                         store(chunk * i32(lanes), mask)));
     }
-    statements.push_back(body);
+    if (tail_lanes != 0) {
+      PrimExpr tail_mask =
+          EmitBind("fill_tail_mask",
+                   Call(DataType::Bool(lanes), VmiOp("create_mask"),
+                        {i32(tail_lanes)}, {{"size", i32(lanes)}}),
+                   &statements);
+      body.push_back(store(i32(full_chunks * lanes), tail_mask));
+    }
+    Stmt stores = SeqStmt::Flatten(body);
+    if (plan.outer_axis >= 0) {
+      stores =
+          For(row, i32(0), i32(plan.outer_extent), ForKind::kSerial, stores);
+    }
+    statements.push_back(stores);
     return SeqStmt::Flatten(statements);
   }
 

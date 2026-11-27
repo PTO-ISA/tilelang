@@ -2338,8 +2338,7 @@ private:
           }
         } else if (pto_analysis::IsPtoFill(call)) {
           try {
-            pto_analysis::CheckPtoFill(call, lanes, analyzer_,
-                                       buffer_versions_);
+            pto_analysis::CheckPtoFill(call, analyzer_, buffer_versions_);
           } catch (const pto_analysis::PtoAnalysisError &error) {
             Fail("fill/clear", error.what());
           }

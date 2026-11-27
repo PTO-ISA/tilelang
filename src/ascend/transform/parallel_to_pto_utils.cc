@@ -217,7 +217,7 @@ int PtoFillContinuousAxis(const BufferRegion &destination,
 
 } // namespace
 
-void CheckPtoFill(const Call &call, int64_t lanes, arith::Analyzer *analyzer,
+void CheckPtoFill(const Call &call, arith::Analyzer *analyzer,
                   const Map<Var, int> &buffer_versions) {
   auto fail = [](const std::string &message) {
     throw PtoAnalysisError("fill/clear: " + message);
@@ -280,12 +280,6 @@ void CheckPtoFill(const Call &call, int64_t lanes, arith::Analyzer *analyzer,
   int axis = PtoFillContinuousAxis(destination, strides, prefix, analyzer);
   if (!analyzer->CanProveEqual(strides[axis], 1)) {
     fail("requires a unit-stride axis");
-  }
-  int64_t run_extent =
-      Downcast<IntImm>(destination->region[axis]->extent)->value;
-  if (run_extent % lanes != 0) {
-    fail("tail regions are not supported; the contiguous extent must be a "
-         "multiple of SimdVF lanes");
   }
   if (rank == 2) {
     int outer_axis = prefix + (axis == prefix ? 1 : 0);

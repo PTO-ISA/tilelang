@@ -48,13 +48,12 @@ def _region_kernel(shape, extent, strides=None, dtype="float32", scope="shared.d
     "shape, extent, strides, scope, reason",
     [
         ((256,), 0, (1,), "shared.dyn", "positive compile-time integers"),
-        ((256,), 1, (1,), "shared.dyn", "tail regions"),
-        ((256,), 64, (1,), "shared.dyn", "tail regions"),
         ((3, 256), 128, (258, 1), "shared.dyn", "32-byte aligned"),
+        ((3, 4), 4, (4, 1), "shared.dyn", "32-byte aligned"),
         ((3, 128), 128, (256, 2), "shared.dyn", "unit-stride axis"),
         ((128,), 128, (1,), "local.fragment", "supported scopes are UB"),
     ],
-    ids=["empty", "single-element", "short-vector", "unaligned-row", "no-contiguous-axis", "fragment"],
+    ids=["empty", "unaligned-row", "unaligned-short-row", "no-contiguous-axis", "fragment"],
 )
 def test_fill_clear_verify_rejects_unsupported_regions(shape, extent, strides, scope, reason, clear):
     func = _region_kernel(shape, extent, strides, scope=scope, clear=clear)
@@ -70,6 +69,29 @@ def test_fill_clear_verify_rejects_unsupported_regions(shape, extent, strides, s
 @pytest.mark.parametrize("scope", ["shared", "shared.dyn"])
 def test_fill_clear_verify_accepts_aligned_origin_zero_neighbor(clear, scope):
     func = _region_kernel((3, 256), 128, (256, 1), scope=scope, clear=clear)
+    result = _verify(func)
+    expected = tvm.IRModule.from_expr(func.with_attr("target", normalize_pto_target("pto")))
+    tvm.ir.assert_structural_equal(result, expected)
+
+
+@pytest.mark.pto
+@pytest.mark.parametrize("clear", [False, True], ids=["fill", "clear"])
+@pytest.mark.parametrize(
+    "shape, extent, strides",
+    [
+        ((256,), 1, (1,)),
+        ((256,), 64, (1,)),
+        ((256,), 130, (1,)),
+        ((3, 64), 64, (64, 1)),
+        ((3, 256), 130, (256, 1)),
+        ((100, 3), 3, (1, 104)),
+    ],
+    ids=["single-element", "short-vector", "1d-tail", "2d-short-rows", "2d-tail", "transposed-short-columns"],
+)
+def test_fill_clear_verify_accepts_tail_regions(shape, extent, strides, clear):
+    # A run that is not a multiple of the SimdVF lanes leaves a tail. Verify
+    # keeps the source IR untouched; Vectorize stores that tail with a mask.
+    func = _region_kernel(shape, extent, strides, clear=clear)
     result = _verify(func)
     expected = tvm.IRModule.from_expr(func.with_attr("target", normalize_pto_target("pto")))
     tvm.ir.assert_structural_equal(result, expected)

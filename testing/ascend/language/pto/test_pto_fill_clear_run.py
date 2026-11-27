@@ -7,6 +7,8 @@ allocation so origin-zero subregions and stride gaps are checked together.
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 import torch_npu  # noqa: F401
@@ -96,6 +98,99 @@ def test_fill_clear_dtype(npu, dtype, lanes, clear):
     got = kernel(initial.to(npu))
     torch.npu.synchronize()
     assert torch.equal(got.cpu(), expected)
+
+
+TAIL_LANES = [(dtype, 64) for dtype in DTYPES] + [
+    (dtype, lanes) for dtype in ("int8", "float16", "float32", "int32") for lanes in (128, 256)
+]
+
+
+def _check_tail_dtype(npu, dtype, lanes, extent, clear):
+    # The tail is one masked store, so every element after the run must keep
+    # its initial value.
+    func, _, capacity, value = _kernel((extent,), (extent,), dtype, lanes, clear)
+    initial = ((torch.arange(capacity) % 31) + 10).to(getattr(torch, dtype))
+    expected = initial.clone()
+    expected[:extent] = 0 if clear else value
+    kernel = tilelang.compile(func, target="pto", out_idx=-1)
+    got = kernel(initial.to(npu))
+    torch.npu.synchronize()
+    assert torch.equal(got.cpu(), expected)
+
+
+@pytest.mark.pto
+@pytest.mark.parametrize("dtype, lanes", TAIL_LANES)
+@pytest.mark.parametrize("clear", [False, True], ids=["fill", "clear"])
+def test_fill_clear_tail_dtype(npu, dtype, lanes, clear):
+    # Two complete chunks and a three-element tail.
+    _check_tail_dtype(npu, dtype, lanes, 2 * lanes + 3, clear)
+
+
+@pytest.mark.pto
+@pytest.mark.parametrize("dtype", ["int8", "float16", "float32", "int32"])
+@pytest.mark.parametrize("lanes", [128, 256])
+@pytest.mark.parametrize("clear", [False, True], ids=["fill", "clear"])
+def test_fill_clear_single_element_tail(npu, dtype, lanes, clear):
+    # One complete chunk and one active lane: the narrowest masked store.
+    _check_tail_dtype(npu, dtype, lanes, lanes + 1, clear)
+
+
+TAIL_REGIONS = [
+    ((1,), (1,), 128, False),
+    ((63,), (63,), 128, False),
+    ((65,), (65,), 64, False),
+    ((3, 64), (3, 64), 128, False),
+    ((3, 256), (3, 130), 128, False),
+    ((3, 320), (2, 259), 64, False),
+    ((100, 3), (100, 3), 128, True),
+    ((2, 224), (2, 224), 256, False),
+]
+
+
+@pytest.mark.pto
+@pytest.mark.parametrize("clear", [False, True], ids=["fill", "clear"])
+@pytest.mark.parametrize("shape, extents, lanes, transpose", TAIL_REGIONS)
+def test_fill_clear_tail_regions(npu, shape, extents, lanes, transpose, clear):
+    # Short runs, tails of one or several rows, and a transposed run whose
+    # tail is followed by a stride gap. The third row of the partial region
+    # stays untouched along with every gap and the allocation tail.
+    func, strides, capacity, value = _kernel(shape, extents, "float32", lanes, clear, transpose)
+    kernel = tilelang.compile(func, target="pto", out_idx=-1)
+    for trial in range(2):
+        initial = torch.arange(capacity).float() / 8 + 11 + trial
+        expected = initial.clone()
+        view = expected.as_strided(shape, strides)
+        slices = tuple(slice(0, extent) for extent in extents)
+        view[slices] = 0 if clear else value
+        got = kernel(initial.to(npu))
+        torch.npu.synchronize()
+        torch.testing.assert_close(got.cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.pto
+def test_tail_fill_clear_with_tail_reduce_and_parallel_consumer(npu):
+    @T.prim_func
+    def main(B: T.Tensor((64,), "float32")):
+        with T.Kernel(1):
+            source = T.alloc_shared((3, 64), "float32")
+            reduced = T.alloc_shared((64,), "float32")
+            b = T.alloc_shared((64,), "float32")
+            with T.SimdVF():
+                T.fill(source, T.float32(2))
+                T.fill(reduced, T.float32(-5))
+                T.reduce_sum(source, reduced, dim=0, clear=False)
+                T.clear(source)
+                for i in T.Parallel(64):
+                    b[i] = reduced[i] + source[0, i] + T.float32(1)
+            T.copy(b, B)
+
+    # The default 128 lanes leave a tail in every operation of the region:
+    # each fill/clear, the reduction and the Parallel consumer.
+    kernel = tilelang.compile(main, target="pto", out_idx=-1)
+    got = kernel()
+    torch.npu.synchronize()
+    # Each lane reduces to -5 + (2 + 2 + 2) = 1 before the source is cleared.
+    torch.testing.assert_close(got.cpu(), torch.full((64,), 2.0), rtol=0, atol=0)
 
 
 @pytest.mark.pto
@@ -353,7 +448,7 @@ def test_fill_serial_value_with_full_buffer(npu, unroll):
 
 
 @pytest.mark.pto
-@pytest.mark.parametrize("shape", [(128,), (1, 128)], ids=["one-dimensional", "logical-unit-axis"])
+@pytest.mark.parametrize("shape", [(128,), (1, 128), (3, 64)], ids=["one-dimensional", "logical-unit-axis", "short-rows"])
 @pytest.mark.parametrize("versions", [1, 2])
 @pytest.mark.parametrize("clear", [False, True], ids=["fill", "clear"])
 def test_fill_clear_multibuffer_keeps_real_logical_axes(npu, shape, versions, clear):
@@ -380,10 +475,10 @@ def test_fill_clear_multibuffer_keeps_real_logical_axes(npu, shape, versions, cl
                 else:
                     T.copy(b, B[t, :, :])
 
-    initial = torch.arange(4 * 128).reshape(4, *shape).float() / 8
+    initial = torch.arange(4 * math.prod(shape)).reshape(4, *shape).float() / 8
     expected = torch.zeros_like(initial)
     if not clear:
-        expected = initial.reshape(4, -1)[:, 0:1].expand(4, 128).reshape_as(initial)
+        expected = initial.reshape(4, -1)[:, 0:1].expand(initial.reshape(4, -1).shape).reshape_as(initial)
     kernel = tilelang.compile(main, target="pto", out_idx=-1)
     got = kernel(initial.to(npu))
     torch.npu.synchronize()
