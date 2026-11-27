@@ -425,6 +425,86 @@ def test_fill_parameter_cast_preserves_scalar_expression(intermediate, dtype, bi
 
 
 @pytest.mark.pto
+@pytest.mark.parametrize(
+    "rows, extent, lanes",
+    [
+        (1, 1, 128),
+        (1, 63, 128),
+        (1, 65, 64),
+        (3, 64, 128),
+        (3, 130, 128),
+        (1, 259, 128),
+        (2, 257, 256),
+    ],
+    ids=["single-element", "short", "one-full-plus-one", "short-rows", "2d-tail", "two-full-tail", "vl256-tail"],
+)
+@pytest.mark.parametrize("clear", [False, True], ids=["fill", "clear"])
+def test_fill_clear_separates_full_chunks_from_tail(rows, extent, lanes, clear):
+    # Rows start on 32-byte boundaries, as the masked tail store requires.
+    pitch = (extent + 7) // 8 * 8
+    shape = (rows, pitch) if rows > 1 else (extent,)
+
+    @T.prim_func
+    def main(A: T.Tensor(shape, "float32"), B: T.Tensor(shape, "float32")):
+        with T.Kernel(1):
+            b = T.alloc_shared(shape, "float32")
+            T.copy(A, b)
+            with T.SimdVF(lanes=lanes):
+                if rows > 1:
+                    region = b[0:rows, 0:extent]
+                else:
+                    region = b[0:extent]
+                if clear:
+                    T.clear(region)
+                else:
+                    T.fill(region, T.float32(3.25))
+            T.copy(b, B)
+
+    mod, error = _lower_capture(main)
+    assert error is None
+    operations = _vmi_calls(mod)
+    full_chunks, tail = divmod(extent, lanes)
+    mask_bindings = [
+        bind
+        for bind in _collect(mod, lambda node: isinstance(node, tvm.tirx.Bind))
+        if isinstance(bind.value, tvm.tirx.Call) and bind.value.op.name == "tl.vmi.create_mask"
+    ]
+
+    def active_lanes(mask):
+        return int(next(bind.value.args[0] for bind in mask_bindings if bind.var.same_as(mask)))
+
+    assert [int(call.annotations["size"]) for call in operations["tl.vmi.vbrc"]] == [lanes]
+    # One broadcast feeds the complete chunks and the tail. Only constant
+    # masks are needed, and each store keeps the full vector width.
+    stores = operations["tl.vmi.vstore"]
+    assert sorted(active_lanes(store.args[3]) for store in stores) == sorted(
+        ([lanes] if full_chunks > 0 else []) + ([tail] if tail > 0 else [])
+    )
+    for store in stores:
+        assert int(store.args[0].dtype.lanes) == lanes
+        assert int(store.args[1].args[1]) == lanes
+
+    # The complete-chunk loop carries no tail mask, even when a tail follows,
+    # and a run shorter than the lanes leaves no empty loop behind.
+    loops = [loop for loop in _collect(mod, lambda node: isinstance(node, tvm.tirx.For)) if loop.loop_var.name.startswith("fill_")]
+    assert sorted((loop.loop_var.name, int(loop.min), int(loop.extent)) for loop in loops) == sorted(
+        [("fill_chunk", 0, full_chunks)] * int(full_chunks > 0) + [("fill_row", 0, rows)] * int(rows > 1)
+    )
+    for loop in loops:
+        if loop.loop_var.name == "fill_chunk":
+            body = tvm.IRModule({"main": tvm.tirx.PrimFunc([], loop.body)})
+            assert not _vmi_calls(body).get("tl.vmi.create_mask")
+
+    # The tail is one store at the next chunk boundary, masked to the
+    # remaining lanes of every row.
+    assert tail > 0
+    tail_stores = [store for store in stores if active_lanes(store.args[3]) == tail]
+    assert len(tail_stores) == 1
+    index = tail_stores[0].args[1].args[0].indices[-1]
+    assert isinstance(index, tvm.tirx.IntImm) and int(index) == full_chunks * lanes
+
+
+@pytest.mark.pto
 @pytest.mark.parametrize("clear", [False, True], ids=["fill", "clear"])
 @pytest.mark.parametrize(
     "shape, starts, extents",
@@ -432,12 +512,10 @@ def test_fill_parameter_cast_preserves_scalar_expression(intermediate, dtype, bi
         ((256,), (8,), (128,)),
         ((3, 256), (1, 0), (2, 128)),
         ((3, 256), (0, 8), (3, 128)),
-        ((256,), (0,), (130,)),
-        ((3, 256), (0, 0), (3, 130)),
     ],
-    ids=["1d-nonzero-start", "2d-outer-nonzero-start", "2d-inner-nonzero-start", "1d-tail", "2d-tail"],
+    ids=["1d-nonzero-start", "2d-outer-nonzero-start", "2d-inner-nonzero-start"],
 )
-def test_fill_clear_rejects_nonzero_starts_and_tails_in_verify(shape, starts, extents, clear):
+def test_fill_clear_rejects_nonzero_starts_in_verify(shape, starts, extents, clear):
     @T.prim_func
     def main(A: T.Tensor(shape, "float32"), B: T.Tensor(shape, "float32")):
         with T.Kernel(1):
@@ -463,7 +541,7 @@ def test_fill_clear_rejects_nonzero_starts_and_tails_in_verify(shape, starts, ex
     assert mod is None, "Verify must reject the unsupported region before VectorizeParallelToPTO"
     message = str(error)
     assert "VerifyParallelToPTO" in message and "fill/clear" in message
-    assert ("nonzero" if any(starts) else "tail") in message
+    assert "nonzero" in message
 
 
 @pytest.mark.pto
@@ -498,9 +576,8 @@ def test_fill_clear_rejects_nonzero_destination_storage_offset(offset, clear):
 
 
 @pytest.mark.pto
-@pytest.mark.parametrize("start, extent", [(1, 128), (0, 130)], ids=["nonzero-logical-start", "logical-tail"])
 @pytest.mark.parametrize("clear", [False, True], ids=["fill", "clear"])
-def test_fill_clear_version_axis_does_not_hide_logical_boundaries(start, extent, clear):
+def test_fill_clear_version_axis_does_not_hide_logical_start(clear):
     @T.prim_func
     def main(A: T.Tensor((4, 3, 256), "float32"), B: T.Tensor((4, 3, 256), "float32")):
         with T.Kernel(1):
@@ -510,9 +587,9 @@ def test_fill_clear_version_axis_does_not_hide_logical_boundaries(start, extent,
                 T.copy(A[t, :, :], b)
                 with T.SimdVF(lanes=128):
                     if clear:
-                        T.clear(b[start:3, 0:extent])
+                        T.clear(b[1:3, 0:128])
                     else:
-                        T.fill(b[start:3, 0:extent], 3.25)
+                        T.fill(b[1:3, 0:128], 3.25)
                 T.copy(b, B[t, :, :])
 
     with _verify_boundary_capture() as captured:
@@ -523,7 +600,45 @@ def test_fill_clear_version_axis_does_not_hide_logical_boundaries(start, extent,
     assert mod is None
     message = str(error)
     assert "VerifyParallelToPTO" in message and "fill/clear" in message
-    assert ("nonzero" if start else "tail") in message
+    assert "nonzero" in message
+
+
+@pytest.mark.pto
+@pytest.mark.parametrize("versions", [1, 2])
+@pytest.mark.parametrize("clear", [False, True], ids=["fill", "clear"])
+def test_fill_clear_version_axis_keeps_logical_tail(versions, clear):
+    @T.prim_func
+    def main(A: T.Tensor((4, 3, 256), "float32"), B: T.Tensor((4, 3, 256), "float32")):
+        with T.Kernel(1):
+            b = T.alloc_shared((3, 256), "float32")
+            T.annotate_buffer_versions({b: versions})
+            for t in T.Pipelined(4, num_stages=2):
+                T.copy(A[t, :, :], b)
+                with T.SimdVF(lanes=128):
+                    if clear:
+                        T.clear(b[0:3, 0:130])
+                    else:
+                        T.fill(b[0:3, 0:130], 3.25)
+                T.copy(b, B[t, :, :])
+
+    mod, error = _lower_capture(main)
+    assert error is None
+    operations = _vmi_calls(mod)
+    masks = {
+        bind.var: bind.value
+        for bind in _collect(mod, lambda node: isinstance(node, tvm.tirx.Bind))
+        if isinstance(bind.value, tvm.tirx.Call) and bind.value.op.name == "tl.vmi.create_mask"
+    }
+    stores = operations["tl.vmi.vstore"]
+    assert sorted(int(masks[store.args[3]].args[0]) for store in stores) == [2, 128]
+    for store in stores:
+        address = store.args[1].args[0]
+        # The tail belongs to the logical run of one version slot: it is not
+        # hidden behind, nor does it spill into, the compiler version axis.
+        assert tuple(int(extent) for extent in address.buffer.shape) == ((versions, 3, 256) if versions > 1 else (3, 256))
+    tail = [store for store in stores if int(masks[store.args[3]].args[0]) == 2]
+    assert len(tail) == 1
+    assert int(tail[0].args[1].args[0].indices[-1]) == 128
 
 
 @pytest.mark.pto

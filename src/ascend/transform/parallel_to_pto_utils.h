@@ -590,7 +590,7 @@ bool IsPtoFill(const Call &call);
 
 /*! Check fill/clear admission without building a lowering plan.
  * Throws PtoAnalysisError for unsupported calls; does not change IR. */
-void CheckPtoFill(const Call &call, int64_t lanes, arith::Analyzer *analyzer,
+void CheckPtoFill(const Call &call, arith::Analyzer *analyzer,
                   const Map<Var, int> &buffer_versions = {});
 
 /*! Build a fill/clear lowering plan for already verified input.
