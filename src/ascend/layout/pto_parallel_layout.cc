@@ -144,6 +144,10 @@ private:
         name = "vmul";
       } else if (node.as<DivNode>()) {
         name = "vdiv";
+      } else if (node.as<FloorDivNode>()) {
+        name = "vfloordiv";
+      } else if (node.as<FloorModNode>()) {
+        name = "vfloormod";
       } else if (const auto *call = node.as<CallNode>()) {
         if (auto op = call->op.as<Op>();
             op && IsSupportedVectorUnaryOp(op.value()->name, call->dtype)) {

@@ -502,8 +502,7 @@ LaneUse AnalyzeLaneUse(const PrimExpr &expr, LaneUseContext *ctx,
 
 /*! Metadata-mode lane classification: same Var/Bind/BufferLoad
  * rules as AnalyzeLaneUse, but the *node table* is the metadata table —
- * pure scalar Sub/Div/Mod/FloorDiv/FloorMod/Min/Max/comparison/boolean
- * operators and StringImm constants propagate their operands' lane use
+ * scalar Mod and StringImm constants propagate their operands' lane use
  * instead of being rejected by the value whitelist. Unknown nodes still
  * produce kUnknown. */
 LaneUse AnalyzeLaneUseMeta(const PrimExpr &expr, LaneUseContext *ctx,

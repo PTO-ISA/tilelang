@@ -182,6 +182,10 @@ TVM_DLL const Op &vmi_vadd();
 TVM_DLL const Op &vmi_vsub();
 TVM_DLL const Op &vmi_vmul();
 TVM_DLL const Op &vmi_vdiv();
+// Internal integer SIMD floor arithmetic expanded by PTO codegen.
+TVM_DLL const Op &vmi_vfloordiv();
+TVM_DLL const Op &vmi_vfloormod();
+TVM_DLL const Op &vmi_vfloordivmod();
 TVM_DLL const Op &vmi_vmax();
 TVM_DLL const Op &vmi_vmin();
 TVM_DLL const Op &vmi_vand();

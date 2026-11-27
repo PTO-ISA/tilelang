@@ -335,6 +335,10 @@ TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vadd).set_num_inputs(-1);
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vsub).set_num_inputs(-1);
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vmul).set_num_inputs(-1);
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vdiv).set_num_inputs(-1);
+TIR_DEFINE_TL_VMI_PURE_BUILTIN(vfloordiv).set_num_inputs(3);
+TIR_DEFINE_TL_VMI_PURE_BUILTIN(vfloormod).set_num_inputs(3);
+// Keep the pair bound so both projections share one long division.
+TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vfloordivmod).set_num_inputs(3);
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vmax).set_num_inputs(-1);
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vmin).set_num_inputs(-1);
 TIR_DEFINE_TL_VMI_OPAQUE_BUILTIN(vand).set_num_inputs(-1);

@@ -23,6 +23,8 @@ from .rng import PhiloxRNG
 from .simd_inst import (
     vdiv_precise_f32,
     vexp_1ulp_ftz_false,
+    vmi_integer_divmod,
+    vmi_integer_floor,
     vln_1ulp_ftz_false,
     vsqrt_0ulp_ftz_false,
 )
@@ -68,6 +70,8 @@ __all__ = [
     "scalar_binary_fp8",
     "vdiv_precise_f32",
     "vexp_1ulp_ftz_false",
+    "vmi_integer_divmod",
+    "vmi_integer_floor",
     "vln_1ulp_ftz_false",
     "vsqrt_0ulp_ftz_false",
     "write_gm_bypass_dcache",

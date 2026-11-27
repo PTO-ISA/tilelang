@@ -2272,14 +2272,13 @@ public:
     if (!unsupported.has_value()) {
       unsupported = std::string("unsupported expression node `") + kind +
                     "` (admits buffer loads, constants, scalars, loop "
-                    "indices, Add, Sub, Mul, Div, fabs/exp/log/sqrt, Cast, "
+                    "indices, Add, Sub, Mul, Div, FloorDiv, FloorMod, "
+                    "fabs/exp/log/sqrt, Cast, "
                     "Select, comparisons, Min/Max, And/Or/Not and the "
                     "bitwise mask-combine calls)";
     }
   }
   void VisitExpr_(const ModNode *) final { MarkUnsupported("Mod"); }
-  void VisitExpr_(const FloorDivNode *) final { MarkUnsupported("FloorDiv"); }
-  void VisitExpr_(const FloorModNode *) final { MarkUnsupported("FloorMod"); }
   // Min/Max are admitted here — Verify runs before
   // LegalizeParallelToPTO, which rewrites them into the Select form before
   // VectorizeParallelToPTO consumes the unit.
@@ -2887,11 +2886,11 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
   } else if (const auto *fdiv = expr.as<FloorDivNode>()) {
     a = &fdiv->a;
     b = &fdiv->b;
-    known_op = metadata_mode;
+    known_op = true;
   } else if (const auto *fmod = expr.as<FloorModNode>()) {
     a = &fmod->a;
     b = &fmod->b;
-    known_op = metadata_mode;
+    known_op = true;
   } else if (const auto *minn = expr.as<MinNode>()) {
     // Min/Max classify like the comparisons in value mode too;
     // LegalizeParallelToPTO rewrites them into Select before Vectorize.
@@ -3021,6 +3020,12 @@ ValueInfo AnalyzeComputeValue(const PrimExpr &expr, LaneUseContext *ctx) {
   } else if (const auto *op = expr.as<DivNode>()) {
     lhs = &op->a;
     rhs = &op->b;
+  } else if (const auto *op = expr.as<FloorDivNode>()) {
+    lhs = &op->a;
+    rhs = &op->b;
+  } else if (const auto *op = expr.as<FloorModNode>()) {
+    lhs = &op->a;
+    rhs = &op->b;
   }
   if (const auto *call = expr.as<CallNode>()) {
     if (call->args.size() == 1) {
@@ -3145,6 +3150,9 @@ bool IsSupportedVectorBinaryOp(const std::string &vmi_op, DataType dtype) {
     return is_fp_like;
   if (vmi_op == "vdiv") {
     return dtype.is_float() && (bits == 16 || bits == 32);
+  }
+  if (vmi_op == "vfloordiv" || vmi_op == "vfloormod") {
+    return IsPtoIndexDType(dtype);
   }
   return false;
 }
