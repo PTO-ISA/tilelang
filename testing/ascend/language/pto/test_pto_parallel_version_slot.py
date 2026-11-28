@@ -14,8 +14,9 @@ from testing.ascend.auto_schedule._scheduled_ir import unit
 
 
 @pytest.mark.pto
-@pytest.mark.parametrize("stages", [1, 2, 3, 7])
-def test_persistent_expand_compiles(stages, monkeypatch):
+@pytest.mark.parametrize("x_slots,y_slots", [(1, 1), (2, 2), (3, 3), (7, 7), (2, 3)])
+def test_persistent_expand_compiles(x_slots, y_slots, monkeypatch):
+    stages = max(x_slots, y_slots)
     n = T.dynamic("n")
 
     @T.prim_func
@@ -23,7 +24,7 @@ def test_persistent_expand_compiles(stages, monkeypatch):
         with T.Kernel(4) as core:
             x = T.alloc_shared((256,), "bfloat16")
             y = T.alloc_shared((4, 256), "bfloat16")
-            T.annotate_buffer_versions({x: stages, y: stages})
+            T.annotate_buffer_versions({x: x_slots, y: y_slots})
             for row, col in T.Persistent([n, 5], 4, core, group_size=1, num_stages=stages):
                 T.copy(X[row, col * 256], x)
                 with T.SimdVF(lanes=128):
@@ -40,12 +41,20 @@ def test_persistent_expand_compiles(stages, monkeypatch):
     addresses = [nodes(ptr, tirx.BufferLoad)[0] for ptr in (load.args[0], store.args[1])]
     if stages == 1:
         assert [len(addr.indices) for addr in addresses] == [1, 2]
-    else:
-        slot = addresses[0].indices[0]
-        assert isinstance(slot, tirx.Var) and slot.same_as(addresses[1].indices[0])
-        (binding,) = [b for b in nodes(ir, tirx.Bind) if b.var.same_as(slot)]
+        return
+
+    read_slot, write_slot = (addr.indices[0] for addr in addresses)
+    assert isinstance(read_slot, tirx.Var) and isinstance(write_slot, tirx.Var)
+    assert read_slot.same_as(write_slot) == (x_slots == y_slots)
+
+    bindings = nodes(ir, tirx.Bind)
+    clocks = []
+    for slot, modulus in ((read_slot, x_slots), (write_slot, y_slots)):
+        (binding,) = [b for b in bindings if b.var.same_as(slot)]
         (clock,) = nodes(binding.value, tirx.BufferLoad)
-        assert tvm.arith.Analyzer().can_prove_equal(binding.value, clock % stages)
+        assert tvm.arith.Analyzer().can_prove_equal(binding.value, clock % modulus)
+        clocks.append(clock)
+    assert clocks[0].buffer.data.same_as(clocks[1].buffer.data)
 
 
 @pytest.mark.parametrize(
