@@ -128,11 +128,9 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.Simplify()(mod)
 
     mod = ascend_transform.NormalizeBufferVersion()(mod)
-    # The PTO target splits here: the formal PTO Parallel pipeline runs
-    # Verify -> Legalize -> Vectorize (Legalize is currently a pass-through
-    # placeholder). The AscendC SIMD_VF lowering only
-    # handles the AscendC target and must not see PTO regions.
+    # Capture invariant scalar reads before verifying the PTO Parallel addresses.
     if target_is_pto(target):
+        mod = ascend_transform.HoistPTOScalarAddressLoads()(mod)
         mod = ascend_transform.VerifyParallelToPTO()(mod)
         mod = ascend_transform.LegalizeParallelToPTO()(mod)
         mod = ascend_transform.VectorizeParallelToPTO()(mod)

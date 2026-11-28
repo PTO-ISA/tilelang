@@ -6,9 +6,9 @@ Scope: this file proves routing only.
   ``VerifyParallelToPTO -> LegalizeParallelToPTO -> VectorizeParallelToPTO``
   in that order, and never through ``AscendSimdVFLowerParallel``;
 * the AscendC SIMD_VF route keeps ``AscendSimdVFLowerParallel`` and never sees
-  the three PTO Parallel passes;
+  the PTO Parallel passes;
 * PTO ``SimtVF`` and hand-written PTO VMI modules without a ``T.Parallel``
-  unit enter the same three PTO pass entry points, but are bypassed inside
+  unit enter the same PTO pass entry points, but are bypassed inside
   those passes and accepted without conversion.
 
 This file deliberately asserts routing only: no PTO Parallel semantics, no
@@ -44,6 +44,7 @@ from tilelang.instrumentation import (
 import tvm
 
 _PTO_PARALLEL_PASSES = (
+    "tl.HoistPTOScalarAddressLoads",
     "tl.VerifyParallelToPTO",
     "tl.LegalizeParallelToPTO",
     "tl.VectorizeParallelToPTO",

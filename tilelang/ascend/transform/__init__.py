@@ -201,6 +201,11 @@ def AscendSimdVFLowerParallel():
     return _ffi_api.AscendSimdVFLowerParallel()  # type: ignore
 
 
+def HoistPTOScalarAddressLoads():
+    """Capture invariant integer loads used in PTO Parallel buffer addresses."""
+    return _ffi_api.HoistPTOScalarAddressLoads()
+
+
 def VerifyParallelToPTO():
     """Read-only verification of the PTO Parallel input contract.
 
@@ -370,5 +375,6 @@ __all__ = [
     "UnrollLoopSkipVF",
     "VectorizeParallelToPTO",
     "VerifyParallelToPTO",
+    "HoistPTOScalarAddressLoads",
     "VerifyPTOCodegenLegality",
 ]
