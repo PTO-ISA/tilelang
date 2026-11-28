@@ -1533,12 +1533,21 @@ private:
     auto entering = values_;
     PrimExpr condition = VisitExpr(op->condition);
     Stmt yes = VisitStmt(op->then_case);
-    values_ = entering;
+    auto then_values = std::move(values_);
+    values_ = std::move(entering);
     Optional<Stmt> no;
     if (op->else_case)
       no = VisitStmt(*op->else_case);
-    values_ = std::move(entering);
-    ForgetWrites(GetRef<Stmt>(op));
+    // Only Vars and literals are recorded. A Var with the same identity on
+    // both paths dominates the join; separately captured loads never match.
+    for (auto it = values_.begin(); it != values_.end();) {
+      auto other = then_values.find(it->first);
+      if (other == then_values.end() ||
+          !ExprDeepEqual()(it->second, other->second))
+        it = values_.erase(it);
+      else
+        ++it;
+    }
     return IfThenElse(condition, yes, no, op->span);
   }
 

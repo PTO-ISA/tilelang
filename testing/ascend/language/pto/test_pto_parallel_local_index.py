@@ -30,6 +30,18 @@ def local_index_kernel(source, access, dtype="int32"):
                         out[j] = a[idx_ub[i]]
                     elif source == "external":
                         out[(i % 3) * 256 + j] = a[(i % 3) * 256 + j]
+                    elif source in ("join_equal", "join_varying"):
+                        p = T.alloc_var("int32", init=0)
+                        q = T.alloc_var("int32", init=0)
+                        if source == "join_varying":
+                            q = idx_ub[j]
+                        if j < 64:
+                            p = q
+                        if source == "join_equal":
+                            if j < 96:
+                                out[j] = a[p + j]
+                        else:
+                            out[j] = a[p + j]
                     elif source in ("copy", "branch", "loop"):
                         base = T.bind(idx_ub[0])
                         p = T.alloc_local((1,), "int32")
@@ -81,6 +93,8 @@ def local_index_kernel(source, access, dtype="int32"):
         ("copy", "read", 0, 0),
         ("branch", "read", 0, 0),
         ("loop", "read", 0, 0),
+        ("join_equal", "read", 0, 0),
+        ("join_varying", "read", 1, 0),
     ],
 )
 def test_local_index_compiles(source, access, gathers, scatters, monkeypatch):
