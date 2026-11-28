@@ -25,6 +25,7 @@
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/extra/structural_equal.h>
 #include <tvm/ffi/reflection/registry.h>
+#include <tvm/tirx/builtin.h>
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
@@ -120,6 +121,17 @@ public:
 protected:
   void VisitExpr_(const VarNode *op) final {
     addresses_.insert(GetRef<Var>(op));
+  }
+  void VisitExpr_(const CallNode *op) final {
+    // Both intrinsics take an element address through a BufferLoad operand.
+    // A normal scalar load of that element does not expose its storage.
+    if ((op->op.same_as(builtin::address_of()) ||
+         op->op.same_as(tl::access_ptr())) &&
+        !op->args.empty()) {
+      if (const auto *base = op->args[0].as<BufferLoadNode>())
+        addresses_.insert(base->buffer->data);
+    }
+    StmtExprVisitor::VisitExpr_(op);
   }
   void VisitExpr_(const BufferLoadNode *op) final {
     if (op->predicate)

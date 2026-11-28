@@ -55,7 +55,19 @@ def test_persistent_expand_compiles(stages):
 
 @pytest.mark.parametrize(
     "mode",
-    ["guarded", "alias_store", "outer_alias", "outer_match", "predicated_escape", "escape", "local_allocation", "explicit_vf", "ascendc"],
+    [
+        "guarded",
+        "alias_store",
+        "outer_alias",
+        "outer_address_of",
+        "outer_access_ptr",
+        "outer_match",
+        "predicated_escape",
+        "escape",
+        "local_allocation",
+        "explicit_vf",
+        "ascendc",
+    ],
 )
 def test_version_slot_scope(mode):
     x = tirx.decl_buffer((64,), "int32", name="x", scope="shared.dyn")
@@ -68,7 +80,7 @@ def test_version_slot_scope(mode):
     if mode == "alias_store":
         alias = tirx.decl_buffer((1,), "int32", data=counter.data, scope="local.var")
         body = seq(tirx.DeclBuffer(alias), tirx.BufferStore(alias, 1, [0]), body)
-    elif mode in ("outer_alias", "outer_match"):
+    elif mode in ("outer_alias", "outer_address_of", "outer_access_ptr", "outer_match"):
         alias = tirx.decl_buffer((1,), "int32", name="alias", scope="local.var")
         body = seq(tirx.BufferStore(alias, 1, [0]), body)
     elif mode == "predicated_escape":
@@ -79,8 +91,13 @@ def test_version_slot_scope(mode):
     vf = tirx.SBlock([], [], [], "SIMD_VF", body, alloc_buffers=[counter] if mode == "local_allocation" else [])
     pred = tile < 3
     vf = tirx.SBlockRealize([], pred, vf)
-    if mode == "outer_alias":
-        vf = seq(tirx.Bind(alias.data, counter.data), tirx.DeclBuffer(alias), vf)
+    if mode in ("outer_alias", "outer_address_of", "outer_access_ptr"):
+        address = counter.data
+        if mode == "outer_address_of":
+            address = T.address_of(counter[0])
+        elif mode == "outer_access_ptr":
+            address = T.access_ptr(counter[0], "rw", extent=1)
+        vf = seq(tirx.Bind(alias.data, address), tirx.DeclBuffer(alias), vf)
     elif mode == "outer_match":
         match = tirx.MatchBufferRegion(alias, tirx.BufferRegion(counter, [tvm.ir.Range(0, 1)]))
         vf = tirx.SBlockRealize([], True, tirx.SBlock([], [], [], "wrapper", vf, match_buffers=[match]))
@@ -108,6 +125,13 @@ def test_version_slot_scope(mode):
     bindings = [b for b in nodes(after, tirx.Bind) if b.var.dtype != "handle"]
     if mode != "guarded":
         assert not bindings
+        if mode in ("outer_address_of", "outer_access_ptr"):
+            (loop,) = [loop for loop in nodes(after, tirx.For) if loop.kind == tirx.ForKind.PARALLEL]
+            (store,) = nodes(loop, tirx.BufferStore)
+            for index in (store.indices[0], store.value.indices[0]):
+                (load,) = nodes(index, tirx.BufferLoad)
+                assert load.buffer.data.same_as(counter.data)
+                assert tvm.arith.Analyzer().can_prove_equal(index, counter[0] % 3)
         return
     (binding,) = bindings
     assert tvm.arith.Analyzer().can_prove_equal(binding.value, counter[0] % 3)
