@@ -15,7 +15,7 @@ from testing.ascend.auto_schedule._scheduled_ir import unit
 
 @pytest.mark.pto
 @pytest.mark.parametrize("stages", [1, 2, 3, 7])
-def test_persistent_expand_compiles(stages):
+def test_persistent_expand_compiles(stages, monkeypatch):
     n = T.dynamic("n")
 
     @T.prim_func
@@ -31,14 +31,9 @@ def test_persistent_expand_compiles(stages):
                         y[m, j] = x[j]
                 T.copy(y, Y[row, 0, col * 256])
 
-    was_enabled = tilelang.is_cache_enabled()
-    tilelang.disable_cache()
-    try:
-        with capture_passes() as captured:
-            tilelang.compile(expand, target="pto")
-    finally:
-        if was_enabled:
-            tilelang.enable_cache()
+    monkeypatch.setenv("TILELANG_DISABLE_CACHE", "1")
+    with capture_passes() as captured:
+        tilelang.compile(expand, target="pto")
     ir = captured["VectorizeParallelToPTO_after"]["expand"]
     (load,) = calls(ir, "tl.vmi.vload")
     (store,) = calls(ir, "tl.vmi.vstore")
@@ -56,16 +51,16 @@ def test_persistent_expand_compiles(stages):
 @pytest.mark.parametrize(
     "mode",
     [
-        "guarded",
-        "alias_store",
-        "outer_alias",
-        "outer_address_of",
-        "outer_access_ptr",
-        "outer_match",
-        "predicated_escape",
-        "escape",
-        "local_allocation",
-        "explicit_vf",
+        pytest.param("guarded", marks=pytest.mark.pto),
+        pytest.param("alias_store", marks=pytest.mark.pto),
+        pytest.param("outer_alias", marks=pytest.mark.pto),
+        pytest.param("outer_address_of", marks=pytest.mark.pto),
+        pytest.param("outer_access_ptr", marks=pytest.mark.pto),
+        pytest.param("outer_match", marks=pytest.mark.pto),
+        pytest.param("predicated_escape", marks=pytest.mark.pto),
+        pytest.param("escape", marks=pytest.mark.pto),
+        pytest.param("local_allocation", marks=pytest.mark.pto),
+        pytest.param("explicit_vf", marks=pytest.mark.pto),
         "ascendc",
     ],
 )
@@ -144,6 +139,7 @@ def test_version_slot_scope(mode):
     assert store.value.indices[1].buffer.data.same_as(user_index.data)
 
 
+@pytest.mark.pto
 @pytest.mark.parametrize("write_type,write_slots", [("int32", 2), ("int64", 3)])
 def test_two_vfs_refresh_independent_clocks(write_type, write_slots):
     x, y = [tirx.decl_buffer((64,), "float32", name=n, scope="shared.dyn") for n in ("x", "y")]
