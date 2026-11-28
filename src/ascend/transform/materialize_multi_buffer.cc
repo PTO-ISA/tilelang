@@ -110,10 +110,46 @@ Buffer CreateMultiVersionBuffer(const Buffer &buffer, int num_versions,
   return Buffer(versioned);
 }
 
+// The scheduler owns a fresh counter allocation. If its address escapes
+// anywhere in the kernel, a VF could update it through an unrelated handle.
+// TIRx's default visitors omit optional BufferLoad/BufferStore predicates.
+class CounterAddressUses : public StmtExprVisitor {
+public:
+  bool Contains(const Var &storage) const { return addresses_.count(storage); }
+
+protected:
+  void VisitExpr_(const VarNode *op) final {
+    addresses_.insert(GetRef<Var>(op));
+  }
+  void VisitExpr_(const BufferLoadNode *op) final {
+    if (op->predicate)
+      VisitExpr(op->predicate.value());
+    StmtExprVisitor::VisitExpr_(op);
+  }
+  void VisitStmt_(const BufferStoreNode *op) final {
+    if (op->predicate)
+      VisitExpr(op->predicate.value());
+    StmtExprVisitor::VisitStmt_(op);
+  }
+  void VisitStmt_(const SBlockNode *op) final {
+    for (const auto &match : op->match_buffers)
+      addresses_.insert(match->source->buffer->data);
+    StmtExprVisitor::VisitStmt_(op);
+  }
+  void VisitStmt_(const AttrStmtNode *op) final {
+    if (op->node.as<PrimExprNode>())
+      VisitExpr(Downcast<PrimExpr>(op->node));
+    StmtExprVisitor::VisitStmt_(op);
+  }
+  std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> addresses_;
+};
+
 class VersionedBufferRegistry {
 public:
   VersionedBufferRegistry(const MultiBufferPlan &plan,
-                          const SBlock &kernel_root) {
+                          const SBlock &kernel_root, bool pto) {
+    if (pto)
+      counter_addresses_(kernel_root);
     for (const MultiBufferInfo &info : plan.Infos()) {
       if (info.NeedsVersionDimension())
         storage_versions_.emplace(info.storage, info.num_versions);
@@ -127,6 +163,10 @@ public:
              "storage "
           << info.storage->name_hint;
     }
+  }
+
+  bool CanCaptureCounter(const Var &storage) const {
+    return !counter_addresses_.Contains(storage);
   }
 
   Buffer Resolve(const Buffer &buffer) {
@@ -210,6 +250,7 @@ private:
     }
   }
 
+  CounterAddressUses counter_addresses_;
   std::unordered_map<Var, int, ObjectPtrHash, ObjectPtrEqual> storage_versions_;
   std::unordered_map<Var, PrimExpr, ObjectPtrHash, ObjectPtrEqual>
       storage_pitch_bits_;
@@ -222,21 +263,23 @@ private:
 // allocated and initialized by the scheduler outside the task. If its storage
 // already occurs in the VF (including an alias or a pointer argument), keep
 // the original load at the use site.
-class VFVersionSlots : public StmtExprVisitor {
+class VFVersionSlots : public CounterAddressUses {
 public:
   bool has_parallel{false};
   Array<Stmt> bindings;
 
   PrimExpr Capture(const Var &counter, const PrimExpr &index) {
-    if (!has_parallel || referenced_.count(counter.get()))
+    if (!has_parallel || Contains(counter))
       return index;
-    for (const auto &[value, slot] : slots_) {
-      if (ffi::StructuralEqual()(value, index))
-        return slot;
+    auto &slots = by_counter_[counter];
+    for (const Bind &binding : slots) {
+      if (ffi::StructuralEqual()(binding->value, index))
+        return binding->var;
     }
     Var slot("version_slot", index.dtype());
-    slots_.emplace_back(index, slot);
-    bindings.push_back(Bind(slot, index));
+    Bind binding(slot, index);
+    slots.push_back(binding);
+    bindings.push_back(binding);
     return slot;
   }
 
@@ -245,17 +288,16 @@ private:
     has_parallel |= op->kind == ForKind::kParallel;
     StmtExprVisitor::VisitStmt_(op);
   }
-  void VisitExpr_(const VarNode *op) final { referenced_.insert(op); }
   void VisitBufferUse(const Buffer &buffer) final {
-    referenced_.insert(buffer->data.get());
+    addresses_.insert(buffer->data);
   }
   void VisitBufferDef(const Buffer &buffer, bool alloc_data) final {
-    referenced_.insert(buffer->data.get());
+    addresses_.insert(buffer->data);
     StmtExprVisitor::VisitBufferDef(buffer, alloc_data);
   }
 
-  std::unordered_set<const VarNode *> referenced_;
-  std::vector<std::pair<PrimExpr, Var>> slots_;
+  std::unordered_map<Var, std::vector<Bind>, ObjectPtrHash, ObjectPtrEqual>
+      by_counter_;
 };
 
 class MultiBufferAccessRewriter : public StmtExprMutator {
@@ -306,7 +348,8 @@ private:
     if (version.dtype() != index_dtype)
       version = cast(index_dtype, version);
     if (vf_slots_ && info.UsesCounter() &&
-        pto::IsOrdinaryUbScope(versioned.scope()))
+        pto::IsOrdinaryUbScope(versioned.scope()) &&
+        buffers_->CanCaptureCounter(info.counter->data))
       return vf_slots_->Capture(info.counter->data, version);
     return version;
   }
@@ -620,7 +663,8 @@ SBlock MaterializeKernel(ScheduledTIR scheduled_tir, bool pto) {
       scheduled_tir.tree, scheduled_tir.metadata.buffer_versions,
       L0StorageGroups(CollectL0SFBindings(scheduled_tir.metadata.kernel_root)));
   ElideUnitVersionCounterGroups(&scheduled_tir, plan);
-  VersionedBufferRegistry buffers(plan, scheduled_tir.metadata.kernel_root);
+  VersionedBufferRegistry buffers(plan, scheduled_tir.metadata.kernel_root,
+                                  pto);
   RewriteScheduledTree(&scheduled_tir.tree, plan, &buffers, pto);
 
   BufferVersionMap physical_versions;

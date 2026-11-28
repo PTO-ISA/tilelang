@@ -8,7 +8,8 @@ from tilelang.ascend import language as T, transform
 from tilelang.ascend.target import normalize_pto_target
 from tvm import tirx
 
-from testing.ascend._ir import kernel, nodes, seq
+from testing.ascend._ir import calls, kernel, nodes, seq
+from test_pto_parallel_gather_scatter import capture_passes
 from testing.ascend.auto_schedule._scheduled_ir import unit
 
 
@@ -30,11 +31,32 @@ def test_persistent_expand_compiles(stages):
                         y[m, j] = x[j]
                 T.copy(y, Y[row, 0, col * 256])
 
-    compiled = tilelang.compile(expand, target="pto")
-    assert compiled.get_kernel_source()
+    was_enabled = tilelang.is_cache_enabled()
+    tilelang.disable_cache()
+    try:
+        with capture_passes() as captured:
+            tilelang.compile(expand, target="pto")
+    finally:
+        if was_enabled:
+            tilelang.enable_cache()
+    ir = captured["VectorizeParallelToPTO_after"]["expand"]
+    (load,) = calls(ir, "tl.vmi.vload")
+    (store,) = calls(ir, "tl.vmi.vstore")
+    addresses = [nodes(ptr, tirx.BufferLoad)[0] for ptr in (load.args[0], store.args[1])]
+    if stages == 1:
+        assert [len(addr.indices) for addr in addresses] == [1, 2]
+    else:
+        slot = addresses[0].indices[0]
+        assert isinstance(slot, tirx.Var) and slot.same_as(addresses[1].indices[0])
+        (binding,) = [b for b in nodes(ir, tirx.Bind) if b.var.same_as(slot)]
+        (clock,) = nodes(binding.value, tirx.BufferLoad)
+        assert tvm.arith.Analyzer().can_prove_equal(binding.value, clock % stages)
 
 
-@pytest.mark.parametrize("mode", ["guarded", "alias_store", "escape", "local_allocation", "explicit_vf", "ascendc"])
+@pytest.mark.parametrize(
+    "mode",
+    ["guarded", "alias_store", "outer_alias", "outer_match", "predicated_escape", "escape", "local_allocation", "explicit_vf", "ascendc"],
+)
 def test_version_slot_scope(mode):
     x = tirx.decl_buffer((64,), "int32", name="x", scope="shared.dyn")
     counter = tirx.decl_buffer((1,), "int32", name="epoch", scope="local.var")
@@ -45,12 +67,23 @@ def test_version_slot_scope(mode):
     body = tirx.For(lane, 0, 64, kind, tirx.BufferStore(x, x[user_index[0]], [lane]))
     if mode == "alias_store":
         alias = tirx.decl_buffer((1,), "int32", data=counter.data, scope="local.var")
-        body = seq(body, tirx.BufferStore(alias, 1, [0]))
+        body = seq(tirx.DeclBuffer(alias), tirx.BufferStore(alias, 1, [0]), body)
+    elif mode in ("outer_alias", "outer_match"):
+        alias = tirx.decl_buffer((1,), "int32", name="alias", scope="local.var")
+        body = seq(tirx.BufferStore(alias, 1, [0]), body)
+    elif mode == "predicated_escape":
+        predicate = tirx.call_extern("bool", "advance_counter", counter.data)
+        body = seq(tirx.BufferStore(user_index, 0, [0], predicate=predicate), body)
     elif mode == "escape":
         body = seq(body, tirx.Evaluate(tirx.call_extern("int32", "opaque", counter.data)))
     vf = tirx.SBlock([], [], [], "SIMD_VF", body, alloc_buffers=[counter] if mode == "local_allocation" else [])
     pred = tile < 3
     vf = tirx.SBlockRealize([], pred, vf)
+    if mode == "outer_alias":
+        vf = seq(tirx.Bind(alias.data, counter.data), tirx.DeclBuffer(alias), vf)
+    elif mode == "outer_match":
+        match = tirx.MatchBufferRegion(alias, tirx.BufferRegion(counter, [tvm.ir.Range(0, 1)]))
+        vf = tirx.SBlockRealize([], True, tirx.SBlock([], [], [], "wrapper", vf, match_buffers=[match]))
     advance = unit(tirx.BufferStore(counter, counter[0] + 1, [0]))
     owner = tirx.For(
         tile,
@@ -72,7 +105,7 @@ def test_version_slot_scope(mode):
     if mode != "ascendc":
         before = tvm.IRModule({"main": before["main"].with_attr("target", normalize_pto_target("pto"))})
     after = transform.MaterializeMultiBuffer()(before)
-    bindings = nodes(after, tirx.Bind)
+    bindings = [b for b in nodes(after, tirx.Bind) if b.var.dtype != "handle"]
     if mode != "guarded":
         assert not bindings
         return
@@ -87,9 +120,10 @@ def test_version_slot_scope(mode):
     assert store.value.indices[1].buffer.data.same_as(user_index.data)
 
 
-def test_two_vfs_refresh_independent_clocks():
+@pytest.mark.parametrize("write_type,write_slots", [("int32", 2), ("int64", 3)])
+def test_two_vfs_refresh_independent_clocks(write_type, write_slots):
     x, y = [tirx.decl_buffer((64,), "float32", name=n, scope="shared.dyn") for n in ("x", "y")]
-    read, write = [tirx.decl_buffer((1,), t, name="epoch", scope="local.var") for t in ("int32", "int64")]
+    read, write = [tirx.decl_buffer((1,), t, name="epoch", scope="local.var") for t in ("int32", write_type)]
     tile = tirx.Var("tile", "int32")
     active = tile < 3
 
@@ -114,9 +148,9 @@ def test_two_vfs_refresh_independent_clocks():
         },
     )
     before = kernel(
-        seq(unit(tirx.BufferStore(read, 0, [0])), unit(tirx.BufferStore(write, tirx.const(0, "int64"), [0])), unit(owner, core=None)),
+        seq(unit(tirx.BufferStore(read, 0, [0])), unit(tirx.BufferStore(write, tirx.const(0, write_type), [0])), unit(owner, core=None)),
         buffers=[x, y, read, write],
-        annotations={"tl.buffer_versions_map": {x.data: 2, y.data: 3}},
+        annotations={"tl.buffer_versions_map": {x.data: 2, y.data: write_slots}},
     )
     before = tvm.IRModule({"main": before["main"].with_attr("target", normalize_pto_target("pto"))})
     result = transform.MaterializeMultiBuffer()(before)
@@ -127,7 +161,7 @@ def test_two_vfs_refresh_independent_clocks():
         bindings = nodes(g, tirx.Bind)
         assert len(bindings) == 2
         (store,) = nodes(g, tirx.BufferStore)
-        for address, counter, modulus in [(store, write, 3), (store.value, read, 2)]:
+        for address, counter, modulus in [(store, write, write_slots), (store.value, read, 2)]:
             (binding,) = [b for b in bindings if b.var.same_as(address.indices[0])]
             expected = tirx.Cast(binding.var.dtype, counter[0] % modulus)
             assert tvm.arith.Analyzer().can_prove_equal(binding.value, expected)
