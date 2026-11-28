@@ -1449,28 +1449,47 @@ namespace {
 // read if its source is subsequently overwritten.
 class PrivateIndexValues : public StmtExprMutator {
 public:
-  explicit PrivateIndexValues(const For &unit) {
+  PrivateIndexValues(const For &unit, std::set<const VarNode *> *created)
+      : created_(created) {
     auto owners = unit->annotations.Get(attr::kParallelPrivateAllocs);
     if (!owners)
       return;
     std::set<const VarNode *> private_data;
     for (const Var &local : Downcast<Array<Var>>(*owners))
       private_data.insert(local.get());
-    auto collect = [&](const Array<PrimExpr> &indices) {
-      for (const PrimExpr &index : indices)
-        PostOrderVisit(index, [&](const ObjectRef &node) {
-          if (auto *read = node.as<BufferLoadNode>();
-              read && private_data.count(read->buffer->data.get()) &&
-              IsPlainSlot(read->buffer, read->indices, read->predicate))
-            targets_.insert(read->buffer->data.get());
-        });
-    };
+    std::map<const VarNode *, std::vector<PrimExpr>> definitions;
+    std::vector<PrimExpr> pending;
     PostOrderVisit(unit->body, [&](const ObjectRef &node) {
-      if (auto *load = node.as<BufferLoadNode>())
-        collect(load->indices);
-      else if (auto *store = node.as<BufferStoreNode>())
-        collect(store->indices);
+      if (const auto *load = node.as<BufferLoadNode>()) {
+        pending.insert(pending.end(), load->indices.begin(),
+                       load->indices.end());
+      } else if (const auto *store = node.as<BufferStoreNode>()) {
+        pending.insert(pending.end(), store->indices.begin(),
+                       store->indices.end());
+        if (private_data.count(store->buffer->data.get()))
+          definitions[store->buffer->data.get()].push_back(store->value);
+      } else if (const auto *bind = node.as<BindNode>()) {
+        definitions[bind->var.get()].push_back(bind->value);
+      }
     });
+    // Follow only definitions that feed an address, including slot-to-slot
+    // copies and intermediate Bind variables.
+    while (!pending.empty()) {
+      PrimExpr expr = pending.back();
+      pending.pop_back();
+      PostOrderVisit(expr, [&](const ObjectRef &node) {
+        auto *key = node.as<VarNode>();
+        if (auto *load = node.as<BufferLoadNode>();
+            load && private_data.count(load->buffer->data.get()) &&
+            IsPlainSlot(load->buffer, load->indices, load->predicate))
+          key = load->buffer->data.get();
+        if (auto it = definitions.find(key); it != definitions.end()) {
+          targets_.insert(key);
+          pending.insert(pending.end(), it->second.begin(), it->second.end());
+          definitions.erase(it);
+        }
+      });
+    }
   }
 
   Stmt Rewrite(const Stmt &body) {
@@ -1490,8 +1509,13 @@ private:
 
   void ForgetWrites(const Stmt &stmt) {
     PostOrderVisit(stmt, [&](const ObjectRef &node) {
-      if (const auto *store = node.as<BufferStoreNode>())
-        values_.erase(store->buffer->data.get());
+      if (const auto *store = node.as<BufferStoreNode>()) {
+        auto it = values_.find(store->buffer->data.get());
+        if (it != values_.end() &&
+            !(IsPlainSlot(store->buffer, store->indices, store->predicate) &&
+              ExprDeepEqual()(it->second, store->value)))
+          values_.erase(it);
+      }
     });
   }
 
@@ -1507,8 +1531,6 @@ private:
 
   Stmt VisitStmt_(const IfThenElseNode *op) final {
     auto entering = values_;
-    bool saved = in_branch_;
-    in_branch_ = true;
     PrimExpr condition = VisitExpr(op->condition);
     Stmt yes = VisitStmt(op->then_case);
     values_ = entering;
@@ -1516,7 +1538,6 @@ private:
     if (op->else_case)
       no = VisitStmt(*op->else_case);
     values_ = std::move(entering);
-    in_branch_ = saved;
     ForgetWrites(GetRef<Stmt>(op));
     return IfThenElse(condition, yes, no, op->span);
   }
@@ -1529,10 +1550,11 @@ private:
     return result;
   }
 
-  Array<PrimExpr> RewriteIndices(const Array<PrimExpr> &indices) {
+  PrimExpr SubstituteValue(const PrimExpr &expr) {
     class SubstituteReads : public ExprMutator {
     public:
-      explicit SubstituteReads(const std::map<const VarNode *, Var> &values)
+      explicit SubstituteReads(
+          const std::map<const VarNode *, PrimExpr> &values)
           : values_(values) {}
       PrimExpr VisitExpr_(const BufferLoadNode *op) final {
         auto it = values_.find(op->buffer->data.get());
@@ -1543,42 +1565,58 @@ private:
       }
 
     private:
-      const std::map<const VarNode *, Var> &values_;
+      const std::map<const VarNode *, PrimExpr> &values_;
     } remap(values_);
-    return indices.Map([&](const PrimExpr &index) { return remap(index); });
+    return remap(expr);
+  }
+
+  Stmt VisitStmt_(const BindNode *op) final {
+    if (targets_.count(op->var.get()))
+      return Bind(op->var, SubstituteValue(op->value), op->span);
+    return StmtExprMutator::VisitStmt_(op);
   }
 
   PrimExpr VisitExpr_(const BufferLoadNode *op) final {
-    auto indices = RewriteIndices(op->indices);
+    auto indices =
+        op->indices.Map([&](const PrimExpr &e) { return SubstituteValue(e); });
     return indices.same_as(op->indices)
                ? GetRef<PrimExpr>(op)
                : BufferLoad(op->buffer, indices, op->predicate, op->span);
   }
 
   Stmt VisitStmt_(const BufferStoreNode *op) final {
-    auto indices = RewriteIndices(op->indices);
+    auto indices =
+        op->indices.Map([&](const PrimExpr &e) { return SubstituteValue(e); });
     auto value = VisitExpr(op->value);
-    if (!targets_.count(op->buffer->data.get()) || in_branch_ ||
+    if (!targets_.count(op->buffer->data.get()) ||
         !IsPlainSlot(op->buffer, op->indices, op->predicate)) {
       values_.erase(op->buffer->data.get());
       return BufferStore(op->buffer, value, indices, op->predicate, op->span);
     }
+    value = SubstituteValue(value);
+    if (value.as<VarNode>() || value.as<IntImmNode>()) {
+      values_[op->buffer->data.get()] = value;
+      return BufferStore(op->buffer, value, indices, op->predicate, op->span);
+    }
     Var snapshot(op->buffer->name + "_index", value.dtype());
+    if (created_)
+      created_->insert(snapshot.get());
     values_[op->buffer->data.get()] = snapshot;
     return SeqStmt::Flatten(
         Bind(snapshot, value),
         BufferStore(op->buffer, snapshot, indices, op->predicate, op->span));
   }
 
-  bool in_branch_{false};
+  std::set<const VarNode *> *created_;
   std::set<const VarNode *> targets_;
-  std::map<const VarNode *, Var> values_;
+  std::map<const VarNode *, PrimExpr> values_;
 };
 
 } // namespace
 
-Stmt LegalizePrivateIndexValues(const For &unit) {
-  return PrivateIndexValues(unit).Rewrite(unit->body);
+Stmt LegalizePrivateIndexValues(const For &unit,
+                                std::set<const VarNode *> *created) {
+  return PrivateIndexValues(unit, created).Rewrite(unit->body);
 }
 
 void SetPtoIndexStorage(PtoInverseMapping *mapping,

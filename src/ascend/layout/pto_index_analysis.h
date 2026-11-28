@@ -49,8 +49,8 @@ PrimExpr SubstituteVar(const PrimExpr &expr, const VarNode *from, PrimExpr to);
 Optional<PrimExpr> ResolveIndexAliases(const PrimExpr &index,
                                        const Map<Var, PrimExpr> &bind_env);
 
-/*! Check the address expression whitelist, including ordinary UB and local loads.
- * Opaque and side-effecting calls remain unsupported. */
+/*! Check the address expression whitelist, including ordinary UB and local
+ * loads. Opaque and side-effecting calls remain unsupported. */
 bool IsSupportedAddressExpr(const PrimExpr &expr);
 
 /*! Ordinary UB scope ("shared" / "shared.dyn") for indexed memory payloads. */

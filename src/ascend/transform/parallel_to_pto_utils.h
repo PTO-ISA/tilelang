@@ -324,7 +324,8 @@ using ValueInfoMap =
 
 // Use the same reaching index values for layout selection, admission and
 // legalization. Verify analyzes the rewritten body without mutating its input.
-Stmt LegalizePrivateIndexValues(const For &unit);
+Stmt LegalizePrivateIndexValues(const For &unit,
+                                std::set<const VarNode *> *created = nullptr);
 
 void SetPtoIndexStorage(PtoInverseMapping *mapping,
                         const Array<Buffer> &private_allocations,

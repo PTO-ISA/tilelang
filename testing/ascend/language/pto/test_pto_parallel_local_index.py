@@ -8,6 +8,8 @@ from tilelang import tvm
 from tvm import tirx
 from test_pto_parallel_gather_scatter import capture_passes
 from testing.ascend._ir import calls, nodes
+from tilelang.ascend import transform as ascend
+from tilelang.ascend.target import normalize_pto_target
 
 
 def local_index_kernel(source, access, dtype="int32"):
@@ -28,6 +30,25 @@ def local_index_kernel(source, access, dtype="int32"):
                         out[j] = a[idx_ub[i]]
                     elif source == "external":
                         out[(i % 3) * 256 + j] = a[(i % 3) * 256 + j]
+                    elif source in ("copy", "branch", "loop"):
+                        base = T.bind(idx_ub[0])
+                        p = T.alloc_local((1,), "int32")
+                        p[0] = base
+                        if source == "copy":
+                            q = T.alloc_var("int32")
+                            alias = T.bind(p[0])
+                            q = alias
+                            p[0] = j
+                            out[j] = a[q + j]
+                        elif source == "branch":
+                            if j < 150:
+                                p[0] = idx_ub[1]
+                                out[j] = a[p[0] + j]
+                        else:
+                            for k in T.serial(2):
+                                p[0] = base
+                                out[k * 256 + j] = a[p[0] + j]
+                            out[512 + j] = a[p[0] + j]
                     else:
                         idx = T.alloc_var("int32")
                         if source in ("private_uniform", "snapshot"):
@@ -57,6 +78,9 @@ def local_index_kernel(source, access, dtype="int32"):
         ("private_uniform", "read", 0, 0),
         ("private_varying", "read", 1, 0),
         ("private_varying", "write", 0, 1),
+        ("copy", "read", 0, 0),
+        ("branch", "read", 0, 0),
+        ("loop", "read", 0, 0),
     ],
 )
 def test_local_index_compiles(source, access, gathers, scatters, monkeypatch):
@@ -104,6 +128,28 @@ def test_private_index_observes_source_before_overwrite(monkeypatch):
     ]
     assert read.value.indices[0].same_as(saved.var)
     assert seq.index(saved) < seq.index(overwrite) < seq.index(read)
+
+
+@pytest.mark.pto
+def test_private_index_cannot_escape_through_a_bound_pointer():
+    idx = tirx.decl_buffer((1,), "int32", scope="local", name="idx")
+    table = tirx.decl_buffer((256,), "int32", scope="shared", name="table")
+    ptr = tirx.Var("alias_ptr", idx.data.type_annotation)
+    alias = tirx.decl_buffer((1,), "int32", data=ptr, scope="local")
+    j = tirx.Var("j", "int32")
+    body = tirx.SeqStmt(
+        [
+            tirx.BufferStore(idx, 3, [0]),
+            tirx.Bind(ptr, idx.data),
+            tirx.BufferStore(alias, 11, [0]),
+            tirx.BufferStore(table, table[idx[0] + j], [j]),
+        ]
+    )
+    loop = tirx.For(j, 0, 128, tirx.ForKind.PARALLEL, body, annotations={"tl.parallel_private_allocs": [idx.data]})
+    vf = tirx.SBlock([], [], [], "SIMD_VF", loop, alloc_buffers=[idx, table], annotations={"tl.simdvf_lanes": 128})
+    func = tirx.PrimFunc([], vf).with_attr("target", normalize_pto_target("pto"))
+    with pytest.raises(tvm.error.InternalError, match="private address escape"):
+        ascend.VerifyParallelToPTO()(tvm.IRModule({"main": func}))
 
 
 @pytest.mark.pto
