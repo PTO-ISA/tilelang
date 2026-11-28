@@ -539,9 +539,11 @@ private:
   public:
     UnitVisitor(VerifyParallelToPTOImpl *parent, const Var &loop_var,
                 const pto_analysis::PtoInverseMapping &mapping,
-                const std::set<const VarNode *> &external_defs)
+                const std::set<const VarNode *> &external_defs,
+                const std::set<const VarNode *> &index_snapshots)
         : parent_(parent), loop_var_(loop_var), mapping_(mapping),
-          external_defs_(external_defs), value_infos_(parent->region_values_) {}
+          external_defs_(external_defs), value_infos_(parent->region_values_),
+          index_snapshots_(index_snapshots) {}
 
     void VisitStmt_(const AttrStmtNode *op) final {
       // Analyze the *whole* metadata expression with the shared
@@ -886,6 +888,11 @@ private:
       }
       if (const auto *nested = stmt.as<IfThenElseNode>()) {
         VisitStmt_(nested);
+        return;
+      }
+      if (auto *bind = stmt.as<BindNode>();
+          bind && index_snapshots_.count(bind->var.get())) {
+        VisitStmt_(bind);
         return;
       }
       if (const auto *store = stmt.as<BufferStoreNode>()) {
@@ -1440,7 +1447,7 @@ private:
             parent_->Fail("expression",
                           "buffer `" + std::string(buffer->name) +
                               "` view metadata contains an unsupported "
-                              "call or a non-UB index load");
+                              "call or index load");
           }
           RegionVisitor metadata_accesses(parent_);
           metadata_accesses(expr);
@@ -1468,6 +1475,7 @@ private:
     // (0 = uniform, 1 = varying) for this unit.
     Map<Var, Integer> classified_;
     pto::ValueInfoMap value_infos_;
+    const std::set<const VarNode *> &index_snapshots_;
     arith::Analyzer analyzer_;
     // The lexical definition snapshot at the unit's position —
     // params, buffer data pointers, and every definition (outer loop
@@ -1807,6 +1815,8 @@ private:
         return pto_analysis::PtoInverseMapping();
       }
     }();
+    pto::SetPtoIndexStorage(&mapping, storage_.PrivateAllocations(unit),
+                            reducers_.storage_values);
     if (mapping.lanes != lanes) {
       std::ostringstream oss;
       oss << "layout lanes (" << mapping.lanes
@@ -1828,11 +1838,15 @@ private:
             ? (mapping.select_inner ? mapping.inner_var : mapping.outer_var)
             : unit->loop_var;
     // The definition snapshot at the unit's lexical position.
-    const Stmt &body_to_verify = inner_loop ? inner_loop->body : unit->body;
+    std::set<const VarNode *> index_snapshots;
+    Stmt body_to_verify =
+        pto::LegalizePrivateIndexValues(unit, &index_snapshots);
+    if (inner_loop)
+      body_to_verify = Downcast<For>(body_to_verify)->body;
     ConditionalIndexedAccessVisitor conditional_accesses(this, vector_var,
                                                          mapping, defs_);
     conditional_accesses(body_to_verify);
-    UnitVisitor unit_visitor(this, vector_var, mapping, defs_);
+    UnitVisitor unit_visitor(this, vector_var, mapping, defs_, index_snapshots);
     unit_visitor(body_to_verify);
   }
 

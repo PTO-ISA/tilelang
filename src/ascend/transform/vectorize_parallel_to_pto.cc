@@ -935,6 +935,8 @@ private:
           !pto::UsesExplicitSIMD(loop->body)) {
         For unit = GetRef<For>(loop);
         auto mapping = pto::InvertPtoLaneLayout(unit);
+        pto::SetPtoIndexStorage(&mapping, storage_.PrivateAllocations(unit),
+                                reducers_.storage_values);
         result = ConvertUnit(unit, mapping);
         Array<Stmt> declarations;
         for (const auto &old : storage_.PrivateAllocations(unit))
@@ -1234,10 +1236,8 @@ private:
     });
     if (needs_vmi)
       return false;
-    return pto_analysis::IsPtoLaneUniform(
-        simplified, loop_var_, unit_mapping_.index_expr, unit_mapping_.lane_var,
-        unit_mapping_.chunk_var, lanes_, unit_mapping_.chunk_count,
-        unit_mapping_.SerialVar(), unit_mapping_.SerialExtent(), bind_env_);
+    return pto_analysis::IsPtoLaneUniform(simplified, loop_var_, unit_mapping_,
+                                          bind_env_);
   }
 
   PrimExpr ConvertScalarExpr(const PrimExpr &expr) {
