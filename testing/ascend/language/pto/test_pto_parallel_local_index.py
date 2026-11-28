@@ -6,7 +6,7 @@ import tilelang
 import tilelang.ascend.language as T
 from tilelang import tvm
 from tvm import tirx
-from test_pto_parallel_gather_scatter import capture_passes
+from test_pto_parallel_gather_scatter import binding_values, capture_passes
 from testing.ascend._ir import calls, nodes
 from tilelang.ascend import transform as ascend
 from tilelang.ascend.target import normalize_pto_target
@@ -63,7 +63,7 @@ def local_index_kernel(source, access, dtype="int32"):
                             out[512 + j] = a[p[0] + j]
                     else:
                         idx = T.alloc_var("int32")
-                        if source in ("private_uniform", "snapshot"):
+                        if source == "private_uniform":
                             idx = idx_ub[i]
                         else:
                             idx = idx_ub[j]
@@ -106,6 +106,39 @@ def test_local_index_compiles(source, access, gathers, scatters, monkeypatch):
     assert len(calls(ir, "tl.vmi.vscatter")) == scatters
     if source == "external":
         assert len(calls(ir, "tl.vmi.vload")) == len(calls(ir, "tl.vmi.vstore")) == 1
+    if source == "join_varying":
+        bindings = binding_values(ir)
+        (gather,) = calls(ir, "tl.vmi.vgather")
+        add = defining_value(gather.args[2], bindings)
+        assert add.op.name == "tl.vmi.vadd"
+        saved = defining_value(add.args[0], bindings)
+        assert defining_value(add.args[1], bindings).op.name == "tl.vmi.vci"
+        (chunk,) = [loop for loop in nodes(ir, tirx.For) if loop.loop_var.name == "q"]
+        writes = [s for s in chunk.body.seq if isinstance(s, tirx.BufferStore) and s.buffer.data.same_as(saved.buffer.data)]
+        initial, update = writes
+        zero = defining_value(initial.value, bindings)
+        assert zero.op.name == "tl.vmi.vbrc" and int(zero.args[0]) == 0
+        select = defining_value(update.value, bindings)
+        assert select.op.name == "tl.vmi.vsel"
+        cond, taken, previous = [defining_value(arg, bindings) for arg in select.args]
+        assert cond.op.name == "tl.vmi.vcmps" and int(cond.args[1]) == 64 and cond.args[-1].value == "lt"
+        assert taken.op.name == "tl.vmi.vload" and taken.args[0].args[0].buffer.name == "idx_ub"
+        assert previous.buffer.data.same_as(saved.buffer.data)
+        seq = list(chunk.body.seq)
+        snapshots = [
+            s
+            for s in seq
+            if isinstance(s, tirx.Bind) and isinstance(s.value, tirx.BufferLoad) and s.value.buffer.data.same_as(saved.buffer.data)
+        ]
+        before, after = snapshots
+        assert before.value.same_as(previous) and after.value.same_as(saved)
+        assert seq.index(initial) < seq.index(before) < seq.index(update) < seq.index(after)
+
+
+def defining_value(value, bindings):
+    while isinstance(value, tirx.Var) and value in bindings:
+        value = bindings[value]
+    return value
 
 
 @pytest.mark.pto
@@ -130,17 +163,17 @@ def test_private_index_observes_source_before_overwrite(monkeypatch):
     (saved,) = [
         stmt
         for stmt in seq
-        if isinstance(stmt, tirx.Bind) and isinstance(stmt.value, tirx.BufferLoad) and stmt.value.buffer.name == "idx_ub"
+        if isinstance(stmt, tirx.Bind) and calls(stmt.value, "tl.vmi.vload") and stmt.value.args[0].args[0].buffer.name == "idx_ub"
     ]
     (overwrite,) = [
         stmt
         for stmt in seq
         if isinstance(stmt, tirx.Evaluate) and calls(stmt, "tl.vmi.vstore") and stmt.value.args[1].args[0].buffer.name == "idx_ub"
     ]
-    (read,) = [
-        stmt for stmt in seq if isinstance(stmt, tirx.Bind) and isinstance(stmt.value, tirx.BufferLoad) and stmt.value.buffer.name == "a"
-    ]
-    assert read.value.indices[0].same_as(saved.var)
+    (read,) = [stmt for stmt in seq if isinstance(stmt, tirx.Bind) and calls(stmt.value, "tl.vmi.vgather")]
+    assert read.value.args[0].args[0].buffer.name == "a"
+    assert defining_value(read.value.args[2], binding_values(ir)).same_as(saved.value)
+    assert tvm.arith.Analyzer().can_prove_equal(saved.value.args[0].args[0].indices[0], overwrite.value.args[1].args[0].indices[0])
     assert seq.index(saved) < seq.index(overwrite) < seq.index(read)
 
 
@@ -192,6 +225,14 @@ def test_persistent_expand_compiles(x_slots, y_slots, monkeypatch):
     (load,) = calls(ir, "tl.vmi.vload")
     (store,) = calls(ir, "tl.vmi.vstore")
     assert not calls(ir, "tl.vmi.vgather") and not calls(ir, "tl.vmi.vscatter")
+    chunk, row = [loop.loop_var for loop in nodes(ir, tirx.For) if loop.loop_var.name in ("q", "m")]
+    analyzer = tvm.arith.Analyzer()
+    x_address, y_address = load.args[0].args[0], store.args[1].args[0]
+    assert len(x_address.indices) == 1 + (stages > 1)
+    assert len(y_address.indices) == 2 + (stages > 1)
+    assert analyzer.can_prove_equal(x_address.indices[-1], chunk * 128)
+    assert analyzer.can_prove_equal(y_address.indices[-2], row)
+    assert analyzer.can_prove_equal(y_address.indices[-1], chunk * 128)
     if stages > 1:
         counters = []
         for ptr, slots in ((load.args[0], x_slots), (store.args[1], y_slots)):
