@@ -39,6 +39,8 @@
 #include "./auto_schedule/kernel_rewriter.h"
 #include "./auto_schedule/multi_buffer.h"
 #include "./auto_schedule/scheduled_tir.h"
+#include "ascend/layout/pto_index_analysis.h"
+#include "ascend/target_utils.h"
 #include "layout/layout.h"
 #include "op/builtin.h"
 #include "transform/common/attr.h"
@@ -216,12 +218,53 @@ private:
   std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual> expanded_buffers_;
 };
 
+// Inspect the logical VF before adding version indices. A prepared counter is
+// allocated and initialized by the scheduler outside the task. If its storage
+// already occurs in the VF (including an alias or a pointer argument), keep
+// the original load at the use site.
+class VFVersionSlots : public StmtExprVisitor {
+public:
+  bool has_parallel{false};
+  Array<Stmt> bindings;
+
+  PrimExpr Capture(const Var &counter, const PrimExpr &index) {
+    if (!has_parallel || referenced_.count(counter.get()))
+      return index;
+    for (const auto &[value, slot] : slots_) {
+      if (ffi::StructuralEqual()(value, index))
+        return slot;
+    }
+    Var slot("version_slot", index.dtype());
+    slots_.emplace_back(index, slot);
+    bindings.push_back(Bind(slot, index));
+    return slot;
+  }
+
+private:
+  void VisitStmt_(const ForNode *op) final {
+    has_parallel |= op->kind == ForKind::kParallel;
+    StmtExprVisitor::VisitStmt_(op);
+  }
+  void VisitExpr_(const VarNode *op) final { referenced_.insert(op); }
+  void VisitBufferUse(const Buffer &buffer) final {
+    referenced_.insert(buffer->data.get());
+  }
+  void VisitBufferDef(const Buffer &buffer, bool alloc_data) final {
+    referenced_.insert(buffer->data.get());
+    StmtExprVisitor::VisitBufferDef(buffer, alloc_data);
+  }
+
+  std::unordered_set<const VarNode *> referenced_;
+  std::vector<std::pair<PrimExpr, Var>> slots_;
+};
+
 class MultiBufferAccessRewriter : public StmtExprMutator {
 public:
   MultiBufferAccessRewriter(const MultiBufferPlan &plan,
                             VersionedBufferRegistry *buffers,
-                            const MultiBufferBroadcastFill &broadcast_storages)
-      : plan_(plan), buffers_(buffers) {
+                            const MultiBufferBroadcastFill &broadcast_storages,
+                            bool pto)
+      : plan_(plan), buffers_(buffers), pto_(pto) {
     for (const Var &storage : broadcast_storages) {
       const MultiBufferInfo *info = plan_.Find(storage);
       ICHECK(info != nullptr)
@@ -260,8 +303,46 @@ private:
     PrimExpr version =
         indexmod(iteration, IntImm(iteration.dtype(), info.num_versions));
     DataType index_dtype = versioned->shape[0].dtype();
-    return version.dtype() == index_dtype ? version
-                                          : cast(index_dtype, version);
+    if (version.dtype() != index_dtype)
+      version = cast(index_dtype, version);
+    if (vf_slots_ && info.UsesCounter() &&
+        pto::IsOrdinaryUbScope(versioned.scope()))
+      return vf_slots_->Capture(info.counter->data, version);
+    return version;
+  }
+
+  Stmt RewriteVF(const SBlock &block, const SBlockRealizeNode *realize) {
+    VFVersionSlots slots;
+    slots(block);
+    VFVersionSlots *previous = vf_slots_;
+    vf_slots_ = &slots;
+    SBlock rewritten =
+        Downcast<SBlock>(StmtExprMutator::VisitStmt_(block.get()));
+    vf_slots_ = previous;
+    if (!realize)
+      return SeqStmt::Flatten(slots.bindings, rewritten);
+
+    auto values = realize->iter_values.Map(
+        [this](const PrimExpr &value) { return VisitExpr(value); });
+    PrimExpr pred = VisitExpr(realize->predicate);
+    if (slots.bindings.empty())
+      return SBlockRealize(values, pred, rewritten, realize->span);
+    Stmt body = SeqStmt::Flatten(
+        slots.bindings,
+        SBlockRealize(values, Bool(true), rewritten, realize->span));
+    return is_one(pred) ? body : IfThenElse(pred, body);
+  }
+
+  Stmt VisitStmt_(const SBlockNode *op) final {
+    if (pto_ && op->name_hint == "SIMD_VF")
+      return RewriteVF(GetRef<SBlock>(op), nullptr);
+    return StmtExprMutator::VisitStmt_(op);
+  }
+
+  Stmt VisitStmt_(const SBlockRealizeNode *op) final {
+    if (pto_ && op->block->name_hint == "SIMD_VF")
+      return RewriteVF(op->block, op);
+    return StmtExprMutator::VisitStmt_(op);
   }
 
   PrimExpr VisitExpr_(const BufferLoadNode *op) final {
@@ -321,6 +402,8 @@ private:
 
   const MultiBufferPlan &plan_;
   VersionedBufferRegistry *buffers_;
+  bool pto_;
+  VFVersionSlots *vf_slots_{nullptr};
   std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> broadcast_storages_;
 };
 
@@ -344,13 +427,14 @@ void RewriteGuards(IRStructure *node, MultiBufferAccessRewriter *rewriter) {
 
 void RewriteScheduledTree(std::vector<std::shared_ptr<IRStructure>> *nodes,
                           const MultiBufferPlan &plan,
-                          VersionedBufferRegistry *buffers) {
+                          VersionedBufferRegistry *buffers, bool pto) {
   for (const auto &node : *nodes) {
     MultiBufferBroadcastFill broadcast_storages;
     if (node->IsTask()) {
       auto *task = static_cast<TaskNode *>(node.get());
       broadcast_storages = GetMultiBufferBroadcastFills(task);
-      MultiBufferAccessRewriter rewriter(plan, buffers, broadcast_storages);
+      MultiBufferAccessRewriter rewriter(plan, buffers, broadcast_storages,
+                                         pto);
       RewriteGuards(task, &rewriter);
       task->stmt = rewriter(task->stmt);
       if (!broadcast_storages.empty())
@@ -358,9 +442,9 @@ void RewriteScheduledTree(std::vector<std::shared_ptr<IRStructure>> *nodes,
       continue;
     }
     auto *control = static_cast<ControlNode *>(node.get());
-    MultiBufferAccessRewriter rewriter(plan, buffers, broadcast_storages);
+    MultiBufferAccessRewriter rewriter(plan, buffers, broadcast_storages, pto);
     RewriteGuards(control, &rewriter);
-    RewriteScheduledTree(&control->children, plan, buffers);
+    RewriteScheduledTree(&control->children, plan, buffers, pto);
     For loop = control->control;
     auto *for_node = loop.CopyOnWrite();
     for_node->annotations.erase(kMultiBufferCounterMap);
@@ -531,13 +615,13 @@ void ElideUnitVersionCounterGroups(ScheduledTIR *scheduled_tir,
   scheduled_tir->metadata.kernel_root = std::move(kernel_root);
 }
 
-SBlock MaterializeKernel(ScheduledTIR scheduled_tir) {
+SBlock MaterializeKernel(ScheduledTIR scheduled_tir, bool pto) {
   MultiBufferPlan plan = ReadMultiBufferPlan(
       scheduled_tir.tree, scheduled_tir.metadata.buffer_versions,
       L0StorageGroups(CollectL0SFBindings(scheduled_tir.metadata.kernel_root)));
   ElideUnitVersionCounterGroups(&scheduled_tir, plan);
   VersionedBufferRegistry buffers(plan, scheduled_tir.metadata.kernel_root);
-  RewriteScheduledTree(&scheduled_tir.tree, plan, &buffers);
+  RewriteScheduledTree(&scheduled_tir.tree, plan, &buffers, pto);
 
   BufferVersionMap physical_versions;
   for (const auto &[storage, num_versions] :
@@ -562,12 +646,14 @@ tvm::transform::Pass MaterializeMultiBuffer() {
   using namespace tirx::transform;
   auto pass_func = [](PrimFunc func, const IRModule &,
                       const tvm::transform::PassContext &) -> PrimFunc {
+    auto target = func->GetAttr<Target>(tvm::attr::kTarget);
+    bool pto = target.defined() && TargetIsPTO(target.value());
     return RewriteTilelangKernels(
         std::move(func), "MaterializeMultiBuffer",
-        [](const TilelangKernelContext &context) {
+        [pto](const TilelangKernelContext &context) {
           ScheduledTIR scheduled_tir =
               DecodeScheduledTIR(context.root, context.outer_ctx);
-          return MaterializeKernel(std::move(scheduled_tir));
+          return MaterializeKernel(std::move(scheduled_tir), pto);
         });
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.MaterializeMultiBuffer", {});
