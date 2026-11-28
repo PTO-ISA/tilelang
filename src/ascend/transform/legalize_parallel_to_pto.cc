@@ -292,7 +292,9 @@ public:
     bool saved_in = in_parallel_;
     in_parallel_ = true;
 
-    Stmt body = StmtExprMutator::VisitStmt(op->body);
+    Stmt input =
+        saved_in ? op->body : pto::LegalizePrivateIndexValues(GetRef<For>(op));
+    Stmt body = StmtExprMutator::VisitStmt(input);
 
     For loop = GetRef<For>(op);
     if (!body.same_as(op->body)) {

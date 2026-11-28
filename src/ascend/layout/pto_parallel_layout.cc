@@ -311,7 +311,7 @@ bool ShouldVectorizeInnerAxis(const For &root, const Var &iv, const Var &jv,
                               const pto::ParallelStorageQuery &storage,
                               const ReducerLayoutValues &values) {
   PtoAccessCollector collector(storage, root);
-  collector(root->body);
+  collector(LegalizePrivateIndexValues(root));
 
   Array<Var> external_vars;
   if (!collector.value_operations.empty()) {
@@ -319,6 +319,8 @@ bool ShouldVectorizeInnerAxis(const For &root, const Var &iv, const Var &jv,
   }
 
   PtoInverseMapping common_mapping;
+  SetPtoIndexStorage(&common_mapping, storage.PrivateAllocations(root),
+                     values.results);
   common_mapping.lanes = lanes;
   common_mapping.is_2d = true;
   common_mapping.outer_var = iv;

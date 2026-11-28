@@ -49,12 +49,11 @@ PrimExpr SubstituteVar(const PrimExpr &expr, const VarNode *from, PrimExpr to);
 Optional<PrimExpr> ResolveIndexAliases(const PrimExpr &index,
                                        const Map<Var, PrimExpr> &bind_env);
 
-/*! Check the address expression whitelist, including ordinary UB index loads.
+/*! Check the address expression whitelist, including ordinary UB and local loads.
  * Opaque and side-effecting calls remain unsupported. */
 bool IsSupportedAddressExpr(const PrimExpr &expr);
 
-/*! Ordinary UB scope ("shared" / "shared.dyn") — the only address space from
- * which gather/scatter index loads and indexed payloads may come. */
+/*! Ordinary UB scope ("shared" / "shared.dyn") for indexed memory payloads. */
 bool IsOrdinaryUbScope(const std::string &scope);
 
 /*! Scalar 8-, 16- or 32-bit integer — the required element type of loaded index
@@ -70,19 +69,15 @@ bool IsPtoScalarCoordinate(const PrimExpr &expr, const Var &vector_var,
                            const Var &lane_var = Var());
 
 struct MemoryAccess;
+struct PtoInverseMapping;
 
 /*! Prove an integer coordinate is uniform within the canonical lane/chunk
  * domain. Loaded Bind definitions retain the same SSA symbols as address
  * classification, so algebraic coordinate simplification cannot speculate or
  * re-read a saved index value. */
 bool IsPtoLaneUniform(const PrimExpr &expr, const tirx::Var &vector_var,
-                      const PrimExpr &inverse_index, const tirx::Var &lane_var,
-                      const tirx::Var &chunk_var, int64_t lanes,
-                      int64_t chunk_count,
-                      const ffi::Optional<tirx::Var> &kept_var,
-                      int64_t kept_extent, const Map<Var, PrimExpr> &bind_env);
-
-struct PtoInverseMapping;
+                      const PtoInverseMapping &mapping,
+                      const Map<Var, PrimExpr> &bind_env);
 
 /*! Check that the planned offset has a supported scalar/VMI expression
  * lowering under the selected lane mapping. Return inputs of its vector
@@ -102,13 +97,11 @@ ffi::Array<PrimExpr> PtoAddressMetadata(const tirx::Buffer &buffer,
  * These symbols never enter the returned expressions or generated TIR.
  * Indexed offset encoding is checked separately by PlanPtoIndexedAccess.
  */
-MemoryAccess
-AnalyzePtoAddress(const tirx::Buffer &buffer,
-                  const ffi::Array<PrimExpr> &indices, bool is_write,
-                  const Var &vector_var, const PrimExpr &inverse_index,
-                  const Var &lane_var, const Var &chunk_var, int64_t lanes,
-                  int64_t chunk_count, const Optional<Var> &kept_var,
-                  int64_t kept_extent, const Map<Var, PrimExpr> &bind_env);
+MemoryAccess AnalyzePtoAddress(const tirx::Buffer &buffer,
+                               const ffi::Array<PrimExpr> &indices,
+                               bool is_write, const Var &vector_var,
+                               const PtoInverseMapping &mapping,
+                               const Map<Var, PrimExpr> &bind_env);
 
 /*! Compute the padded fragment-input extent P = ceil(E / lanes) * lanes with
  * the shared overflow guard. The final execution space is int32-bounded

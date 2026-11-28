@@ -1440,7 +1440,7 @@ private:
             parent_->Fail("expression",
                           "buffer `" + std::string(buffer->name) +
                               "` view metadata contains an unsupported "
-                              "call or a non-UB index load");
+                              "call or index load");
           }
           RegionVisitor metadata_accesses(parent_);
           metadata_accesses(expr);
@@ -1807,6 +1807,8 @@ private:
         return pto_analysis::PtoInverseMapping();
       }
     }();
+    pto::SetPtoIndexStorage(&mapping, storage_.PrivateAllocations(unit),
+                            reducers_.storage_values);
     if (mapping.lanes != lanes) {
       std::ostringstream oss;
       oss << "layout lanes (" << mapping.lanes
@@ -1828,7 +1830,9 @@ private:
             ? (mapping.select_inner ? mapping.inner_var : mapping.outer_var)
             : unit->loop_var;
     // The definition snapshot at the unit's lexical position.
-    const Stmt &body_to_verify = inner_loop ? inner_loop->body : unit->body;
+    Stmt body_to_verify = pto::LegalizePrivateIndexValues(unit);
+    if (inner_loop)
+      body_to_verify = Downcast<For>(body_to_verify)->body;
     ConditionalIndexedAccessVisitor conditional_accesses(this, vector_var,
                                                          mapping, defs_);
     conditional_accesses(body_to_verify);

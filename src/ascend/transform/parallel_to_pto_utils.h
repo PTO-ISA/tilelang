@@ -117,6 +117,10 @@ struct MemoryAccess {
  * where p is the per-lane chunk position.
  */
 struct PtoInverseMapping {
+  // Private slots and VMI-backed reducer state can have different values
+  // in each lane even when every lane names slot zero.
+  std::set<const VarNode *> vector_storage;
+
   /*! Lane variable of the enclosing SIMD_VF (analysis placeholder). */
   Var lane_var;
   /*! Chunk position variable (per-lane column index). */
@@ -317,6 +321,14 @@ struct ValueInfo {
 
 using ValueInfoMap =
     std::unordered_map<Var, ValueInfo, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>;
+
+// Use the same reaching index values for layout selection, admission and
+// legalization. Verify analyzes the rewritten body without mutating its input.
+Stmt LegalizePrivateIndexValues(const For &unit);
+
+void SetPtoIndexStorage(PtoInverseMapping *mapping,
+                        const Array<Buffer> &private_allocations,
+                        const ValueInfoMap &storage_values);
 
 /*! Classify a value emitted by Parallel conversion. Bound variables carry
  * their producer's representation, including one-lane register results. */

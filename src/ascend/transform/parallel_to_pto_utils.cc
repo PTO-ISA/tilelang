@@ -1442,15 +1442,162 @@ PrimExpr MakeIndexedMemoryDescriptor(const IndexedMemoryOwner &owner,
                         is_write ? 2 : 1);
 }
 
+namespace {
+// A private slot is a vector after promotion, even when its last assignment
+// read a scalar. Keep the assigned value as an SSA operand for address
+// analysis. Taking the snapshot at the store also preserves an earlier UB
+// read if its source is subsequently overwritten.
+class PrivateIndexValues : public StmtExprMutator {
+public:
+  explicit PrivateIndexValues(const For &unit) {
+    auto owners = unit->annotations.Get(attr::kParallelPrivateAllocs);
+    if (!owners)
+      return;
+    std::set<const VarNode *> private_data;
+    for (const Var &local : Downcast<Array<Var>>(*owners))
+      private_data.insert(local.get());
+    auto collect = [&](const Array<PrimExpr> &indices) {
+      for (const PrimExpr &index : indices)
+        PostOrderVisit(index, [&](const ObjectRef &node) {
+          if (auto *read = node.as<BufferLoadNode>();
+              read && private_data.count(read->buffer->data.get()) &&
+              IsPlainSlot(read->buffer, read->indices, read->predicate))
+            targets_.insert(read->buffer->data.get());
+        });
+    };
+    PostOrderVisit(unit->body, [&](const ObjectRef &node) {
+      if (auto *load = node.as<BufferLoadNode>())
+        collect(load->indices);
+      else if (auto *store = node.as<BufferStoreNode>())
+        collect(store->indices);
+    });
+  }
+
+  Stmt Rewrite(const Stmt &body) {
+    return targets_.empty() ? body : VisitStmt(body);
+  }
+
+private:
+  // Forward only the ordinary single-slot representation. Other views and
+  // predicated reads still go through Verify's original storage checks.
+  static bool IsPlainSlot(const Buffer &buffer, const Array<PrimExpr> &indices,
+                          const Optional<PrimExpr> &predicate) {
+    return !predicate && buffer->shape.size() == 1 &&
+           is_one(buffer->shape[0]) && buffer->strides.empty() &&
+           is_zero(buffer->elem_offset) && indices.size() == 1 &&
+           is_zero(indices[0]) && IsPtoIndexDType(buffer->dtype);
+  }
+
+  void ForgetWrites(const Stmt &stmt) {
+    PostOrderVisit(stmt, [&](const ObjectRef &node) {
+      if (const auto *store = node.as<BufferStoreNode>())
+        values_.erase(store->buffer->data.get());
+    });
+  }
+
+  Stmt VisitStmt_(const ForNode *op) final {
+    // A loop-carried slot may differ on its second iteration and after the
+    // loop. An untouched outer slot remains available inside the loop.
+    ForgetWrites(op->body);
+    auto entering = values_;
+    Stmt body = StmtExprMutator::VisitStmt_(op);
+    values_ = std::move(entering);
+    return body;
+  }
+
+  Stmt VisitStmt_(const IfThenElseNode *op) final {
+    auto entering = values_;
+    bool saved = in_branch_;
+    in_branch_ = true;
+    PrimExpr condition = VisitExpr(op->condition);
+    Stmt yes = VisitStmt(op->then_case);
+    values_ = entering;
+    Optional<Stmt> no;
+    if (op->else_case)
+      no = VisitStmt(*op->else_case);
+    values_ = std::move(entering);
+    in_branch_ = saved;
+    ForgetWrites(GetRef<Stmt>(op));
+    return IfThenElse(condition, yes, no, op->span);
+  }
+
+  Stmt VisitStmt_(const AttrStmtNode *op) final {
+    auto entering = values_;
+    Stmt result = StmtExprMutator::VisitStmt_(op);
+    values_ = std::move(entering);
+    ForgetWrites(op->body);
+    return result;
+  }
+
+  Array<PrimExpr> RewriteIndices(const Array<PrimExpr> &indices) {
+    class SubstituteReads : public ExprMutator {
+    public:
+      explicit SubstituteReads(const std::map<const VarNode *, Var> &values)
+          : values_(values) {}
+      PrimExpr VisitExpr_(const BufferLoadNode *op) final {
+        auto it = values_.find(op->buffer->data.get());
+        if (it != values_.end() && it->second.dtype() == op->dtype &&
+            IsPlainSlot(op->buffer, op->indices, op->predicate))
+          return it->second;
+        return ExprMutator::VisitExpr_(op);
+      }
+
+    private:
+      const std::map<const VarNode *, Var> &values_;
+    } remap(values_);
+    return indices.Map([&](const PrimExpr &index) { return remap(index); });
+  }
+
+  PrimExpr VisitExpr_(const BufferLoadNode *op) final {
+    auto indices = RewriteIndices(op->indices);
+    return indices.same_as(op->indices)
+               ? GetRef<PrimExpr>(op)
+               : BufferLoad(op->buffer, indices, op->predicate, op->span);
+  }
+
+  Stmt VisitStmt_(const BufferStoreNode *op) final {
+    auto indices = RewriteIndices(op->indices);
+    auto value = VisitExpr(op->value);
+    if (!targets_.count(op->buffer->data.get()) || in_branch_ ||
+        !IsPlainSlot(op->buffer, op->indices, op->predicate)) {
+      values_.erase(op->buffer->data.get());
+      return BufferStore(op->buffer, value, indices, op->predicate, op->span);
+    }
+    Var snapshot(op->buffer->name + "_index", value.dtype());
+    values_[op->buffer->data.get()] = snapshot;
+    return SeqStmt::Flatten(
+        Bind(snapshot, value),
+        BufferStore(op->buffer, snapshot, indices, op->predicate, op->span));
+  }
+
+  bool in_branch_{false};
+  std::set<const VarNode *> targets_;
+  std::map<const VarNode *, Var> values_;
+};
+
+} // namespace
+
+Stmt LegalizePrivateIndexValues(const For &unit) {
+  return PrivateIndexValues(unit).Rewrite(unit->body);
+}
+
+void SetPtoIndexStorage(PtoInverseMapping *mapping,
+                        const Array<Buffer> &private_allocations,
+                        const ValueInfoMap &storage_values) {
+  for (const Buffer &buffer : private_allocations)
+    mapping->vector_storage.insert(buffer->data.get());
+  for (const auto &[data, info] : storage_values)
+    if (info.IsVmi())
+      mapping->vector_storage.insert(data.get());
+}
+
 MemoryAccess AnalyzeBufferAccess(const Buffer &buffer,
                                  const Array<PrimExpr> &indices, bool is_write,
                                  const Var &loop_var,
                                  const PtoInverseMapping &mapping,
                                  const Map<Var, PrimExpr> &bind_env) {
-  return AnalyzePtoAddress(
-      buffer, indices, is_write, loop_var, mapping.index_expr, mapping.lane_var,
-      mapping.chunk_var, mapping.lanes, mapping.chunk_count,
-      mapping.SerialVar(), mapping.SerialExtent(), bind_env);
+  return AnalyzePtoAddress(buffer, indices, is_write, loop_var, mapping,
+                           bind_env);
 }
 
 namespace {
@@ -1589,10 +1736,7 @@ public:
     Map<Var, PrimExpr> substitutions{{mapping_.lane_var, lane}};
     for (const auto &[symbol, value] : values_) {
       if (!keep_uniform_values ||
-          !IsPtoLaneUniform(
-              value, loop_var_, mapping_.index_expr, mapping_.lane_var,
-              mapping_.chunk_var, mapping_.lanes, mapping_.chunk_count,
-              mapping_.SerialVar(), mapping_.SerialExtent(), bind_env_)) {
+          !IsPtoLaneUniform(value, loop_var_, mapping_, bind_env_)) {
         substitutions.Set(symbol, make_zero(value.dtype()));
       }
     }
@@ -1996,11 +2140,7 @@ PtoOffsetPlanResult TryPlanPtoVersionSlot(
            "version axis";
   }
   const PrimExpr &version = access.source_indices[0];
-  const auto serial = mapping.SerialVar();
-  const int64_t serial_extent = mapping.SerialExtent();
-  if (!IsPtoLaneUniform(version, loop_var, mapping.index_expr, mapping.lane_var,
-                        mapping.chunk_var, mapping.lanes, mapping.chunk_count,
-                        serial, serial_extent, bind_env)) {
+  if (!IsPtoLaneUniform(version, loop_var, mapping, bind_env)) {
     return "indexed access to padded versioned storage requires a "
            "lane-uniform version selector";
   }
@@ -2031,8 +2171,8 @@ PtoOffsetPlanResult TryPlanPtoVersionSlot(
         expr_analyzer.Simplify(cast(slot_extent.dtype(), version) + slot_shift);
     auto proof = analyzer->Clone();
     BindPtoExtent(proof.get(), loop_var, mapping.logical_extent);
-    if (serial) {
-      BindPtoExtent(proof.get(), *serial, serial_extent);
+    if (auto serial = mapping.SerialVar()) {
+      BindPtoExtent(proof.get(), *serial, mapping.SerialExtent());
     }
     if (!proof->CanProve(selected_version >= 0) ||
         !proof->CanProve(selected_version < versions)) {
@@ -2059,8 +2199,7 @@ PtoIndexedAccessPlan PlanPtoIndexedAccess(const MemoryAccess &access,
                                           const Map<Var, PrimExpr> &bind_env) {
   if (!IsSupportedAddressExpr(access.original_offset)) {
     throw PtoAnalysisError(
-        "complete indexed offset contains an unsupported call or a non-UB "
-        "index load");
+        "complete indexed offset contains an unsupported call or index load");
   }
   auto versions = buffer_versions.Get(owner.buffer->data);
   if (versions && *versions > 1 &&

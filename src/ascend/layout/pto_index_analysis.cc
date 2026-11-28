@@ -189,6 +189,13 @@ bool IsPtoScalarCoordinate(const PrimExpr &expr, const Var &vector_var,
   return scalar;
 }
 
+// Ordinary scalar local slots use the same value lowering as T.alloc_var
+// and T.alloc_local. The unit verifier checks their owner, shape and slot.
+static bool IsIndexLoadScope(const Buffer &buffer) {
+  const auto &scope = buffer.scope();
+  return IsOrdinaryUbScope(scope) || scope == "local" || scope == "local.var";
+}
+
 bool IsSupportedAddressExpr(const PrimExpr &expr) {
   // Existing coordinate arithmetic remains legal. Ordinary UB loads are
   // classified with their lane dependence separately; calls with no index
@@ -219,7 +226,7 @@ bool IsSupportedAddressExpr(const PrimExpr &expr) {
       supported = false;
     }
     void VisitExpr_(const BufferLoadNode *op) final {
-      if (!IsOrdinaryUbScope(op->buffer.scope())) {
+      if (!IsIndexLoadScope(op->buffer)) {
         supported = false;
         return;
       }
@@ -240,21 +247,17 @@ namespace {
 // All occurrences of one Bind reuse its symbol; separate source loads do not.
 class LoadedValueProof : public ExprMutator {
 public:
-  LoadedValueProof(const Var &vector_var, const PrimExpr &inverse_index,
-                   const Var &lane_var, const Var &chunk_var, int64_t lanes,
-                   int64_t chunk_count, const Optional<Var> &kept_var,
-                   int64_t kept_extent, const Map<Var, PrimExpr> &bind_env)
-      : vector_var_(vector_var), inverse_index_(inverse_index),
-        lane_var_(lane_var), bind_env_(bind_env) {
+  LoadedValueProof(const Var &vector_var, const PtoInverseMapping &mapping,
+                   const Map<Var, PrimExpr> &bind_env)
+      : vector_var_(vector_var), mapping_(mapping), bind_env_(bind_env) {
     auto bind_extent = [&](const Var &var, int64_t extent) {
       analyzer_.Bind(var, Range::FromMinExtent(make_zero(var.dtype()),
                                                IntImm(var.dtype(), extent)));
     };
-    bind_extent(lane_var, lanes);
-    bind_extent(chunk_var, chunk_count);
-    if (kept_var) {
-      bind_extent(kept_var.value(), kept_extent);
-    }
+    bind_extent(mapping.lane_var, mapping.lanes);
+    bind_extent(mapping.chunk_var, mapping.chunk_count);
+    if (auto kept = mapping.SerialVar())
+      bind_extent(*kept, mapping.SerialExtent());
   }
 
   // Compare each expression with the same saved values at lane zero.
@@ -266,7 +269,7 @@ public:
   AccessPattern Classify(const PrimExpr &offset) {
     PrimExpr value = VisitExpr(offset);
     PrimExpr start = AtLaneZero(value);
-    if (analyzer_.CanProveEqual(value, start + lane_var_)) {
+    if (analyzer_.CanProveEqual(value, start + mapping_.lane_var)) {
       return AccessPattern::kContinuous;
     }
     return analyzer_.CanProveEqual(value, start) ? AccessPattern::kLaneUniform
@@ -277,7 +280,7 @@ private:
   PrimExpr VisitExpr_(const VarNode *op) final {
     Var var = GetRef<Var>(op);
     if (var.same_as(vector_var_)) {
-      return inverse_index_;
+      return mapping_.index_expr;
     }
     if (!bind_env_.count(var)) {
       return var;
@@ -299,6 +302,8 @@ private:
   }
 
   PrimExpr VisitExpr_(const BufferLoadNode *op) final {
+    if (mapping_.vector_storage.count(op->buffer->data.get()))
+      return MakeSymbol(op->dtype, false);
     bool uniform = true;
     for (const PrimExpr &offset : op->buffer->ElemOffset(op->indices)) {
       uniform &= IsUniform(offset);
@@ -307,7 +312,8 @@ private:
   }
 
   PrimExpr AtLaneZero(const PrimExpr &value) const {
-    return SubstituteVar(value, lane_var_.get(), make_zero(lane_var_.dtype()));
+    return SubstituteVar(value, mapping_.lane_var.get(),
+                         make_zero(mapping_.lane_var.dtype()));
   }
 
   PrimExpr MakeSymbol(DataType dtype, bool uniform) {
@@ -323,13 +329,12 @@ private:
     // zero is not zero. Otherwise a product could incorrectly lose a varying
     // dependence just because the proof substituted lane=0.
     Var slope("pto_loaded_index_stride", dtype);
-    PrimExpr typed_lane = Cast(dtype, lane_var_);
+    PrimExpr typed_lane = Cast(dtype, mapping_.lane_var);
     return symbol + slope * typed_lane;
   }
 
   Var vector_var_;
-  PrimExpr inverse_index_;
-  Var lane_var_;
+  const PtoInverseMapping &mapping_;
   const Map<Var, PrimExpr> &bind_env_;
   arith::Analyzer analyzer_;
   Map<Var, PrimExpr> symbols_;
@@ -381,10 +386,10 @@ private:
   }
 
   bool VisitExpr_(const BufferLoadNode *op) final {
-    if (!IsOrdinaryUbScope(op->buffer.scope())) {
+    if (!IsIndexLoadScope(op->buffer)) {
       throw PtoAnalysisError(
           "gather/scatter indices must be loaded from "
-          "ordinary UB buffers; Fragment and GM are unsupported");
+          "ordinary UB or local slots; Fragment and GM are unsupported");
     }
     // This load's address is classified separately. Its coordinates are not
     // values emitted by ConvertExpr (for example, a buffer-version index).
@@ -497,12 +502,9 @@ private:
 } // namespace
 
 bool IsPtoLaneUniform(const PrimExpr &expr, const Var &vector_var,
-                      const PrimExpr &inverse_index, const Var &lane_var,
-                      const Var &chunk_var, int64_t lanes, int64_t chunk_count,
-                      const ffi::Optional<Var> &kept_var, int64_t kept_extent,
+                      const PtoInverseMapping &mapping,
                       const Map<Var, PrimExpr> &bind_env) {
-  LoadedValueProof proof(vector_var, inverse_index, lane_var, chunk_var, lanes,
-                         chunk_count, kept_var, kept_extent, bind_env);
+  LoadedValueProof proof(vector_var, mapping, bind_env);
   return proof.IsUniform(expr);
 }
 
@@ -510,9 +512,7 @@ Array<PrimExpr> CheckPtoIndexedOffsetExpr(const PrimExpr &offset,
                                           const Var &vector_var,
                                           const PtoInverseMapping &mapping,
                                           const Map<Var, PrimExpr> &bind_env) {
-  LoadedValueProof proof(vector_var, mapping.index_expr, mapping.lane_var,
-                         mapping.chunk_var, mapping.lanes, mapping.chunk_count,
-                         mapping.SerialVar(), mapping.SerialExtent(), bind_env);
+  LoadedValueProof proof(vector_var, mapping, bind_env);
   IndexedExprCheck checker(vector_var, mapping.lane_var, mapping.lanes,
                            bind_env, proof);
   return checker.Check(offset);
@@ -535,13 +535,11 @@ Array<PrimExpr> PtoAddressMetadata(const Buffer &buffer,
   return metadata;
 }
 
-MemoryAccess
-AnalyzePtoAddress(const Buffer &buffer, const ffi::Array<PrimExpr> &indices,
-                  bool is_write, const Var &vector_var,
-                  const PrimExpr &inverse_index, const Var &lane_var,
-                  const Var &chunk_var, int64_t lanes, int64_t chunk_count,
-                  const Optional<Var> &kept_var, int64_t kept_extent,
-                  const Map<Var, PrimExpr> &bind_env) {
+MemoryAccess AnalyzePtoAddress(const Buffer &buffer,
+                               const ffi::Array<PrimExpr> &indices,
+                               bool is_write, const Var &vector_var,
+                               const PtoInverseMapping &mapping,
+                               const Map<Var, PrimExpr> &bind_env) {
   MemoryAccess result;
   result.buffer = buffer;
   result.is_write = is_write;
@@ -554,13 +552,13 @@ AnalyzePtoAddress(const Buffer &buffer, const ffi::Array<PrimExpr> &indices,
     }
     if (!IsSupportedAddressExpr(alias.value())) {
       throw PtoAnalysisError("address expression contains an unsupported "
-                             "call or a non-UB index load");
+                             "call or index load");
     }
     resolved.push_back(alias.value());
     PrimExpr inverse =
-        SubstituteVar(alias.value(), vector_var.get(), inverse_index);
-    result.start_indices.push_back(
-        SubstituteVar(inverse, lane_var.get(), make_zero(lane_var.dtype())));
+        SubstituteVar(alias.value(), vector_var.get(), mapping.index_expr);
+    result.start_indices.push_back(SubstituteVar(
+        inverse, mapping.lane_var.get(), make_zero(mapping.lane_var.dtype())));
   }
   auto offset = [&](const ffi::Array<PrimExpr> &at) {
     ffi::Array<PrimExpr> offsets = buffer->ElemOffset(at);
@@ -573,8 +571,7 @@ AnalyzePtoAddress(const Buffer &buffer, const ffi::Array<PrimExpr> &indices,
   result.source_indices = resolved;
   result.original_offset = offset(resolved);
 
-  LoadedValueProof proof(vector_var, inverse_index, lane_var, chunk_var, lanes,
-                         chunk_count, kept_var, kept_extent, bind_env);
+  LoadedValueProof proof(vector_var, mapping, bind_env);
   result.pattern = proof.Classify(result.original_offset);
   if (!result.RequiresIndexedInstruction()) {
     return result;
